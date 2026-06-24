@@ -1,0 +1,9 @@
+dependencies:
+  idf: '>=6.0'
+description: W5500 Ethernet Driver
+repository: git://github.com/espressif/esp-eth-drivers.git
+repository_info:
+  commit_sha: 1f19456ec90b60424583a4138c075a78e1ab2297
+  path: w5500
+url: https://github.com/espressif/esp-eth-drivers/tree/master/w5500
+version: 1.0.1
