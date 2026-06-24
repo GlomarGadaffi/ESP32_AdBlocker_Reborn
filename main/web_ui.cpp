@@ -5,6 +5,7 @@
 #include "esp_log.h"
 #include <cstring>
 #include <cstdio>
+#include <cstdlib>
 #include <inttypes.h>
 
 static const char *TAG = "web_ui";
@@ -14,6 +15,65 @@ static DnsSinkServer  *s_dns    = nullptr;
 extern "C" void dns_sink_trigger_reload(void);
 
 /* ── helpers ─────────────────────────────────────────────────────── */
+
+/* Escape HTML special chars: <>&"' → entities. Safe for both text and attrs. */
+static void html_escape(char *dst, size_t cap, const char *src)
+{
+    size_t d = 0;
+    for (size_t i = 0; src[i] && d + 1 < cap; i++) {
+        const char *ent = nullptr;
+        switch (src[i]) {
+            case '<':  ent = "&lt;";   break;
+            case '>':  ent = "&gt;";   break;
+            case '&':  ent = "&amp;";  break;
+            case '"':  ent = "&quot;"; break;
+            case '\'': ent = "&#39;";  break;
+            default:   break;
+        }
+        if (ent) {
+            size_t elen = strlen(ent);
+            if (d + elen >= cap) break;
+            memcpy(dst + d, ent, elen);
+            d += elen;
+        } else {
+            dst[d++] = src[i];
+        }
+    }
+    dst[d] = '\0';
+}
+
+/* URL-decode a form-encoded value (%-hex and + as space). dst is NUL-terminated. */
+static void url_decode(char *dst, size_t cap, const char *src, size_t src_len)
+{
+    size_t d = 0;
+    for (size_t i = 0; i < src_len && d + 1 < cap; i++) {
+        if (src[i] == '%' && i + 2 < src_len) {
+            char hex[3] = { src[i+1], src[i+2], '\0' };
+            char *end; unsigned long v = strtoul(hex, &end, 16);
+            if (end == hex + 2) { dst[d++] = (char)v; i += 2; continue; }
+        }
+        dst[d++] = (src[i] == '+') ? ' ' : src[i];
+    }
+    dst[d] = '\0';
+}
+
+/* Check Origin/Referer header against Host on POST handlers to block CSRF.
+ * Returns true when the request looks same-origin (or has no Origin/Referer). */
+static bool csrf_ok(httpd_req_t *r)
+{
+    char host[64] = {}, origin[128] = {}, referer[128] = {};
+    httpd_req_get_hdr_value_str(r, "Host",    host,    sizeof(host));
+    httpd_req_get_hdr_value_str(r, "Origin",  origin,  sizeof(origin));
+    httpd_req_get_hdr_value_str(r, "Referer", referer, sizeof(referer));
+
+    /* If Origin is present it must contain our host. */
+    if (origin[0] != '\0') return (strstr(origin,  host) != nullptr);
+    /* If Referer is present it must contain our host. */
+    if (referer[0] != '\0') return (strstr(referer, host) != nullptr);
+    /* Neither header present — allow (same-origin form with no JS). */
+    return true;
+}
+
 static void send_html(httpd_req_t *r, const char *body)
 {
     httpd_resp_set_type(r, "text/html; charset=utf-8");
@@ -74,12 +134,15 @@ static esp_err_t handle_status(httpd_req_t *r)
         char wl[WHITELIST_MAX][64]; uint32_t cnt = WHITELIST_MAX;
         blocklist_whitelist_get(wl, &cnt);
         for (uint32_t i = 0; i < cnt && n < (int)sizeof(page) - 256; i++) {
+            char safe_text[384], safe_attr[384];
+            html_escape(safe_text, sizeof(safe_text), wl[i]);
+            html_escape(safe_attr, sizeof(safe_attr), wl[i]);
             n += snprintf(page + n, sizeof(page) - n,
                 "<tr><td>%s</td><td>"
                 "<form method=post action=/whitelist/remove>"
-                "<input type=hidden name=domain value='%s'>"
+                "<input type=hidden name=domain value=\"%s\">"
                 "<button>Remove</button></form></td></tr>",
-                wl[i], wl[i]);
+                safe_text, safe_attr);
         }
         n += snprintf(page + n, sizeof(page) - n, "</table>");
     }
@@ -104,6 +167,9 @@ static esp_err_t handle_metrics(httpd_req_t *r)
 /* ── POST /metrics/reset — zero counters+histograms ──────────────── */
 static esp_err_t handle_metrics_reset(httpd_req_t *r)
 {
+    if (!csrf_ok(r)) {
+        httpd_resp_send_err(r, HTTPD_403_FORBIDDEN, "CSRF"); return ESP_FAIL;
+    }
     dns_server_metrics_reset();
     httpd_resp_set_type(r, "application/json");
     httpd_resp_sendstr(r, "{\"reset\":true}");
@@ -113,6 +179,9 @@ static esp_err_t handle_metrics_reset(httpd_req_t *r)
 /* ── POST /reload ────────────────────────────────────────────────── */
 static esp_err_t handle_reload(httpd_req_t *r)
 {
+    if (!csrf_ok(r)) {
+        httpd_resp_send_err(r, HTTPD_403_FORBIDDEN, "CSRF"); return ESP_FAIL;
+    }
     dns_sink_trigger_reload();
     httpd_resp_set_status(r, "303 See Other");
     httpd_resp_set_hdr(r, "Location", "/");
@@ -123,6 +192,9 @@ static esp_err_t handle_reload(httpd_req_t *r)
 /* ── POST /check ─────────────────────────────────────────────────── */
 static esp_err_t handle_check(httpd_req_t *r)
 {
+    if (!csrf_ok(r)) {
+        httpd_resp_send_err(r, HTTPD_403_FORBIDDEN, "CSRF"); return ESP_FAIL;
+    }
     char body[256] = {}; int got = httpd_req_recv(r, body, sizeof(body) - 1);
     if (got <= 0) { httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST, ""); return ESP_FAIL; }
 
@@ -132,15 +204,17 @@ static esp_err_t handle_check(httpd_req_t *r)
     p += strlen(key);
     size_t dlen = strlen(p); while (dlen > 0 && (p[dlen-1] == '\r'||p[dlen-1]=='\n')) dlen--;
 
-    char norm[256]; size_t nlen = domain_normalize(norm, sizeof(norm), p, dlen);
+    char decoded[256]; url_decode(decoded, sizeof(decoded), p, dlen);
+    char norm[256]; size_t nlen = domain_normalize(norm, sizeof(norm), decoded, strlen(decoded));
     bool blocked = (nlen > 0) && blocklist_is_blocked(norm, nlen);
 
+    char safe[384]; html_escape(safe, sizeof(safe), norm);
     char page[512];
     snprintf(page, sizeof(page),
         "<!DOCTYPE html><html><body><h2>Check result</h2>"
         "<p><b>%s</b> is <b style='color:%s'>%s</b></p>"
         "<a href='/'>Back</a></body></html>",
-        norm, blocked ? "red" : "green", blocked ? "BLOCKED" : "ALLOWED");
+        safe, blocked ? "red" : "green", blocked ? "BLOCKED" : "ALLOWED");
     send_html(r, page);
     return ESP_OK;
 }
@@ -148,12 +222,16 @@ static esp_err_t handle_check(httpd_req_t *r)
 /* ── POST /whitelist/add ─────────────────────────────────────────── */
 static esp_err_t handle_wl_add(httpd_req_t *r)
 {
+    if (!csrf_ok(r)) {
+        httpd_resp_send_err(r, HTTPD_403_FORBIDDEN, "CSRF"); return ESP_FAIL;
+    }
     char body[256] = {}; httpd_req_recv(r, body, sizeof(body) - 1);
     const char *p = strstr(body, "domain=");
     if (p) {
         p += 7;
         size_t dlen = strlen(p); while (dlen && (p[dlen-1]=='\r'||p[dlen-1]=='\n')) dlen--;
-        char norm[256]; size_t nlen = domain_normalize(norm, sizeof(norm), p, dlen);
+        char decoded[256]; url_decode(decoded, sizeof(decoded), p, dlen);
+        char norm[256]; size_t nlen = domain_normalize(norm, sizeof(norm), decoded, strlen(decoded));
         if (nlen > 0) blocklist_whitelist_add(norm);
     }
     httpd_resp_set_status(r, "303 See Other");
@@ -165,12 +243,16 @@ static esp_err_t handle_wl_add(httpd_req_t *r)
 /* ── POST /whitelist/remove ─────────────────────────────────────── */
 static esp_err_t handle_wl_remove(httpd_req_t *r)
 {
+    if (!csrf_ok(r)) {
+        httpd_resp_send_err(r, HTTPD_403_FORBIDDEN, "CSRF"); return ESP_FAIL;
+    }
     char body[256] = {}; httpd_req_recv(r, body, sizeof(body) - 1);
     const char *p = strstr(body, "domain=");
     if (p) {
         p += 7;
         size_t dlen = strlen(p); while (dlen && (p[dlen-1]=='\r'||p[dlen-1]=='\n')) dlen--;
-        char norm[256]; size_t nlen = domain_normalize(norm, sizeof(norm), p, dlen);
+        char decoded[256]; url_decode(decoded, sizeof(decoded), p, dlen);
+        char norm[256]; size_t nlen = domain_normalize(norm, sizeof(norm), decoded, strlen(decoded));
         if (nlen > 0) blocklist_whitelist_remove(norm);
     }
     httpd_resp_set_status(r, "303 See Other");
