@@ -37,6 +37,4 @@ private:
     bool             _taskStarted = false;
     SemaphoreHandle_t _exitSem    = nullptr;
 
-    std::atomic<uint64_t> _total{0};
-    std::atomic<uint64_t> _blocked{0};
 };

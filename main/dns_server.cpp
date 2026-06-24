@@ -29,7 +29,6 @@ static Hist s_h_sendto;   /* the blocked-response sendto() call alone (lwIP TX p
  * atomic on Xtensa; plain uint32_t avoids the C++20 volatile-increment ban. */
 static uint32_t s_cnt_total        = 0;
 static uint32_t s_cnt_blocked      = 0;
-static uint32_t s_cnt_cached       = 0;
 static uint32_t s_cnt_forwarded    = 0;
 static uint32_t s_cnt_drop_table   = 0;  /* upstream table full */
 static uint32_t s_cnt_upstream_to  = 0;  /* upstream timeouts (evicted in_use) */
@@ -95,7 +94,7 @@ struct CacheEntry {
     uint32_t   ttl_deadline_ms;       /* esp_timer ms timestamp */
     bool       valid;
     bool       blocked;
-    uint8_t    qtype;
+    uint16_t   qtype;
     uint16_t   resp_len;              /* allowed: cached raw response length (0 = blocked) */
     uint8_t    resp[FWD_RESP_MAX];    /* allowed: raw upstream response */
 };
@@ -106,25 +105,25 @@ static bool cache_init(void)
     s_cache = (CacheEntry *)heap_caps_calloc(CACHE_SLOTS, sizeof(CacheEntry), MALLOC_CAP_SPIRAM);
     return s_cache != nullptr;
 }
-static CacheEntry *cache_lookup(uint32_t h, uint8_t qtype, uint32_t now_ms)
+static CacheEntry *cache_lookup(uint32_t h, uint16_t qtype, uint32_t now_ms)
 {
-    CacheEntry *e = &s_cache[h & 0xFFu];
+    CacheEntry *e = &s_cache[(h ^ ((uint32_t)qtype << 1)) & 0xFFu];
     if (e->valid && e->key_hash == h && e->qtype == qtype && e->ttl_deadline_ms > now_ms)
         return e;
     return nullptr;
 }
-static void cache_store_blocked(uint32_t h, uint8_t qtype, uint32_t ttl_s, uint32_t now_ms)
+static void cache_store_blocked(uint32_t h, uint16_t qtype, uint32_t ttl_s, uint32_t now_ms)
 {
-    CacheEntry *e = &s_cache[h & 0xFFu];
+    CacheEntry *e = &s_cache[(h ^ ((uint32_t)qtype << 1)) & 0xFFu];
     e->key_hash = h; e->qtype = qtype; e->blocked = true; e->valid = true;
     e->resp_len = 0;
     e->ttl_deadline_ms = now_ms + ttl_s * 1000u;
 }
-static void cache_store_resp(uint32_t h, uint8_t qtype, const uint8_t *resp, int len,
+static void cache_store_resp(uint32_t h, uint16_t qtype, const uint8_t *resp, int len,
                              uint32_t ttl_s, uint32_t now_ms)
 {
     if (len <= 0 || len > FWD_RESP_MAX) return;
-    CacheEntry *e = &s_cache[h & 0xFFu];
+    CacheEntry *e = &s_cache[(h ^ ((uint32_t)qtype << 1)) & 0xFFu];
     e->key_hash = h; e->qtype = qtype; e->blocked = false; e->valid = true;
     e->resp_len = (uint16_t)len;
     memcpy(e->resp, resp, len);
@@ -172,7 +171,7 @@ struct UpstreamEntry {
     int64_t          recv_us;        /* esp_timer µs when client query received */
     int64_t          upstream_us;    /* esp_timer µs when forwarded upstream */
     uint32_t         qhash;          /* domain hash — to key the forward cache on reply */
-    uint8_t          qtype;
+    uint16_t         qtype;
     bool             in_use;
 };
 static UpstreamEntry s_upstream[UPSTREAM_TABLE_SIZE];
@@ -361,7 +360,8 @@ void DnsSinkServer::run_loop()
     {
         int usock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
         if (usock < 0) { ESP_LOGE(TAG, "upstream socket: %d", errno); goto done; }
-        /* non-blocking for upstream receives */
+        /* SO_REUSEADDR: lets the task restart without waiting for TIME_WAIT.
+         * Non-blocking receive is via MSG_DONTWAIT on each recvfrom() call. */
         {
             int flags = 1;
             setsockopt(usock, SOL_SOCKET, SO_REUSEADDR, &flags, sizeof(flags));
@@ -452,7 +452,7 @@ void DnsSinkServer::run_loop()
 
                 /* ── cache hit? ─────────────────────────────── */
                 s_cnt_cache_probe++;
-                CacheEntry *ce = cache_lookup(h, (uint8_t)qtype, now_ms);
+                CacheEntry *ce = cache_lookup(h, qtype, now_ms);
                 if (ce) {
                     s_cnt_cache_hit++;
                     if (ce->blocked) {
@@ -493,7 +493,7 @@ void DnsSinkServer::run_loop()
                             sendto(csock, tx, tlen, 0, (sockaddr *)&client_addr, clen);
                             hist_record(&s_h_sendto, esp_timer_get_time() - t_s0);
                         }
-                        cache_store_blocked(h, (uint8_t)qtype, BLOCKED_TTL_S, now_ms);
+                        cache_store_blocked(h, qtype, BLOCKED_TTL_S, now_ms);
                         hist_record(&s_h_blocked, esp_timer_get_time() - t_recv);
                         continue;
                     }
@@ -514,7 +514,7 @@ void DnsSinkServer::run_loop()
                     ue->sent_ms     = now_ms;
                     ue->recv_us     = t_recv;
                     ue->qhash       = h;
-                    ue->qtype       = (uint8_t)qtype;
+                    ue->qtype       = qtype;
 
                     /* rewrite txid and forward */
                     hdr->id = htons(our_txid);
@@ -545,7 +545,7 @@ extern "C" uint32_t dns_sink_l2_blocked(void);  /* L2 fast-path counter (dns_sin
 
 void dns_server_metrics_reset(void)
 {
-    s_cnt_total = s_cnt_blocked = s_cnt_cached = s_cnt_forwarded = 0;
+    s_cnt_total = s_cnt_blocked = s_cnt_forwarded = 0;
     s_cnt_drop_table = s_cnt_upstream_to = s_cnt_cache_probe = s_cnt_cache_hit = 0;
     memset(&s_h_blocked,    0, sizeof(s_h_blocked));
     memset(&s_h_cached,     0, sizeof(s_h_cached));
@@ -595,14 +595,15 @@ int dns_server_metrics_json(char *out, size_t cap)
         {"lookup",           &s_h_lookup},
         {"sendto",           &s_h_sendto},
     };
-    n += snprintf(out + n, cap - n, "\"latency_us\":{");
+    if ((size_t)n < cap) n += snprintf(out + n, cap - (size_t)n, "\"latency_us\":{");
     for (size_t i = 0; i < sizeof(cats)/sizeof(cats[0]); i++) {
-        n += snprintf(out + n, cap - n,
+        if ((size_t)n >= cap) break;
+        n += snprintf(out + n, cap - (size_t)n,
             "%s\"%s\":{\"p50\":%" PRIu32 ",\"p99\":%" PRIu32 ",\"max\":%" PRIu32 ",\"count\":%" PRIu32 "}",
             i ? "," : "", cats[i].name,
             hist_pctl(cats[i].h, 0.50), hist_pctl(cats[i].h, 0.99),
             cats[i].h->max_us, cats[i].h->count);
     }
-    n += snprintf(out + n, cap - n, "}}");
+    if ((size_t)n < cap) n += snprintf(out + n, cap - (size_t)n, "}}");
     return n;
 }
