@@ -3,3 +3,5 @@ dependencies:
   idf: ">=6.0.0"
   espressif/w5500:
     version: "^1.0.1"
+  espressif/mdns:
+    version: "^1.2.5"

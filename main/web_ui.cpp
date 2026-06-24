@@ -90,7 +90,7 @@ static esp_err_t handle_status(httpd_req_t *r)
     bool     loading = blocklist_is_loading();
     uint32_t wl_n    = blocklist_whitelist_count();
 
-    static char page[4096];  /* static: avoids stack overflow in httpd task */
+    static char page[8192];  /* static: avoids stack overflow in httpd task */
     int  n = 0;
     n += snprintf(page + n, sizeof(page) - n,
         "<!DOCTYPE html><html><head><meta charset=utf-8>"
@@ -146,6 +146,38 @@ static esp_err_t handle_status(httpd_req_t *r)
         }
         n += snprintf(page + n, sizeof(page) - n, "</table>");
     }
+
+    /* Blocklist sources section (#4, #9) */
+    n += snprintf(page + n, sizeof(page) - n,
+        "<h3>Blocklist Sources</h3>"
+        "<table><tr><th>#</th><th>URL</th><th>Action</th></tr>"
+        "<tr><td>0 (primary)</td><td>%s</td><td>built-in</td></tr>",
+        BLOCKLIST_URL);
+    for (int i = 0; i < BLOCKLIST_EXTRA_MAX && n < (int)sizeof(page) - 512; i++) {
+        char url[BLOCKLIST_URL_CAP]; blocklist_extra_url_get(i, url, sizeof(url));
+        if (url[0]) {
+            char safe_url[BLOCKLIST_URL_CAP * 2]; html_escape(safe_url, sizeof(safe_url), url);
+            n += snprintf(page + n, sizeof(page) - n,
+                "<tr><td>%d</td><td>%s</td><td>"
+                "<form method=post action=/blocklist/url/clear>"
+                "<input type=hidden name=idx value=%d>"
+                "<button>Remove</button></form></td></tr>",
+                i + 1, safe_url, i);
+        } else {
+            n += snprintf(page + n, sizeof(page) - n,
+                "<tr><td>%d (empty)</td><td>"
+                "<form method=post action=/blocklist/url/set style='display:inline'>"
+                "<input type=hidden name=idx value=%d>"
+                "<input name=url placeholder='https://...' size=50>"
+                "<button>Add</button></form></td><td></td></tr>",
+                i + 1, i);
+        }
+    }
+    n += snprintf(page + n, sizeof(page) - n, "</table>"
+        "<p><small>After adding/removing a source, click <b>Reload blocklist</b> above.</small></p>"
+        "<p><small>Suggested security feeds: "
+        "<code>https://raw.githubusercontent.com/hagezi/dns-blocklists/main/domains/tif.txt</code> (malware/phishing) &nbsp; "
+        "<code>https://nsfw.oisd.nl/domainswild2</code> (adult content)</small></p>");
 
     n += snprintf(page + n, sizeof(page) - n, "</body></html>");
     (void)n;
@@ -261,26 +293,68 @@ static esp_err_t handle_wl_remove(httpd_req_t *r)
     return ESP_OK;
 }
 
+/* ── POST /blocklist/url/set — set extra blocklist URL (#4, #9) ── */
+static esp_err_t handle_bl_url_set(httpd_req_t *r)
+{
+    if (!csrf_ok(r)) {
+        httpd_resp_send_err(r, HTTPD_403_FORBIDDEN, "CSRF"); return ESP_FAIL;
+    }
+    char body[512] = {}; httpd_req_recv(r, body, sizeof(body) - 1);
+    /* parse: idx=0&url=https://... */
+    const char *pidx = strstr(body, "idx=");
+    const char *purl = strstr(body, "url=");
+    if (!pidx || !purl) { httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST, ""); return ESP_FAIL; }
+    int idx = (int)strtol(pidx + 4, nullptr, 10);
+    purl += 4;
+    size_t ulen = strlen(purl);
+    while (ulen && (purl[ulen-1] == '\r' || purl[ulen-1] == '\n')) ulen--;
+    char decoded[BLOCKLIST_URL_CAP]; url_decode(decoded, sizeof(decoded), purl, ulen);
+    blocklist_extra_url_set(idx, decoded);
+    httpd_resp_set_status(r, "303 See Other");
+    httpd_resp_set_hdr(r, "Location", "/");
+    httpd_resp_send(r, nullptr, 0);
+    return ESP_OK;
+}
+
+/* ── POST /blocklist/url/clear — clear extra blocklist URL (#4, #9) */
+static esp_err_t handle_bl_url_clear(httpd_req_t *r)
+{
+    if (!csrf_ok(r)) {
+        httpd_resp_send_err(r, HTTPD_403_FORBIDDEN, "CSRF"); return ESP_FAIL;
+    }
+    char body[64] = {}; httpd_req_recv(r, body, sizeof(body) - 1);
+    const char *pidx = strstr(body, "idx=");
+    if (!pidx) { httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST, ""); return ESP_FAIL; }
+    int idx = (int)strtol(pidx + 4, nullptr, 10);
+    blocklist_extra_url_set(idx, "");
+    httpd_resp_set_status(r, "303 See Other");
+    httpd_resp_set_hdr(r, "Location", "/");
+    httpd_resp_send(r, nullptr, 0);
+    return ESP_OK;
+}
+
 /* ── Public API ──────────────────────────────────────────────────── */
 bool web_ui_start(DnsSinkServer *dns)
 {
     s_dns = dns;
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.server_port      = 80;
-    cfg.max_uri_handlers = 12;
+    cfg.max_uri_handlers = 16;
     cfg.stack_size       = 8192;
     if (httpd_start(&s_server, &cfg) != ESP_OK) {
         ESP_LOGE(TAG, "httpd_start failed"); return false;
     }
 
     static const httpd_uri_t uris[] = {
-        { "/",                  HTTP_GET,  handle_status,        nullptr },
-        { "/metrics",           HTTP_GET,  handle_metrics,       nullptr },
-        { "/metrics/reset",     HTTP_POST, handle_metrics_reset, nullptr },
-        { "/reload",            HTTP_POST, handle_reload,        nullptr },
-        { "/check",             HTTP_POST, handle_check,     nullptr },
-        { "/whitelist/add",     HTTP_POST, handle_wl_add,    nullptr },
-        { "/whitelist/remove",  HTTP_POST, handle_wl_remove, nullptr },
+        { "/",                    HTTP_GET,  handle_status,        nullptr },
+        { "/metrics",             HTTP_GET,  handle_metrics,       nullptr },
+        { "/metrics/reset",       HTTP_POST, handle_metrics_reset, nullptr },
+        { "/reload",              HTTP_POST, handle_reload,        nullptr },
+        { "/check",               HTTP_POST, handle_check,         nullptr },
+        { "/whitelist/add",       HTTP_POST, handle_wl_add,        nullptr },
+        { "/whitelist/remove",    HTTP_POST, handle_wl_remove,     nullptr },
+        { "/blocklist/url/set",   HTTP_POST, handle_bl_url_set,    nullptr },
+        { "/blocklist/url/clear", HTTP_POST, handle_bl_url_clear,  nullptr },
     };
     for (auto &u : uris) httpd_register_uri_handler(s_server, &u);
 

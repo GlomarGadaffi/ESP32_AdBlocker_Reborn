@@ -56,6 +56,13 @@ void blocklist_whitelist_get(char out[][64], uint32_t *count_inout);
 bool     blocklist_load_sd(void);   /* returns true if loaded from /sdcard/blocklist.bin */
 void     blocklist_save_sd(void);   /* write sorted array to SD after successful download */
 
+/* Extra blocklist URLs (up to 4, NVS-backed; idx 0-3; empty string = disabled).
+ * Merged with BLOCKLIST_URL on each blocklist_load() call. (#4, #9) */
+#define BLOCKLIST_EXTRA_MAX  4
+#define BLOCKLIST_URL_CAP    256
+bool blocklist_extra_url_set(int idx, const char *url);   /* "" to clear */
+void blocklist_extra_url_get(int idx, char *buf, size_t cap);
+
 /* Stats */
 uint32_t blocklist_domain_count(void);
 bool     blocklist_is_loading(void);

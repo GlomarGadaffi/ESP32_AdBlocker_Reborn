@@ -34,6 +34,7 @@
 #include "domain.h"
 #include "dns_server.h"
 #include "web_ui.h"
+#include "mdns.h"
 #include <cstring>
 #include <cstdlib>
 
@@ -386,6 +387,14 @@ extern "C" void app_main(void)
 
     /* Start web UI on port 80 */
     web_ui_start(&s_dns);
+
+    /* mDNS: advertise as esp32adblock.local and expose the HTTP service (#20) */
+    if (mdns_init() == ESP_OK) {
+        mdns_hostname_set("esp32adblock");
+        mdns_instance_name_set("ESP32 AdBlocker");
+        mdns_service_add(nullptr, "_http", "_tcp", 80, nullptr, 0);
+        ESP_LOGI(TAG, "mDNS: reachable at esp32adblock.local");
+    }
 
     /* Launch blocklist download + daily reload (Core 0, priority 2).
      * 24KB stack: mbedTLS (HTTPS fetch) + FATFS (SD save) are both deep. */

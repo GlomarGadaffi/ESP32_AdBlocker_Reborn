@@ -27,4 +27,5 @@ idf_component_register(
         sdmmc
         fatfs
         esp_driver_sdspi
+        espressif__mdns
 )

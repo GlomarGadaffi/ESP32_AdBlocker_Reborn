@@ -37,6 +37,42 @@ static _Atomic(uint32_t *) s_live    = NULL;
 static _Atomic uint32_t    s_count   = 0;
 static _Atomic bool        s_loading = false;
 
+/* ── Extra blocklist URLs (NVS-backed, up to 4) ──────────────────── */
+static char s_extra_urls[BLOCKLIST_EXTRA_MAX][BLOCKLIST_URL_CAP];
+
+static void extra_urls_load_nvs(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS, NVS_READONLY, &h) != ESP_OK) return;
+    for (int i = 0; i < BLOCKLIST_EXTRA_MAX; i++) {
+        char key[12]; snprintf(key, sizeof(key), "bl_url_%d", i);
+        size_t len = BLOCKLIST_URL_CAP;
+        if (nvs_get_str(h, key, s_extra_urls[i], &len) != ESP_OK)
+            s_extra_urls[i][0] = '\0';
+    }
+    nvs_close(h);
+}
+
+bool blocklist_extra_url_set(int idx, const char *url)
+{
+    if (idx < 0 || idx >= BLOCKLIST_EXTRA_MAX || !url) return false;
+    if (strlen(url) >= BLOCKLIST_URL_CAP) return false;
+    snprintf(s_extra_urls[idx], BLOCKLIST_URL_CAP, "%s", url);
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS, NVS_READWRITE, &h) != ESP_OK) return false;
+    char key[12]; snprintf(key, sizeof(key), "bl_url_%d", idx);
+    nvs_set_str(h, key, url);
+    nvs_commit(h);
+    nvs_close(h);
+    return true;
+}
+
+void blocklist_extra_url_get(int idx, char *buf, size_t cap)
+{
+    if (idx < 0 || idx >= BLOCKLIST_EXTRA_MAX || !buf || cap == 0) { if (buf && cap) buf[0]='\0'; return; }
+    snprintf(buf, cap, "%s", s_extra_urls[idx]);
+}
+
 /* ── Whitelist (SRAM, NVS-backed) ────────────────────────────────── */
 static char s_whitelist[WHITELIST_MAX][64];
 static uint32_t s_wl_count = 0;
@@ -120,6 +156,7 @@ bool blocklist_init(void)
     ESP_LOGI(TAG, "PSRAM ping-pong: 2 x %" PRIu32 " KB allocated",
              (uint32_t)(BLOCKLIST_CAPACITY * 4 / 1024));
 
+    extra_urls_load_nvs();
     wl_load_nvs();
     return true;
 }
@@ -133,14 +170,24 @@ uint32_t blocklist_load(void)
     int new_buf = 1 - s_active_buf;
     load_ctx_t lc = { .buf = s_buf[new_buf], .cap = BLOCKLIST_CAPACITY, .n = 0 };
 
-    ESP_LOGI(TAG, "Downloading blocklist (old list stays live)...");
+    ESP_LOGI(TAG, "Downloading primary blocklist (old list stays live)...");
     bool ok = http_fetch_lines(BLOCKLIST_URL, on_domain_line, &lc);
     if (!ok || lc.n == 0) {
-        ESP_LOGE(TAG, "Download failed or empty; keeping previous list");
+        ESP_LOGE(TAG, "Primary download failed or empty; keeping previous list");
         atomic_store(&s_loading, false);
         return 0;
     }
-    ESP_LOGI(TAG, "Downloaded %" PRIu32 " domains; sorting...", lc.n);
+    ESP_LOGI(TAG, "Primary: %" PRIu32 " domains", lc.n);
+
+    /* Fetch extra blocklists and append to the same buffer */
+    for (int i = 0; i < BLOCKLIST_EXTRA_MAX; i++) {
+        if (s_extra_urls[i][0] == '\0') continue;
+        uint32_t before = lc.n;
+        ESP_LOGI(TAG, "Downloading extra list %d: %s", i, s_extra_urls[i]);
+        http_fetch_lines(s_extra_urls[i], on_domain_line, &lc);
+        ESP_LOGI(TAG, "Extra list %d: %" PRIu32 " domains added", i, lc.n - before);
+    }
+    ESP_LOGI(TAG, "Total %" PRIu32 " domains before dedup; sorting...", lc.n);
 
     /* The sort needs the other buffer as scratch — that's the live one, so we
      * must drop to degraded mode for the ~1-2s sort only (not the whole fetch).
