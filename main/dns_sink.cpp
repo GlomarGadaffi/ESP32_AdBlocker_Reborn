@@ -231,6 +231,7 @@ static void download_task(void *)
  * Everything else passes through to lwIP unchanged (DHCP, httpd, forwarding,
  * cache, allowed queries). Runs single-threaded in the eth RX task. */
 static uint32_t s_l2_blocked = 0;   /* L2-handled blocked queries (bypassed lwIP) */
+extern "C" uint32_t dns_sink_l2_blocked(void) { return s_l2_blocked; }
 
 /* Parse question qname → normalized name; return qend offset within DNS msg. */
 static int l2_qname(const uint8_t *dns, int dns_len, char *out, size_t cap, size_t *outlen)

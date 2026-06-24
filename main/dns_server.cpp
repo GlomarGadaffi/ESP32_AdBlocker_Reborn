@@ -541,6 +541,8 @@ done:
 uint64_t DnsSinkServer::queries_total()   const { return s_cnt_total; }
 uint64_t DnsSinkServer::queries_blocked() const { return s_cnt_blocked; }
 
+extern "C" uint32_t dns_sink_l2_blocked(void);  /* L2 fast-path counter (dns_sink.cpp) */
+
 void dns_server_metrics_reset(void)
 {
     s_cnt_total = s_cnt_blocked = s_cnt_cached = s_cnt_forwarded = 0;
@@ -569,6 +571,7 @@ int dns_server_metrics_json(char *out, size_t cap)
         "{"
         "\"uptime_s\":%lld,"
         "\"queries_total\":%" PRIu32 ",\"blocked\":%" PRIu32 ",\"forwarded\":%" PRIu32 ","
+        "\"l2_blocked\":%" PRIu32 ","
         "\"cache_probes\":%" PRIu32 ",\"cache_hits\":%" PRIu32 ",\"cache_hit_rate\":%.1f,"
         "\"dropped\":{\"table_full\":%" PRIu32 "},\"upstream_timeouts\":%" PRIu32 ","
         "\"upstream_inflight\":%d,\"upstream_max\":%d,"
@@ -576,6 +579,7 @@ int dns_server_metrics_json(char *out, size_t cap)
         "\"heap_free\":%u,\"psram_free\":%u,\"dns_task_stack_hwm\":%u,",
         (long long)(esp_timer_get_time() / 1000000),
         s_cnt_total, s_cnt_blocked, s_cnt_forwarded,
+        dns_sink_l2_blocked(),
         probes, hits, hitrate,
         s_cnt_drop_table, s_cnt_upstream_to,
         upstream_inflight(), UPSTREAM_TABLE_SIZE,

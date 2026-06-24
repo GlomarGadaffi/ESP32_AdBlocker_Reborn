@@ -32,6 +32,11 @@ CONFIG_LWIP_TCPIP_CORE_LOCKING=y
 # System
 CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=4096
 CONFIG_FREERTOS_HZ=1000
+# Full CPU clock (default was leaving it at 160MHz) — helps the lwIP forward/cache path.
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+# Pull lwIP's hot path into IRAM so a flash-cache miss never stalls UDP/IP — biggest
+# p99-tail win on the forwarded/cached (lwIP) path. Costs IRAM; back out if build overflows.
+CONFIG_LWIP_IRAM_OPTIMIZATION=y
 
 # Partition table — use the custom one already on the board (ota_0/ota_1/prompts layout)
 # CONFIG_PARTITION_TABLE_CUSTOM is set per-project in sdkconfig when needed
