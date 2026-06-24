@@ -33,6 +33,7 @@
 #include "blocklist.h"
 #include "domain.h"
 #include "rewrite.h"
+#include "query_log.h"
 #include "dns_server.h"
 #include "web_ui.h"
 #include "mdns.h"
@@ -372,6 +373,7 @@ extern "C" void app_main(void)
         for (;;) vTaskDelay(portMAX_DELAY);
     }
     rewrite_init();
+    query_log_init();
 
     /* Mount SD card (SPI3 — separate bus from W5500) */
     sd_mount();

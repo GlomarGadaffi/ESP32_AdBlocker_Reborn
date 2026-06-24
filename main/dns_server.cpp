@@ -2,6 +2,7 @@
 #include "blocklist.h"
 #include "domain.h"
 #include "rewrite.h"
+#include "query_log.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
@@ -573,6 +574,8 @@ void DnsSinkServer::run_loop()
                             tx[p++] =  rw_ip        & 0xFF;
                             sendto(csock, tx, p, 0, (sockaddr *)&client_addr, clen);
                             hist_record(&s_h_cached, esp_timer_get_time() - t_recv);
+                            query_log_record(name, qtype,
+                                ntohl(client_addr.sin_addr.s_addr), false, true);
                         }
                         continue;
                     }
@@ -607,8 +610,13 @@ void DnsSinkServer::run_loop()
                         }
                         cache_store_blocked(h, qtype, BLOCKED_TTL_S, now_ms);
                         hist_record(&s_h_blocked, esp_timer_get_time() - t_recv);
+                        query_log_record(name, qtype,
+                            ntohl(client_addr.sin_addr.s_addr), true, false);
                         continue;
                     }
+                    /* allowed: record before forwarding */
+                    query_log_record(name, qtype,
+                        ntohl(client_addr.sin_addr.s_addr), false, false);
                 }
 
                 /* ── forward to upstream ────────────────────── */

@@ -2,6 +2,7 @@
 #include "blocklist.h"
 #include "domain.h"
 #include "rewrite.h"
+#include "query_log.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
 #include <cstring>
@@ -128,7 +129,9 @@ static esp_err_t handle_status(httpd_req_t *r)
         "<button>Check</button></form><br>"
         "<form method=post action=/whitelist/add>"
         "<input name=domain placeholder='Add to whitelist' size=40>"
-        "<button>Whitelist</button></form>");
+        "<button>Whitelist</button></form><br>"
+        "<a href='/log'>Query log</a> &nbsp; <a href='/top'>Top lists</a>"
+        " &nbsp; <a href='/metrics'>Metrics JSON</a>");
 
     /* whitelist table */
     if (wl_n > 0) {
@@ -328,6 +331,83 @@ static esp_err_t handle_wl_remove(httpd_req_t *r)
     return ESP_OK;
 }
 
+/* ── GET /log — recent query log (#8) ───────────────────────────── */
+static esp_err_t handle_log(httpd_req_t *r)
+{
+    static QLogEntry entries[64];
+    uint32_t n = query_log_snapshot(entries, 64);
+    static char page[6144];
+    int pg = 0;
+    pg += snprintf(page + pg, sizeof(page) - pg,
+        "<!DOCTYPE html><html><head><meta charset=utf-8>"
+        "<title>Query Log</title>"
+        "<style>body{font-family:monospace;max-width:900px;margin:1em auto}"
+        "table{border-collapse:collapse;width:100%%}"
+        "td,th{border:1px solid #ccc;padding:.3em .6em;font-size:.85em}"
+        "th{background:#222;color:#eee}.blk{color:red}.rw{color:blue}"
+        ".ok{color:green}</style></head><body>"
+        "<h2>Query Log <small>(<a href='/'>home</a>)</small></h2>"
+        "<table><tr><th>Time</th><th>Client</th><th>Domain</th>"
+        "<th>Type</th><th>Result</th></tr>");
+    for (uint32_t i = 0; i < n && pg < (int)sizeof(page) - 256; i++) {
+        QLogEntry *e = &entries[i];
+        char safe[128]; html_escape(safe, sizeof(safe), e->domain);
+        const char *res  = e->blocked ? "BLOCKED" : (e->rewritten ? "REWRITE" : "ALLOWED");
+        const char *cls  = e->blocked ? "blk"     : (e->rewritten ? "rw"      : "ok");
+        const char *type = e->qtype == 1 ? "A" : (e->qtype == 28 ? "AAAA" :
+                           e->qtype == 5 ? "CNAME" : e->qtype == 15 ? "MX" : "?");
+        uint32_t ip = e->client_ip;
+        pg += snprintf(page + pg, sizeof(page) - pg,
+            "<tr><td>+%lus</td><td>%u.%u.%u.%u</td><td>%s</td>"
+            "<td>%s</td><td class='%s'>%s</td></tr>",
+            (unsigned long)e->ts_s,
+            (unsigned)((ip>>24)&0xFF),(unsigned)((ip>>16)&0xFF),
+            (unsigned)((ip>>8)&0xFF),(unsigned)(ip&0xFF),
+            safe, type, cls, res);
+    }
+    pg += snprintf(page + pg, sizeof(page) - pg, "</table></body></html>");
+    send_html(r, page);
+    return ESP_OK;
+}
+
+/* ── GET /top — top domains and clients (#7) ────────────────────── */
+static esp_err_t handle_top(httpd_req_t *r)
+{
+    static QTopEntry top_d[QTOP_DOMAINS], top_c[QTOP_CLIENTS];
+    uint32_t nd = query_log_top_domains(top_d, QTOP_DOMAINS);
+    uint32_t nc = query_log_top_clients(top_c, QTOP_CLIENTS);
+    static char page[4096];
+    int pg = 0;
+    pg += snprintf(page + pg, sizeof(page) - pg,
+        "<!DOCTYPE html><html><head><meta charset=utf-8>"
+        "<title>Top Lists</title>"
+        "<style>body{font-family:monospace;max-width:700px;margin:1em auto}"
+        "table{border-collapse:collapse;width:100%%}"
+        "td,th{border:1px solid #ccc;padding:.3em .6em}"
+        "th{background:#222;color:#eee}</style></head><body>"
+        "<h2>Top Lists <small>(<a href='/'>home</a>)</small></h2>"
+        "<h3>Top Queried Domains</h3>"
+        "<table><tr><th>Domain</th><th>Total</th><th>Blocked</th></tr>");
+    for (uint32_t i = 0; i < nd && top_d[i].total > 0 && pg < (int)sizeof(page) - 256; i++) {
+        char safe[128]; html_escape(safe, sizeof(safe), top_d[i].key);
+        pg += snprintf(page + pg, sizeof(page) - pg,
+            "<tr><td>%s</td><td>%lu</td><td>%lu</td></tr>",
+            safe, (unsigned long)top_d[i].total, (unsigned long)top_d[i].blocked);
+    }
+    pg += snprintf(page + pg, sizeof(page) - pg,
+        "</table><h3>Top Clients</h3>"
+        "<table><tr><th>Client IP</th><th>Total</th><th>Blocked</th></tr>");
+    for (uint32_t i = 0; i < nc && top_c[i].total > 0 && pg < (int)sizeof(page) - 256; i++) {
+        char safe[64]; html_escape(safe, sizeof(safe), top_c[i].key);
+        pg += snprintf(page + pg, sizeof(page) - pg,
+            "<tr><td>%s</td><td>%lu</td><td>%lu</td></tr>",
+            safe, (unsigned long)top_c[i].total, (unsigned long)top_c[i].blocked);
+    }
+    pg += snprintf(page + pg, sizeof(page) - pg, "</table></body></html>");
+    send_html(r, page);
+    return ESP_OK;
+}
+
 /* ── POST /rewrite/set — add a DNS rewrite rule (#12) ─────────── */
 static esp_err_t handle_rw_set(httpd_req_t *r)
 {
@@ -446,6 +526,8 @@ bool web_ui_start(DnsSinkServer *dns)
         { "/blocklist/url/clear", HTTP_POST, handle_bl_url_clear,  nullptr },
         { "/rewrite/set",         HTTP_POST, handle_rw_set,        nullptr },
         { "/rewrite/clear",       HTTP_POST, handle_rw_clear,      nullptr },
+        { "/log",                 HTTP_GET,  handle_log,           nullptr },
+        { "/top",                 HTTP_GET,  handle_top,           nullptr },
     };
     for (auto &u : uris) httpd_register_uri_handler(s_server, &u);
 
