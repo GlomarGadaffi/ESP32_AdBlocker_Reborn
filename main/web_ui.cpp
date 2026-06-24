@@ -140,7 +140,7 @@ static esp_err_t handle_status(httpd_req_t *r)
         n += snprintf(page + n, sizeof(page) - n,
             "<h3>Whitelist</h3><table>"
             "<tr><th>Domain</th><th>Action</th></tr>");
-        char wl[WHITELIST_MAX][64]; uint32_t cnt = WHITELIST_MAX;
+        static char wl[WHITELIST_MAX][64]; uint32_t cnt = WHITELIST_MAX;
         blocklist_whitelist_get(wl, &cnt);
         for (uint32_t i = 0; i < cnt && n < (int)sizeof(page) - 256; i++) {
             char safe_text[384], safe_attr[384];
@@ -159,8 +159,9 @@ static esp_err_t handle_status(httpd_req_t *r)
     /* Custom block rules (#14) */
     {
         static char crules[CUSTOM_RULES_CAP + 8];
+        static char safe_cr[CUSTOM_RULES_CAP * 2 + 8];
         size_t clen = blocklist_custom_get(crules, sizeof(crules));
-        char safe_cr[CUSTOM_RULES_CAP * 2 + 8]; html_escape(safe_cr, sizeof(safe_cr), crules);
+        html_escape(safe_cr, sizeof(safe_cr), crules);
         n += snprintf(page + n, sizeof(page) - n,
             "<h3>Custom Block Rules</h3>"
             "<form method=post action=/custom/rules>"
@@ -664,7 +665,7 @@ bool web_ui_start(DnsSinkServer *dns)
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.server_port      = 80;
     cfg.max_uri_handlers = 20;
-    cfg.stack_size       = 8192;
+    cfg.stack_size       = 16384;
     if (httpd_start(&s_server, &cfg) != ESP_OK) {
         ESP_LOGE(TAG, "httpd_start failed"); return false;
     }
