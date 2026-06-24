@@ -10,8 +10,11 @@ extern "C" {
 /* OISD big list URL (domainswild2 format) */
 #define BLOCKLIST_URL  "https://big.oisd.nl/domainswild2"
 
-/* Capacity: slightly above 489,537 with headroom for list growth */
-#define BLOCKLIST_CAPACITY  520000u
+/* Capacity must hold the UNION of all sources before dedup. OISD big (~333k) +
+ * hagezi Pro (~497k) dedupes to ~735k; 780k leaves headroom for list growth.
+ * Cost: 2 ping-pong buffers x CAPACITY x 4B in PSRAM (780k -> 6.24MB of ~8MB).
+ * Entries past capacity are silently dropped at load, so keep this >= union. */
+#define BLOCKLIST_CAPACITY  780000u
 
 /* NVS whitelist — domains that always bypass blocklist (up to 64) */
 #define WHITELIST_MAX  64
