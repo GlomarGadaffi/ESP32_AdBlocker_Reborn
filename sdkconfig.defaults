@@ -45,3 +45,19 @@ CONFIG_LWIP_IRAM_OPTIMIZATION=y
 
 # Partition table — use the custom one already on the board (ota_0/ota_1/prompts layout)
 # CONFIG_PARTITION_TABLE_CUSTOM is set per-project in sdkconfig when needed
+
+# ── Release performance + size ───────────────────────────────────────
+# Ship a real release build, not the IDF default -Og debug build.
+# -O2 for speed; assertions off (defines NDEBUG) drops all the assert strings
+# (size) and their runtime checks (speed) — the main size lever here.
+# (IDF 6.0.1 has no clean kconfig for LTO; per-component -flto would hurt
+#  maintainability, so it's intentionally not used.)
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+CONFIG_COMPILER_OPTIMIZATION_ASSERTIONS_DISABLE=y
+# Bigger instruction cache cuts flash misses on the DNS task (runs from flash;
+# only lwIP is in IRAM).
+CONFIG_ESP32S3_INSTRUCTION_CACHE_32KB=y
+# NOTE: flash MUST stay DIO. This module (ESP32-S3-WROOM-1 N16R8) has 8MB OCTAL
+# (OPI) PSRAM, and octal PSRAM contends with QIO flash on the S3 MSPI controller
+# — QIO causes a TG0WDT watchdog boot-loop on this board. DIO@80MHz is the
+# hardware ceiling here. Confirmed empirically + in LilyGO's own examples.

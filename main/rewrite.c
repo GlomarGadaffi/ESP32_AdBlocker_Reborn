@@ -29,7 +29,9 @@ static void entry_to_str(const RewriteEntry *e, char *buf, size_t cap)
     uint8_t b1 = (e->ipv4_hbo >> 16) & 0xFF;
     uint8_t b2 = (e->ipv4_hbo >> 8)  & 0xFF;
     uint8_t b3 =  e->ipv4_hbo        & 0xFF;
-    snprintf(buf, cap, "%s=%u.%u.%u.%u", e->domain, b0, b1, b2, b3);
+    /* %.63s bounds the domain so "domain=255.255.255.255\0" provably fits in the
+     * 80-byte NVS value buffer (63 + 1 + 15 + 1 = 80). */
+    snprintf(buf, cap, "%.63s=%u.%u.%u.%u", e->domain, b0, b1, b2, b3);
 }
 
 static bool str_to_entry(const char *s, RewriteEntry *e)
@@ -160,7 +162,7 @@ void rewrite_list(char out_domains[][64], uint32_t out_ips[], uint32_t *count_in
     uint32_t cap = *count_inout;
     uint32_t n = s_count < cap ? s_count : cap;
     for (uint32_t i = 0; i < n; i++) {
-        snprintf(out_domains[i], 64, "%s", s_rules[i].domain);
+        snprintf(out_domains[i], 64, "%.63s", s_rules[i].domain);
         out_ips[i] = s_rules[i].ipv4_hbo;
     }
     *count_inout = n;
