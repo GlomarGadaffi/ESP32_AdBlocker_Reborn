@@ -28,9 +28,40 @@ L2 fast path that answers blocked queries without going through lwIP.
   parsed from the answer records, then replayed on repeat. CNAME chains and
   non-A records are preserved. A ~40 ms gateway round trip becomes a ~1.8 ms
   local hit.
-* HTTP telemetry. GET /metrics returns JSON counters and per-category
-  microsecond latency histograms. GET / is a status page. POST endpoints:
-  /reload, /check, /whitelist/add, /whitelist/remove, /metrics/reset.
+* HTTP telemetry and control. GET /metrics returns JSON counters and
+  per-category microsecond latency histograms. GET / is a status page with live
+  stat boxes and a clock-sync indicator. GET /log shows the recent query log
+  (dated, see below); GET /top shows top domains/clients and a per-minute
+  CSS bar graph. POST endpoints cover blocklist reload, domain check, whitelist
+  add/remove, custom rules, DNS rewrites, client ACL, extra blocklist URLs, DoT
+  config, and metrics reset.
+
+## Feature set
+
+Beyond the core sinkhole, the device is a fairly complete Pi-hole-class
+appliance — these are all live and verified on hardware:
+
+* **mDNS** — reachable at `esp32adblock.local`, no IP needed.
+* **Multiple blocklist sources** — the built-in OISD primary plus up to four
+  extra URL feeds (malware/phishing, adult, etc.), each NVS-persisted.
+* **Custom block rules** — an inline textarea (hosts format or bare domains,
+  `#` comments), wildcard-style suffix matching, NVS-backed.
+* **Whitelist** — exempt domains from blocking, NVS-backed.
+* **DNS rewrites** — map a local domain to a fixed IP (local-zone / split-horizon),
+  exact + subdomain match, up to 16 rules.
+* **Client ACL** — restrict which client IPs may use the resolver (empty = allow
+  all), enforced before any lookup.
+* **Query log + analytics** — a 512-entry PSRAM ring with real wall-clock
+  timestamps (NTP, below), approximate top-N domains and clients, and a 60-bucket
+  per-minute history graph rendered as pure CSS (no JavaScript).
+* **NTP wall-clock time** — built-in lwIP SNTP against `time.nist.gov` +
+  `pool.ntp.org` (UTC), so log entries carry real dates that survive reboots
+  rather than seconds-since-boot.
+* **DNS-over-TLS upstream (opt-in)** — forward to an encrypted upstream
+  (RFC 7858, e.g. 1.1.1.1 / one.one.one.one) with automatic fallback to plain
+  UDP on failure.
+* **Cache-poisoning hardening** — randomized transaction IDs plus question
+  (qname + qtype) validation on every upstream reply before it is cached.
 
 ## Measured performance
 
@@ -70,34 +101,40 @@ query), not software.
 
 ## Status and known issues
 
-A full-codebase review (June 2026) audited the firmware and filed the results to
-the issue tracker. The figures above are real bench measurements, but a few of
-the advertised wins are currently undercut by open bugs — worth knowing before
-you rely on them:
+Two full-codebase reviews (June 2026) audited the firmware. The first round's
+findings have since been fixed and verified on hardware; see `ISSUES.md` for the
+per-item record. Resolved since the original audit:
 
-* **Forward-cache hit rate is low for dual-stack clients.** Cache slots are
-  indexed by domain hash only, with the query type not folded into the slot, so
-  the A and AAAA records for the same name share one slot and evict each other.
-  Modern stub resolvers (glibc `getaddrinfo`, browsers) issue A+AAAA in
-  parallel, so the ~1.8 ms cached-hit path rarely triggers on repeat lookups until
-  this is fixed. The hit *latency* is accurate; the hit *rate* is not yet. (#43)
-* **The L2 fast path stalls briefly during whitelist edits.** The Ethernet RX
-  hook takes the whitelist mutex, which the writer holds across an NVS commit
-  (~10–100 ms of flash work), so adding or removing a whitelist entry pauses the
-  fast path and frame intake for the commit. Steady-state latency is
-  unaffected. (#37)
-* **The "about a second" SD reload is not independently re-measured.** The load
-  path reads PSRAM directly through FATFS where the save path deliberately
-  bounces through a DRAM buffer, so real cold-boot time may be higher. (#38)
-* **Large upstream responses are truncated.** Replies over 512 bytes are cut to
-  512 with no TC bit set, which breaks DNSSEC, large TXT (SPF/DKIM), and HTTPS
-  RRs for forwarded queries. (#36)
-* **Security: the HTTP control UI is LAN-trust-only.** It has no CSRF protection
-  and reflects/stores user input without escaping, and upstream replies are
-  accepted without source-address validation. Do not expose the board's HTTP
-  port; treat the device as trusted-LAN only. (#22, #23, #24, #28, #35, #44)
+* **Forward cache now isolates A and AAAA.** The slot index folds the query type
+  in (`(h ^ (qtype<<1)) & 0xFF`) and a hit requires a matching `qtype`, so the
+  A and AAAA records for a name occupy separate slots and both cache-hit on
+  repeat — verified live (a repeat A+AAAA pair scores two cache hits). (#43)
+* **L2 fast path no longer stalls on whitelist edits.** The RX hook uses a
+  non-blocking mutex take and the blocking path a bounded 2 ms take, and NVS
+  commits run outside the lock. (#37)
+* **Upstream truncation sets the TC bit** and truncated replies are excluded from
+  the cache, so clients correctly retry over TCP. (#36)
+* **HTTP control UI hardened.** CSRF origin/host checking on all POSTs, HTML
+  escaping of reflected/stored input, client ACL, and upstream replies validated
+  by source address *and* by matching question (qname+qtype) with randomized
+  txids. It is still intended for trusted-LAN use — don't expose port 80 to the
+  internet. (#22, #23, #24, #28, #35, #44)
+* **Concurrency races fixed.** The custom-rules, ACL, and rewrite tables are now
+  synchronized between the httpd writer and the dns_task reader.
 
-See the issue tracker for the full list and the code-grounded analysis on each.
+Remaining open items:
+
+* **DoT runs synchronously in the DNS task.** With DoT enabled, a slow query can
+  briefly stall other queries; the inline timeout is capped (1.5 s) and falls
+  back to UDP, but the proper fix is a worker task / persistent session. DoT is
+  opt-in and off by default. (ISSUES.md C2)
+* **The "about a second" SD reload is not independently re-measured.** (#38)
+* **Some headline ad roots aren't in the loaded list.** e.g. `doubleclick.net`
+  resolves while `analytics.tiktok.com` is blocked — a blocklist-content/cache
+  freshness question (the matching engine works on 333k domains), not a code
+  bug. Try a fresh `/reload` and re-check.
+
+See the issue tracker and `ISSUES.md` for the full, code-grounded analysis.
 
 ## Hardware
 
@@ -124,9 +161,14 @@ address.
 
 ```
 main/
-  dns_sink.cpp     entry: W5500 + SD bringup, L2 fast-path RX hook, download task
-  dns_server.cpp   UDP :53 server, result cache, upstream forward table, /metrics
-  blocklist.c      PSRAM hash table, radix sort, SD persistence, NVS whitelist
+  dns_sink.cpp     entry: W5500 + SD bringup, L2 fast-path RX hook, download task, SNTP
+  dns_server.cpp   UDP :53 server, result cache, upstream forward table, DoT path, /metrics
+  blocklist.c      PSRAM hash table, radix sort, SD persistence, NVS whitelist + custom rules
+  rewrite.c        DNS rewrite rules (local-zone / domain->IP)
+  acl.c            client IP allowlist
+  dot.c            DNS-over-TLS upstream (RFC 7858, esp-tls)
+  query_log.c      query-log ring, top-N tables, per-minute history
+  timesync.c       SNTP wall-clock time (NIST + NTP pool)
   http_fetch.c     streaming HTTPS line fetcher
   domain.c         shared domain normalization and TLD detection
   murmur3.c        MurmurHash3_x86_32
