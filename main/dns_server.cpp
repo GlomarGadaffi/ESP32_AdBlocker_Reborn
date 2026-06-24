@@ -2,6 +2,7 @@
 #include "blocklist.h"
 #include "domain.h"
 #include "rewrite.h"
+#include "acl.h"
 #include "query_log.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -495,6 +496,9 @@ void DnsSinkServer::run_loop()
                 if (rlen < 0) break;                           /* EWOULDBLOCK: drained */
                 if (rlen < (int)sizeof(DnsHeader)) continue;
 
+                /* ACL check (#10) — drop queries from unlisted clients */
+                if (!acl_permits(ntohl(client_addr.sin_addr.s_addr))) continue;
+
                 auto *hdr = reinterpret_cast<DnsHeader *>(rx);
                 if ((ntohs(hdr->flags) & 0x8000) || ntohs(hdr->qdcount) == 0) continue;
 
@@ -586,7 +590,8 @@ void DnsSinkServer::run_loop()
                  * local initializations (illegal in C++). */
                 {
                     int64_t t_lk = esp_timer_get_time();
-                    bool is_blk = blocklist_is_blocked(name, nlen);
+                    bool is_blk = blocklist_is_blocked(name, nlen) ||
+                                  blocklist_custom_is_blocked(name, nlen);
                     hist_record(&s_h_lookup, esp_timer_get_time() - t_lk);
                     if (is_blk) {
                         s_cnt_blocked++;

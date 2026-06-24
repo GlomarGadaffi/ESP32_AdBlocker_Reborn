@@ -2,6 +2,7 @@
 #include "blocklist.h"
 #include "domain.h"
 #include "rewrite.h"
+#include "acl.h"
 #include "query_log.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
@@ -154,6 +155,21 @@ static esp_err_t handle_status(httpd_req_t *r)
         n += snprintf(page + n, sizeof(page) - n, "</table>");
     }
 
+    /* Custom block rules (#14) */
+    {
+        static char crules[CUSTOM_RULES_CAP + 8];
+        size_t clen = blocklist_custom_get(crules, sizeof(crules));
+        char safe_cr[CUSTOM_RULES_CAP * 2 + 8]; html_escape(safe_cr, sizeof(safe_cr), crules);
+        n += snprintf(page + n, sizeof(page) - n,
+            "<h3>Custom Block Rules</h3>"
+            "<form method=post action=/custom/rules>"
+            "<textarea name=rules rows=5 cols=60 placeholder='One domain per line. Lines starting with # are comments."
+            " Hosts format (0.0.0.0 domain) also accepted.'>%s</textarea><br>"
+            "<button>Save rules</button></form>",
+            safe_cr);
+        (void)clen;
+    }
+
     /* DNS rewrite table (#12) */
     {
         uint32_t rw_n = rewrite_count();
@@ -182,6 +198,34 @@ static esp_err_t handle_status(httpd_req_t *r)
                     safe_da);
             }
             n += snprintf(page + n, sizeof(page) - n, "</table>");
+        }
+    }
+
+    /* Client ACL section (#10) */
+    {
+        char acl_ips[ACL_MAX][20]; uint32_t acl_n = ACL_MAX;
+        acl_list(acl_ips, &acl_n);
+        n += snprintf(page + n, sizeof(page) - n,
+            "<h3>Client Access Control</h3>"
+            "<p><small>Empty = allow all. If any IP is listed, only those clients may use this DNS server.</small></p>"
+            "<form method=post action=/acl/add>"
+            "<input name=ip placeholder='192.168.x.x' size=18>"
+            "<button>Add allowed client</button></form>");
+        if (acl_n > 0) {
+            n += snprintf(page + n, sizeof(page) - n, "<table><tr><th>Allowed client IP</th><th>Action</th></tr>");
+            for (uint32_t i = 0; i < acl_n && n < (int)sizeof(page) - 256; i++) {
+                char safe_ip[48]; html_escape(safe_ip, sizeof(safe_ip), acl_ips[i]);
+                char safe_ipv[48]; html_escape(safe_ipv, sizeof(safe_ipv), acl_ips[i]);
+                n += snprintf(page + n, sizeof(page) - n,
+                    "<tr><td>%s</td><td>"
+                    "<form method=post action=/acl/remove>"
+                    "<input type=hidden name=ip value=\"%s\">"
+                    "<button>Remove</button></form></td></tr>",
+                    safe_ip, safe_ipv);
+            }
+            n += snprintf(page + n, sizeof(page) - n, "</table>"
+                "<form method=post action=/acl/clear style='margin-top:.5em'>"
+                "<button>Clear all (allow everyone)</button></form>");
         }
     }
 
@@ -331,6 +375,58 @@ static esp_err_t handle_wl_remove(httpd_req_t *r)
     return ESP_OK;
 }
 
+/* ── POST /acl/add — add allowed client IP (#10) ────────────────── */
+static esp_err_t handle_acl_add(httpd_req_t *r)
+{
+    if (!csrf_ok(r)) { httpd_resp_send_err(r, HTTPD_403_FORBIDDEN, "CSRF"); return ESP_FAIL; }
+    char body[64] = {}; httpd_req_recv(r, body, sizeof(body) - 1);
+    const char *p = strstr(body, "ip=");
+    if (p) { p += 3; char ip[24]={0}; size_t l=0; for(;p[l]&&p[l]!='&'&&p[l]!='\r'&&l<23;l++) ip[l]=p[l]; ip[l]=0; acl_add(ip); }
+    httpd_resp_set_status(r, "303 See Other"); httpd_resp_set_hdr(r, "Location", "/"); httpd_resp_send(r,nullptr,0); return ESP_OK;
+}
+
+/* ── POST /acl/remove ────────────────────────────────────────────── */
+static esp_err_t handle_acl_remove(httpd_req_t *r)
+{
+    if (!csrf_ok(r)) { httpd_resp_send_err(r, HTTPD_403_FORBIDDEN, "CSRF"); return ESP_FAIL; }
+    char body[64] = {}; httpd_req_recv(r, body, sizeof(body) - 1);
+    const char *p = strstr(body, "ip=");
+    if (p) { p += 3; char ip[24]={0}; size_t l=0; for(;p[l]&&p[l]!='&'&&p[l]!='\r'&&l<23;l++) ip[l]=p[l]; ip[l]=0; acl_remove(ip); }
+    httpd_resp_set_status(r, "303 See Other"); httpd_resp_set_hdr(r, "Location", "/"); httpd_resp_send(r,nullptr,0); return ESP_OK;
+}
+
+/* ── POST /acl/clear ─────────────────────────────────────────────── */
+static esp_err_t handle_acl_clear(httpd_req_t *r)
+{
+    if (!csrf_ok(r)) { httpd_resp_send_err(r, HTTPD_403_FORBIDDEN, "CSRF"); return ESP_FAIL; }
+    char body[4] = {}; httpd_req_recv(r, body, sizeof(body) - 1); /* consume body */
+    acl_clear();
+    httpd_resp_set_status(r, "303 See Other"); httpd_resp_set_hdr(r, "Location", "/"); httpd_resp_send(r,nullptr,0); return ESP_OK;
+}
+
+/* ── POST /custom/rules — save inline block rules (#14) ─────────── */
+static esp_err_t handle_custom_rules(httpd_req_t *r)
+{
+    if (!csrf_ok(r)) {
+        httpd_resp_send_err(r, HTTPD_403_FORBIDDEN, "CSRF"); return ESP_FAIL;
+    }
+    static char body[CUSTOM_RULES_CAP + 64];
+    int got = httpd_req_recv(r, body, sizeof(body) - 1);
+    if (got <= 0) { httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST, ""); return ESP_FAIL; }
+    body[got] = '\0';
+    const char *p = strstr(body, "rules=");
+    if (!p) { httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST, ""); return ESP_FAIL; }
+    p += 6;
+    /* url-decode into a temp buffer */
+    static char decoded[CUSTOM_RULES_CAP + 4];
+    url_decode(decoded, sizeof(decoded), p, strlen(p));
+    blocklist_custom_set(decoded);
+    httpd_resp_set_status(r, "303 See Other");
+    httpd_resp_set_hdr(r, "Location", "/");
+    httpd_resp_send(r, nullptr, 0);
+    return ESP_OK;
+}
+
 /* ── GET /log — recent query log (#8) ───────────────────────────── */
 static esp_err_t handle_log(httpd_req_t *r)
 {
@@ -370,22 +466,50 @@ static esp_err_t handle_log(httpd_req_t *r)
     return ESP_OK;
 }
 
-/* ── GET /top — top domains and clients (#7) ────────────────────── */
+/* ── GET /top — top domains, clients + live history graph (#7,#11) ─ */
 static esp_err_t handle_top(httpd_req_t *r)
 {
     static QTopEntry top_d[QTOP_DOMAINS], top_c[QTOP_CLIENTS];
     uint32_t nd = query_log_top_domains(top_d, QTOP_DOMAINS);
     uint32_t nc = query_log_top_clients(top_c, QTOP_CLIENTS);
-    static char page[4096];
+    static uint32_t h_total[QHIST_BUCKETS], h_blocked[QHIST_BUCKETS];
+    uint32_t h_count = 0;
+    query_log_history(h_total, h_blocked, &h_count);
+    /* find max for scaling */
+    uint32_t h_max = 1;
+    for (uint32_t i = 0; i < h_count; i++) if (h_total[i] > h_max) h_max = h_total[i];
+
+    static char page[6144];
     int pg = 0;
     pg += snprintf(page + pg, sizeof(page) - pg,
         "<!DOCTYPE html><html><head><meta charset=utf-8>"
-        "<title>Top Lists</title>"
-        "<style>body{font-family:monospace;max-width:700px;margin:1em auto}"
+        "<meta http-equiv='refresh' content='30'>"
+        "<title>Stats</title>"
+        "<style>body{font-family:monospace;max-width:800px;margin:1em auto}"
         "table{border-collapse:collapse;width:100%%}"
         "td,th{border:1px solid #ccc;padding:.3em .6em}"
-        "th{background:#222;color:#eee}</style></head><body>"
-        "<h2>Top Lists <small>(<a href='/'>home</a>)</small></h2>"
+        "th{background:#222;color:#eee}"
+        ".chart{display:flex;align-items:flex-end;gap:2px;height:80px;border-bottom:1px solid #888;margin:.5em 0}"
+        ".bar{width:10px;display:inline-flex;flex-direction:column;justify-content:flex-end}"
+        ".bt{background:#4a90d9}.bb{background:#e74c3c}</style></head><body>"
+        "<h2>Stats &amp; Graphs <small>(<a href='/'>home</a>)</small></h2>"
+        "<h3>Query Volume (last %lu minutes)</h3>"
+        "<div class=chart>",
+        (unsigned long)h_count);
+    /* render bars oldest→newest */
+    for (int i = (int)h_count - 1; i >= 0 && pg < (int)sizeof(page) - 256; i--) {
+        uint32_t allowed  = h_total[i] > h_blocked[i] ? h_total[i] - h_blocked[i] : 0;
+        uint32_t th = (allowed  * 78) / h_max;
+        uint32_t bh = (h_blocked[i] * 78) / h_max;
+        pg += snprintf(page + pg, sizeof(page) - pg,
+            "<div class=bar title='%lut %lub'>"
+            "<div class=bb style='height:%lupx'></div>"
+            "<div class=bt style='height:%lupx'></div></div>",
+            (unsigned long)h_total[i], (unsigned long)h_blocked[i],
+            (unsigned long)bh, (unsigned long)th);
+    }
+    pg += snprintf(page + pg, sizeof(page) - pg,
+        "</div><p><small>Blue=allowed Red=blocked. Each bar=1 min.</small></p>"
         "<h3>Top Queried Domains</h3>"
         "<table><tr><th>Domain</th><th>Total</th><th>Blocked</th></tr>");
     for (uint32_t i = 0; i < nd && top_d[i].total > 0 && pg < (int)sizeof(page) - 256; i++) {
@@ -528,6 +652,10 @@ bool web_ui_start(DnsSinkServer *dns)
         { "/rewrite/clear",       HTTP_POST, handle_rw_clear,      nullptr },
         { "/log",                 HTTP_GET,  handle_log,           nullptr },
         { "/top",                 HTTP_GET,  handle_top,           nullptr },
+        { "/custom/rules",        HTTP_POST, handle_custom_rules,  nullptr },
+        { "/acl/add",             HTTP_POST, handle_acl_add,       nullptr },
+        { "/acl/remove",          HTTP_POST, handle_acl_remove,    nullptr },
+        { "/acl/clear",           HTTP_POST, handle_acl_clear,     nullptr },
     };
     for (auto &u : uris) httpd_register_uri_handler(s_server, &u);
 

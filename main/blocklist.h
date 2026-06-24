@@ -63,6 +63,16 @@ void     blocklist_save_sd(void);   /* write sorted array to SD after successful
 bool blocklist_extra_url_set(int idx, const char *url);   /* "" to clear */
 void blocklist_extra_url_get(int idx, char *buf, size_t cap);
 
+/* Custom block rules — domains entered inline in the UI (#14).
+ * Newline/space-separated list, stored in NVS as a single blob (max 4000 chars).
+ * Supports plain domain names and hosts-file format ("0.0.0.0 domain").
+ * Comments (#) are stripped. Applied as an overlay on top of the main blocklist. */
+#define CUSTOM_RULES_MAX  256    /* max parsed entries */
+#define CUSTOM_RULES_CAP  4000   /* max raw text bytes */
+bool   blocklist_custom_set(const char *text);      /* save text, re-parse */
+size_t blocklist_custom_get(char *buf, size_t cap); /* retrieve raw text */
+bool   blocklist_custom_is_blocked(const char *domain, size_t len);
+
 /* Stats */
 uint32_t blocklist_domain_count(void);
 bool     blocklist_is_loading(void);

@@ -44,6 +44,13 @@ uint32_t query_log_top_clients(QTopEntry *out, uint32_t cap);
 /* Total unique domains seen (approx), total queries, total blocked */
 void query_log_stats(uint32_t *total_out, uint32_t *blocked_out);
 
+/* Per-minute history ring: up to 60 buckets of (total, blocked) counts (#11).
+ * Bucket granularity: 60 seconds. */
+#define QHIST_BUCKETS 60
+void query_log_history(uint32_t total_out[QHIST_BUCKETS],
+                       uint32_t blocked_out[QHIST_BUCKETS],
+                       uint32_t *count_out);  /* actual buckets filled */
+
 #ifdef __cplusplus
 }
 #endif

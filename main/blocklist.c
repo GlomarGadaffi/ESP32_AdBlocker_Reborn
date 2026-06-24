@@ -13,6 +13,7 @@
 #include <inttypes.h>
 #include <stdio.h>
 #include <errno.h>
+#include <ctype.h>
 
 #define SD_BL_PATH  "/sdcard/blocklist.bin"
 #define SD_MAGIC    0xB10C1573u  /* identifies our binary format */
@@ -36,6 +37,98 @@ static int       s_active_buf = 0;  /* which buffer is currently live  */
 static _Atomic(uint32_t *) s_live    = NULL;
 static _Atomic uint32_t    s_count   = 0;
 static _Atomic bool        s_loading = false;
+
+/* ── Custom blocking rules (NVS-backed, inline text blob) (#14) ── */
+static char s_custom_entries[CUSTOM_RULES_MAX][64];
+static uint32_t s_custom_count = 0;
+
+static void custom_parse(const char *text)
+{
+    s_custom_count = 0;
+    const char *p = text;
+    while (*p && s_custom_count < CUSTOM_RULES_MAX) {
+        /* skip whitespace/newlines */
+        while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+        if (!*p) break;
+        /* skip comment lines */
+        if (*p == '#' || *p == '!') {
+            while (*p && *p != '\n') p++;
+            continue;
+        }
+        /* skip "0.0.0.0 " or "127.0.0.1 " prefix if present (hosts format) */
+        if ((*p >= '0' && *p <= '9') || *p == ':') {
+            while (*p && *p != ' ' && *p != '\t') p++;
+            while (*p == ' ' || *p == '\t') p++;
+            if (!*p || *p == '\r' || *p == '\n') continue;
+        }
+        /* read domain token */
+        const char *start = p;
+        while (*p && *p != ' ' && *p != '\t' && *p != '\r' && *p != '\n' && *p != '#') p++;
+        size_t len = (size_t)(p - start);
+        if (len == 0 || len >= 64) continue;
+        /* strip trailing dot */
+        while (len > 0 && start[len-1] == '.') len--;
+        if (len == 0) continue;
+        for (size_t i = 0; i < len; i++)
+            s_custom_entries[s_custom_count][i] = (char)tolower((unsigned char)start[i]);
+        s_custom_entries[s_custom_count][len] = '\0';
+        s_custom_count++;
+        /* skip rest of line */
+        while (*p && *p != '\n') p++;
+    }
+}
+
+bool blocklist_custom_set(const char *text)
+{
+    if (!text) return false;
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS, NVS_READWRITE, &h) != ESP_OK) return false;
+    nvs_set_str(h, "custom_blk", text);
+    nvs_commit(h);
+    nvs_close(h);
+    custom_parse(text);
+    return true;
+}
+
+size_t blocklist_custom_get(char *buf, size_t cap)
+{
+    if (!buf || cap == 0) return 0;
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS, NVS_READONLY, &h) != ESP_OK) { buf[0]='\0'; return 0; }
+    size_t len = cap;
+    if (nvs_get_str(h, "custom_blk", buf, &len) != ESP_OK) buf[0]='\0', len=0;
+    nvs_close(h);
+    return len > 0 ? len - 1 : 0;
+}
+
+bool blocklist_custom_is_blocked(const char *domain, size_t len)
+{
+    if (s_custom_count == 0 || !domain) return false;
+    const char *name = domain;
+    while (name < domain + len) {
+        size_t rlen = (size_t)((domain + len) - name);
+        for (uint32_t i = 0; i < s_custom_count; i++) {
+            size_t elen = strlen(s_custom_entries[i]);
+            if (rlen == elen && memcmp(name, s_custom_entries[i], rlen) == 0)
+                return true;
+        }
+        const char *dot = memchr(name, '.', rlen);
+        if (!dot) break;
+        name = dot + 1;
+    }
+    return false;
+}
+
+static void custom_load_nvs(void)
+{
+    static char buf[CUSTOM_RULES_CAP + 1];
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS, NVS_READONLY, &h) != ESP_OK) return;
+    size_t len = sizeof(buf);
+    if (nvs_get_str(h, "custom_blk", buf, &len) == ESP_OK)
+        custom_parse(buf);
+    nvs_close(h);
+}
 
 /* ── Extra blocklist URLs (NVS-backed, up to 4) ──────────────────── */
 static char s_extra_urls[BLOCKLIST_EXTRA_MAX][BLOCKLIST_URL_CAP];
@@ -157,6 +250,7 @@ bool blocklist_init(void)
              (uint32_t)(BLOCKLIST_CAPACITY * 4 / 1024));
 
     extra_urls_load_nvs();
+    custom_load_nvs();
     wl_load_nvs();
     return true;
 }

@@ -11,6 +11,11 @@ static const char *TAG = "qlog";
 static QLogEntry *s_ring = NULL;
 static _Atomic uint32_t s_head = 0;   /* next write slot (mod QLOG_SIZE) */
 
+/* ── per-minute history (60 buckets) ─────────────────────────────── */
+typedef struct { uint32_t total; uint32_t blocked; } HistBucket;
+static HistBucket s_hist[QHIST_BUCKETS];
+static uint32_t   s_hist_minute = 0;   /* which minute slot we're filling */
+
 /* ── top-domain table (approx LFU: evict on collision by count) ──── */
 static QTopEntry *s_top_d = NULL;
 static QTopEntry *s_top_c = NULL;
@@ -61,6 +66,23 @@ void query_log_record(const char *domain, uint16_t qtype, uint32_t client_ip_hbo
     e->qtype     = qtype;
     e->blocked   = blocked;
     e->rewritten = rewritten;
+
+    /* Per-minute history bucket */
+    uint32_t now_min = e->ts_s / 60;
+    if (now_min != s_hist_minute) {
+        /* advance to new minute, clear skipped buckets */
+        uint32_t skip = now_min - s_hist_minute;
+        if (skip > QHIST_BUCKETS) skip = QHIST_BUCKETS;
+        for (uint32_t i = 0; i < skip; i++) {
+            uint32_t slot = (s_hist_minute + 1 + i) % QHIST_BUCKETS;
+            s_hist[slot].total = 0;
+            s_hist[slot].blocked = 0;
+        }
+        s_hist_minute = now_min;
+    }
+    uint32_t hslot = now_min % QHIST_BUCKETS;
+    s_hist[hslot].total++;
+    if (blocked) s_hist[hslot].blocked++;
 
     top_insert(s_top_d, QTOP_DOMAINS, e->domain, blocked);
 
@@ -117,4 +139,20 @@ void query_log_stats(uint32_t *total_out, uint32_t *blocked_out)
     uint32_t h = atomic_load(&s_head);
     if (total_out)   *total_out   = h;
     if (blocked_out) *blocked_out = 0; /* main counters are in dns_server.cpp */
+}
+
+void query_log_history(uint32_t total_out[QHIST_BUCKETS],
+                       uint32_t blocked_out[QHIST_BUCKETS],
+                       uint32_t *count_out)
+{
+    /* Walk backwards from most recent bucket, up to QHIST_BUCKETS */
+    uint32_t cur = s_hist_minute;
+    uint32_t filled = 0;
+    for (uint32_t i = 0; i < QHIST_BUCKETS; i++) {
+        uint32_t slot = (cur - i + QHIST_BUCKETS * 2) % QHIST_BUCKETS;
+        total_out[i]   = s_hist[slot].total;
+        blocked_out[i] = s_hist[slot].blocked;
+        if (s_hist[slot].total > 0) filled = i + 1;
+    }
+    *count_out = filled > 0 ? filled : 1;
 }
