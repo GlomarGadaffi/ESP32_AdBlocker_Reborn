@@ -39,11 +39,16 @@ uint32_t blocklist_load(void);
  * Returns false during reload window (g_blocklist == NULL).
  */
 bool blocklist_is_blocked(const char *domain, size_t len);
+/* Non-blocking variant for the L2 eth RX task (#37 — see blocklist_whitelist_contains_nb). */
+bool blocklist_is_blocked_nb(const char *domain, size_t len);
 
 /* Whitelist management (stored in NVS, survives reboot) */
 bool blocklist_whitelist_add(const char *domain);
 bool blocklist_whitelist_remove(const char *domain);
 bool blocklist_whitelist_contains(const char *domain, size_t len);
+/* Non-blocking variant for the L2 RX hook: returns false (allow-through) if
+ * the mutex is held rather than stalling the Ethernet receive path (#37). */
+bool blocklist_whitelist_contains_nb(const char *domain, size_t len);
 uint32_t blocklist_whitelist_count(void);
 void blocklist_whitelist_get(char out[][64], uint32_t *count_inout);
 

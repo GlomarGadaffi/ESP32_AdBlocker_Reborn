@@ -92,7 +92,7 @@ static constexpr int      UPSTREAM_TABLE_SIZE  = 64;
 #define FWD_TTL_MAX_S  3600u
 struct CacheEntry {
     uint32_t   key_hash;
-    uint32_t   ttl_deadline_ms;       /* esp_timer ms timestamp */
+    uint64_t   ttl_deadline_ms;       /* esp_timer ms — 64-bit, no 49-day wrap (#30) */
     bool       valid;
     bool       blocked;
     uint16_t   qtype;
@@ -106,57 +106,98 @@ static bool cache_init(void)
     s_cache = (CacheEntry *)heap_caps_calloc(CACHE_SLOTS, sizeof(CacheEntry), MALLOC_CAP_SPIRAM);
     return s_cache != nullptr;
 }
-static CacheEntry *cache_lookup(uint32_t h, uint16_t qtype, uint32_t now_ms)
+static CacheEntry *cache_lookup(uint32_t h, uint16_t qtype, uint64_t now_ms)
 {
     CacheEntry *e = &s_cache[(h ^ ((uint32_t)qtype << 1)) & 0xFFu];
     if (e->valid && e->key_hash == h && e->qtype == qtype && e->ttl_deadline_ms > now_ms)
         return e;
     return nullptr;
 }
-static void cache_store_blocked(uint32_t h, uint16_t qtype, uint32_t ttl_s, uint32_t now_ms)
+static void cache_store_blocked(uint32_t h, uint16_t qtype, uint32_t ttl_s, uint64_t now_ms)
 {
     CacheEntry *e = &s_cache[(h ^ ((uint32_t)qtype << 1)) & 0xFFu];
     e->key_hash = h; e->qtype = qtype; e->blocked = true; e->valid = true;
     e->resp_len = 0;
-    e->ttl_deadline_ms = now_ms + ttl_s * 1000u;
+    e->ttl_deadline_ms = now_ms + (uint64_t)ttl_s * 1000u;
 }
 static void cache_store_resp(uint32_t h, uint16_t qtype, const uint8_t *resp, int len,
-                             uint32_t ttl_s, uint32_t now_ms)
+                             uint32_t ttl_s, uint64_t now_ms)
 {
     if (len <= 0 || len > FWD_RESP_MAX) return;
     CacheEntry *e = &s_cache[(h ^ ((uint32_t)qtype << 1)) & 0xFFu];
     e->key_hash = h; e->qtype = qtype; e->blocked = false; e->valid = true;
     e->resp_len = (uint16_t)len;
     memcpy(e->resp, resp, len);
-    e->ttl_deadline_ms = now_ms + ttl_s * 1000u;
+    e->ttl_deadline_ms = now_ms + (uint64_t)ttl_s * 1000u;
 }
 
-/* Parse the minimum TTL across answer RRs; returns clamped TTL or `deflt`. */
+/* Skip a DNS name (label walk + compression pointer) at *off; advance *off past it.
+ * Returns false if the packet is malformed. */
+static bool skip_name(const uint8_t *pkt, int len, int *off)
+{
+    while (*off < len) {
+        uint8_t b = pkt[*off];
+        if (b == 0)          { (*off)++;        return true; }
+        if ((b & 0xC0) == 0xC0) { (*off) += 2; return true; }
+        if ((b & 0xC0) != 0) return false;     /* reserved label length */
+        *off += 1 + b;
+    }
+    return false;
+}
+
+/* Parse the minimum TTL for caching:
+ * - NOERROR with answers: min TTL across all answer RRs.
+ * - NXDOMAIN (ancount=0): SOA minimum from authority section (RFC 2308 §5). */
 static uint32_t dns_resp_min_ttl(const uint8_t *pkt, int len, uint32_t deflt)
 {
     if (len < 12) return deflt;
     int ancount = (pkt[6] << 8) | pkt[7];
-    if (ancount == 0) return deflt;
+    int nscount = (pkt[8] << 8) | pkt[9];
+
+    /* Skip question section */
     int off = 12;
-    while (off < len && pkt[off] != 0) {                 /* skip question name */
-        if ((pkt[off] & 0xC0) == 0xC0) { off += 2; goto qdone; }
-        off += 1 + pkt[off];
-    }
-    off += 1;
-qdone:
-    off += 4;                                            /* qtype + qclass */
+    if (!skip_name(pkt, len, &off)) return deflt;
+    if (off + 4 > len) return deflt;
+    off += 4;  /* qtype + qclass */
+
     uint32_t minttl = 0xFFFFFFFFu;
-    for (int i = 0; i < ancount; i++) {
-        if (off + 1 > len) break;
-        if ((pkt[off] & 0xC0) == 0xC0) off += 2;         /* compressed name */
-        else { while (off < len && pkt[off] != 0) off += 1 + pkt[off]; off += 1; }
-        if (off + 10 > len) break;
-        uint32_t ttl = ((uint32_t)pkt[off+4] << 24) | ((uint32_t)pkt[off+5] << 16)
-                     | ((uint32_t)pkt[off+6] << 8)  |  (uint32_t)pkt[off+7];
-        uint16_t rdlen = (pkt[off+8] << 8) | pkt[off+9];
-        if (ttl < minttl) minttl = ttl;
-        off += 10 + rdlen;
+
+    if (ancount > 0) {
+        /* NOERROR: collect min TTL across answer RRs */
+        for (int i = 0; i < ancount; i++) {
+            if (!skip_name(pkt, len, &off)) break;
+            if (off + 10 > len) break;
+            uint32_t ttl = ((uint32_t)pkt[off+4] << 24) | ((uint32_t)pkt[off+5] << 16)
+                         | ((uint32_t)pkt[off+6] << 8)  |  (uint32_t)pkt[off+7];
+            uint16_t rdlen = ((uint16_t)pkt[off+8] << 8) | pkt[off+9];
+            if (ttl < minttl) minttl = ttl;
+            off += 10 + rdlen;
+        }
+    } else if (nscount > 0) {
+        /* NXDOMAIN: look for SOA in authority section (RFC 2308 §5) */
+        for (int i = 0; i < nscount; i++) {
+            if (!skip_name(pkt, len, &off)) break;
+            if (off + 10 > len) break;
+            uint16_t rtype = ((uint16_t)pkt[off+0] << 8) | pkt[off+1];
+            uint32_t rttl  = ((uint32_t)pkt[off+4] << 24) | ((uint32_t)pkt[off+5] << 16)
+                           | ((uint32_t)pkt[off+6] << 8)  |  (uint32_t)pkt[off+7];
+            uint16_t rdlen = ((uint16_t)pkt[off+8] << 8) | pkt[off+9];
+            off += 10;
+            if (rtype == 6 && rdlen >= 20) {  /* SOA: skip MNAME+RNAME then read minimum */
+                int roff = off;
+                if (skip_name(pkt, len, &roff) && skip_name(pkt, len, &roff) &&
+                    roff + 20 <= off + rdlen) {
+                    /* SOA RDATA: serial(4) refresh(4) retry(4) expire(4) minimum(4) */
+                    uint32_t soa_min = ((uint32_t)pkt[roff+16] << 24) | ((uint32_t)pkt[roff+17] << 16)
+                                     | ((uint32_t)pkt[roff+18] << 8)  |  (uint32_t)pkt[roff+19];
+                    uint32_t neg_ttl = rttl < soa_min ? rttl : soa_min;
+                    if (neg_ttl < minttl) minttl = neg_ttl;
+                }
+            }
+            off += rdlen;
+        }
     }
+
     if (minttl == 0xFFFFFFFFu) return deflt;
     if (minttl < FWD_TTL_MIN_S) minttl = FWD_TTL_MIN_S;
     if (minttl > FWD_TTL_MAX_S) minttl = FWD_TTL_MAX_S;
@@ -270,7 +311,11 @@ static int extract_qname(const uint8_t *pkt, int pkt_len,
     /* label walk per RFC 1035 §4.1.2 */
     while (offset < pkt_len && pkt[offset] != 0) {
         uint8_t label_len = pkt[offset];
-        if ((label_len & 0xC0) == 0xC0) { offset += 2; break; }  /* compression ptr */
+        if ((label_len & 0xC0) == 0xC0) {
+            if (offset + 1 >= pkt_len) return -1;  /* #27: validate 2nd byte in bounds */
+            offset += 2; break;
+        }
+        if (label_len & 0xC0) return -1;           /* #42: 0x40-0xBF are reserved */
         if (offset + 1 + label_len >= pkt_len) return -1;
         if (raw_len + label_len + 1 >= sizeof(raw)) return -1;
         if (raw_len > 0) raw[raw_len++] = '.';
@@ -377,7 +422,7 @@ void DnsSinkServer::run_loop()
         upstream_addr.sin_port   = htons(UPSTREAM_PORT);
         inet_aton(_upstream_ip, &upstream_addr.sin_addr);
 
-        uint8_t rx[512], tx[512 + sizeof(DnsAnswerHeader) + 16];
+        uint8_t rx[1500], tx[512 + sizeof(DnsAnswerHeader) + 16];
         struct sockaddr_in client_addr{};
         socklen_t clen = sizeof(client_addr);
 
@@ -394,8 +439,8 @@ void DnsSinkServer::run_loop()
             int sel = select(nfds, &rset, nullptr, nullptr, &tv);
             if (sel < 0 && errno != EINTR) break;
 
-            uint32_t now_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
-            upstream_evict_expired(now_ms);
+            uint64_t now_ms = (uint64_t)(esp_timer_get_time() / 1000);
+            upstream_evict_expired((uint32_t)now_ms);   /* upstream table uses uint32_t; 49d ok for 3s timeout */
             if (s_reset_req) { s_reset_req = false; do_metrics_reset(); }
 
             (void)sel;  /* select() is just the wait; we drain non-blocking below */
@@ -416,6 +461,11 @@ void DnsSinkServer::run_loop()
                 if (!ue) continue;
                 /* rewrite transaction ID back to client's original */
                 reinterpret_cast<DnsHeader *>(rx)->id = htons(ue->client_txid);
+                /* If recvfrom filled the buffer exactly, the datagram was larger —
+                 * we silently truncated it. Set TC=1 so the client knows to retry
+                 * over TCP, and skip caching this incomplete response (#36). */
+                bool truncated = (rlen == (int)sizeof(rx));
+                if (truncated) rx[2] |= 0x02;  /* TC bit in flags high byte */
                 sendto(csock, rx, rlen, 0,
                        (sockaddr *)&ue->client_addr, sizeof(ue->client_addr));
                 int64_t t_csent = esp_timer_get_time();
@@ -427,9 +477,9 @@ void DnsSinkServer::run_loop()
 
                 /* Forward cache: stash the response so a repeat identical query
                  * is answered locally. Only NOERROR/NXDOMAIN; TTL from the RRs
-                 * (NXDOMAIN → short negative TTL). */
+                 * (NXDOMAIN → short negative TTL). Skip truncated responses. */
                 uint8_t rcode = rx[3] & 0x0F;
-                if (rcode == 0 || rcode == 3)
+                if (!truncated && (rcode == 0 || rcode == 3))
                     cache_store_resp(ue->qhash, ue->qtype, rx, rlen,
                                      dns_resp_min_ttl(rx, rlen, 30), now_ms);
                 ue->in_use = false;
@@ -541,7 +591,7 @@ void DnsSinkServer::run_loop()
                     }
                     ue->client_txid = ntohs(hdr->id);
                     ue->client_addr = client_addr;
-                    ue->sent_ms     = now_ms;
+                    ue->sent_ms     = (uint32_t)now_ms;
                     ue->recv_us     = t_recv;
                     ue->qhash       = h;
                     ue->qtype       = qtype;

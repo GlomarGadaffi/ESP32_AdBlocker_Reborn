@@ -241,6 +241,7 @@ static int l2_qname(const uint8_t *dns, int dns_len, char *out, size_t cap, size
     while (off < dns_len && dns[off] != 0) {
         uint8_t l = dns[off];
         if ((l & 0xC0) == 0xC0) return -1;              /* no compression in question */
+        if (l & 0xC0) return -1;                        /* #42: reserved label type */
         if (off + 1 + l > dns_len || rl + l + 1 >= sizeof(raw)) return -1;
         if (rl) raw[rl++] = '.';
         memcpy(raw + rl, dns + off + 1, l); rl += l; off += 1 + l;
@@ -277,7 +278,7 @@ static esp_err_t l2_input_cb(esp_eth_handle_t h, uint8_t *buf, uint32_t len,
         if (qend < 0) break;
         uint16_t qtype = (buf[dns + qend - 4] << 8) | buf[dns + qend - 3];
         if (qtype != 1 && qtype != 28) break;            /* A / AAAA only */
-        if (!blocklist_is_blocked(name, nlen)) break;    /* not blocked → lwIP */
+        if (!blocklist_is_blocked_nb(name, nlen)) break; /* not blocked → lwIP; _nb avoids stalling eth RX on mutex (#37) */
 
         /* ── craft blocked response in tx ── */
         int rdlen = (qtype == 28) ? 16 : 4;

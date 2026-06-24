@@ -171,23 +171,26 @@ uint32_t blocklist_load(void)
     return unique;
 }
 
-bool blocklist_is_blocked(const char *domain, size_t len)
+/* Internal: binary search in sorted PSRAM array + whitelist check.
+ * wl_check is either blocklist_whitelist_contains (blocking) or
+ * blocklist_whitelist_contains_nb (non-blocking for L2 eth RX task). */
+typedef bool (*wl_fn_t)(const char *, size_t);
+
+static bool is_blocked_impl(const char *domain, size_t len, wl_fn_t wl_check)
 {
     uint32_t *arr = atomic_load_explicit(&s_live, memory_order_acquire);
-    if (!arr) return false;  /* reload in progress — allow everything */
+    if (!arr) return false;
     uint32_t n = atomic_load_explicit(&s_count, memory_order_relaxed);
     if (n == 0) return false;
 
-    /* Walk suffix components: sub.example.com → example.com → com (stop) */
     const char *p = domain;
     size_t remaining = len;
 
     while (remaining > 0) {
         if (!domain_is_bare_tld(p, remaining)) {
-            if (blocklist_whitelist_contains(p, remaining)) return false;
+            if (wl_check(p, remaining)) return false;
 
             uint32_t h = domain_hash(p, remaining);
-            /* Binary search in sorted PSRAM array */
             uint32_t lo = 0, hi = n;
             while (lo < hi) {
                 uint32_t mid = lo + (hi - lo) / 2;
@@ -196,14 +199,22 @@ bool blocklist_is_blocked(const char *domain, size_t len)
                 else                    return true;
             }
         }
-
-        /* Advance to next label */
         const char *dot = (const char *)memchr(p, '.', remaining);
         if (!dot) break;
         remaining -= (size_t)(dot - p) + 1;
         p = dot + 1;
     }
     return false;
+}
+
+bool blocklist_is_blocked(const char *domain, size_t len)
+{
+    return is_blocked_impl(domain, len, blocklist_whitelist_contains);
+}
+
+bool blocklist_is_blocked_nb(const char *domain, size_t len)
+{
+    return is_blocked_impl(domain, len, blocklist_whitelist_contains_nb);
 }
 
 bool blocklist_whitelist_add(const char *domain)
@@ -239,15 +250,31 @@ bool blocklist_whitelist_remove(const char *domain)
     return found;
 }
 
+static bool wl_contains_locked(const char *domain, size_t len)
+{
+    for (uint32_t i = 0; i < s_wl_count; i++) {
+        size_t wlen = strlen(s_whitelist[i]);
+        if (wlen == len && memcmp(s_whitelist[i], domain, len) == 0)
+            return true;
+    }
+    return false;
+}
+
 bool blocklist_whitelist_contains(const char *domain, size_t len)
 {
     xSemaphoreTake(s_wl_mutex, portMAX_DELAY);
-    bool found = false;
-    for (uint32_t i = 0; i < s_wl_count && !found; i++) {
-        size_t wlen = strlen(s_whitelist[i]);
-        if (wlen == len && memcmp(s_whitelist[i], domain, len) == 0)
-            found = true;
-    }
+    bool found = wl_contains_locked(domain, len);
+    xSemaphoreGive(s_wl_mutex);
+    return found;
+}
+
+/* Non-blocking: used from the L2 eth RX task where portMAX_DELAY would stall
+ * all Ethernet while a whitelist NVS commit is in progress (#37). */
+bool blocklist_whitelist_contains_nb(const char *domain, size_t len)
+{
+    if (xSemaphoreTake(s_wl_mutex, 0) != pdTRUE)
+        return false;  /* mutex busy — allow-through to avoid stalling eth RX */
+    bool found = wl_contains_locked(domain, len);
     xSemaphoreGive(s_wl_mutex);
     return found;
 }
