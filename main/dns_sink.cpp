@@ -34,6 +34,7 @@
 #include "domain.h"
 #include "rewrite.h"
 #include "acl.h"
+#include "dot.h"
 #include "query_log.h"
 #include "dns_server.h"
 #include "web_ui.h"
@@ -374,6 +375,7 @@ extern "C" void app_main(void)
         for (;;) vTaskDelay(portMAX_DELAY);
     }
     rewrite_init();
+    dot_init_nvs();
     acl_init();
     query_log_init();
 

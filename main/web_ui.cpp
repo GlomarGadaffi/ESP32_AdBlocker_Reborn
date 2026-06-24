@@ -3,6 +3,7 @@
 #include "domain.h"
 #include "rewrite.h"
 #include "acl.h"
+#include "dot.h"
 #include "query_log.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
@@ -229,6 +230,21 @@ static esp_err_t handle_status(httpd_req_t *r)
         }
     }
 
+    /* DoT upstream settings (#5) */
+    {
+        bool dot_en = dot_is_enabled(); char dot_srv[64]="", dot_sni[64]="";
+        dot_get(nullptr, dot_srv, dot_sni);
+        n += snprintf(page + n, sizeof(page) - n,
+            "<h3>Upstream DNS (DoT)</h3>"
+            "<form method=post action=/dot/set>"
+            "<label><input type=checkbox name=enabled value=1%s> Enable DNS-over-TLS</label><br>"
+            "Server IP: <input name=server value=\"%s\" size=18> "
+            "SNI: <input name=sni value=\"%s\" size=28><br>"
+            "<small>Default: 1.1.1.1 / one.one.one.one &nbsp; or &nbsp; 9.9.9.9 / dns.quad9.net</small><br>"
+            "<button>Save &amp; apply (restart DNS task)</button></form>",
+            dot_en ? " checked" : "", dot_srv, dot_sni);
+    }
+
     /* Blocklist sources section (#4, #9) */
     n += snprintf(page + n, sizeof(page) - n,
         "<h3>Blocklist Sources</h3>"
@@ -373,6 +389,21 @@ static esp_err_t handle_wl_remove(httpd_req_t *r)
     httpd_resp_set_hdr(r, "Location", "/");
     httpd_resp_send(r, nullptr, 0);
     return ESP_OK;
+}
+
+/* ── POST /dot/set — configure DoT upstream (#5) ────────────────── */
+static esp_err_t handle_dot_set(httpd_req_t *r)
+{
+    if (!csrf_ok(r)) { httpd_resp_send_err(r, HTTPD_403_FORBIDDEN, "CSRF"); return ESP_FAIL; }
+    char body[256] = {}; httpd_req_recv(r, body, sizeof(body) - 1);
+    bool enabled = (strstr(body, "enabled=1") != nullptr);
+    char server[64] = "1.1.1.1", sni[64] = "one.one.one.one";
+    const char *ps = strstr(body, "server=");
+    if (ps) { ps += 7; size_t l=0; char raw[64]={0}; for(;ps[l]&&ps[l]!='&'&&ps[l]!='\r'&&l<63;l++) raw[l]=ps[l]; url_decode(server,sizeof(server),raw,l); }
+    const char *pn = strstr(body, "sni=");
+    if (pn) { pn += 4; size_t l=0; char raw[64]={0}; for(;pn[l]&&pn[l]!='&'&&pn[l]!='\r'&&l<63;l++) raw[l]=pn[l]; url_decode(sni,sizeof(sni),raw,l); }
+    dot_set(enabled, server, sni);
+    httpd_resp_set_status(r, "303 See Other"); httpd_resp_set_hdr(r, "Location", "/"); httpd_resp_send(r,nullptr,0); return ESP_OK;
 }
 
 /* ── POST /acl/add — add allowed client IP (#10) ────────────────── */
@@ -656,6 +687,7 @@ bool web_ui_start(DnsSinkServer *dns)
         { "/acl/add",             HTTP_POST, handle_acl_add,       nullptr },
         { "/acl/remove",          HTTP_POST, handle_acl_remove,    nullptr },
         { "/acl/clear",           HTTP_POST, handle_acl_clear,     nullptr },
+        { "/dot/set",             HTTP_POST, handle_dot_set,       nullptr },
     };
     for (auto &u : uris) httpd_register_uri_handler(s_server, &u);
 

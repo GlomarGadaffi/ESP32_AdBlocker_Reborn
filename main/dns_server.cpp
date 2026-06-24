@@ -3,6 +3,7 @@
 #include "domain.h"
 #include "rewrite.h"
 #include "acl.h"
+#include "dot.h"
 #include "query_log.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -626,6 +627,26 @@ void DnsSinkServer::run_loop()
 
                 /* ── forward to upstream ────────────────────── */
                 forward: {
+                    /* DoT path (#5): synchronous TLS query-response */
+                    if (dot_is_enabled()) {
+                        int dot_rlen = dot_resolve((uint8_t *)rx, qend, (uint8_t *)tx, sizeof(tx));
+                        if (dot_rlen > 1) {
+                            /* patch txid to match client's request */
+                            tx[0] = rx[0]; tx[1] = rx[1];
+                            cache_store_resp(h, qtype, (uint8_t *)tx, dot_rlen,
+                                            dns_resp_min_ttl((uint8_t *)tx, dot_rlen, 60),
+                                            now_ms);
+                            sendto(csock, tx, dot_rlen, 0,
+                                   (sockaddr *)&client_addr, clen);
+                            s_cnt_forwarded++;
+                            hist_record(&s_h_fwd_total, esp_timer_get_time() - t_recv);
+                        } else {
+                            ESP_LOGW(TAG, "DoT failed for %s — falling through to UDP", name);
+                            goto udp_forward;
+                        }
+                        continue;
+                    }
+                    udp_forward: {
                     uint16_t our_txid;
                     UpstreamEntry *ue = upstream_alloc(&our_txid);
                     if (!ue) {
@@ -647,6 +668,7 @@ void DnsSinkServer::run_loop()
                     sendto(usock, rx, rlen, 0,
                            (sockaddr *)&upstream_addr, sizeof(upstream_addr));
                     s_cnt_forwarded++;
+                    }
                 }
             }
         }  /* while running */
