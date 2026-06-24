@@ -106,9 +106,11 @@ findings have since been fixed and verified on hardware; see `ISSUES.md` for the
 per-item record. Resolved since the original audit:
 
 * **Forward cache now isolates A and AAAA.** The slot index folds the query type
-  in (`(h ^ (qtype<<1)) & 0xFF`) and a hit requires a matching `qtype`, so the
-  A and AAAA records for a name occupy separate slots and both cache-hit on
-  repeat — verified live (a repeat A+AAAA pair scores two cache hits). (#43)
+  in (`(h ^ (qtype<<1)) & (CACHE_SLOTS-1)`) and a hit requires a matching
+  `qtype`, so the A and AAAA records for a name occupy separate slots and both
+  cache-hit on repeat — verified live (a repeat A+AAAA pair scores two cache
+  hits). The cache is 1024 slots (~545 KB PSRAM); a warm pass over 100 distinct
+  domains scored 92/100 hits. (#43)
 * **L2 fast path no longer stalls on whitelist edits.** The RX hook uses a
   non-blocking mutex take and the blocking path a bounded 2 ms take, and NVS
   commits run outside the lock. (#37)

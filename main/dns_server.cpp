@@ -91,7 +91,8 @@ static constexpr int      UPSTREAM_TABLE_SIZE  = 64;
  * Direct-mapped, 256 slots. Blocked entries regenerate 0.0.0.0/::; allowed
  * entries store the raw upstream response and replay it (txid rewritten) so
  * repeat allowed queries are served locally instead of re-forwarding. */
-#define CACHE_SLOTS    256
+#define CACHE_SLOTS    1024   /* PSRAM is plentiful (4MB free); 256 gave ~4% hit
+                                 rate on diverse home traffic. 1024 slots ≈ 545KB. */
 #define FWD_RESP_MAX   512
 #define FWD_TTL_MIN_S  10u
 #define FWD_TTL_MAX_S  3600u
@@ -113,14 +114,14 @@ static bool cache_init(void)
 }
 static CacheEntry *cache_lookup(uint32_t h, uint16_t qtype, uint64_t now_ms)
 {
-    CacheEntry *e = &s_cache[(h ^ ((uint32_t)qtype << 1)) & 0xFFu];
+    CacheEntry *e = &s_cache[(h ^ ((uint32_t)qtype << 1)) & (CACHE_SLOTS - 1)];
     if (e->valid && e->key_hash == h && e->qtype == qtype && e->ttl_deadline_ms > now_ms)
         return e;
     return nullptr;
 }
 static void cache_store_blocked(uint32_t h, uint16_t qtype, uint32_t ttl_s, uint64_t now_ms)
 {
-    CacheEntry *e = &s_cache[(h ^ ((uint32_t)qtype << 1)) & 0xFFu];
+    CacheEntry *e = &s_cache[(h ^ ((uint32_t)qtype << 1)) & (CACHE_SLOTS - 1)];
     e->key_hash = h; e->qtype = qtype; e->blocked = true; e->valid = true;
     e->resp_len = 0;
     e->ttl_deadline_ms = now_ms + (uint64_t)ttl_s * 1000u;
@@ -129,7 +130,7 @@ static void cache_store_resp(uint32_t h, uint16_t qtype, const uint8_t *resp, in
                              uint32_t ttl_s, uint64_t now_ms)
 {
     if (len <= 0 || len > FWD_RESP_MAX) return;
-    CacheEntry *e = &s_cache[(h ^ ((uint32_t)qtype << 1)) & 0xFFu];
+    CacheEntry *e = &s_cache[(h ^ ((uint32_t)qtype << 1)) & (CACHE_SLOTS - 1)];
     e->key_hash = h; e->qtype = qtype; e->blocked = false; e->valid = true;
     e->resp_len = (uint16_t)len;
     memcpy(e->resp, resp, len);
