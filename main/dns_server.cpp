@@ -324,6 +324,8 @@ void DnsSinkServer::stop() {
     _taskHandle = nullptr;
 }
 
+static void do_metrics_reset(void);   /* forward decl — defined near metrics_reset */
+
 void DnsSinkServer::dns_task(void *pv) {
     static_cast<DnsSinkServer *>(pv)->run_loop();
 }

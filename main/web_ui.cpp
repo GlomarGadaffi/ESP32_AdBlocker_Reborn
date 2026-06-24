@@ -209,7 +209,7 @@ static esp_err_t handle_check(httpd_req_t *r)
     bool blocked = (nlen > 0) && blocklist_is_blocked(norm, nlen);
 
     char safe[384]; html_escape(safe, sizeof(safe), norm);
-    char page[512];
+    char page[768];
     snprintf(page, sizeof(page),
         "<!DOCTYPE html><html><body><h2>Check result</h2>"
         "<p><b>%s</b> is <b style='color:%s'>%s</b></p>"
