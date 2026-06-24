@@ -350,7 +350,7 @@ bool DnsSinkServer::start(const char *upstream_ip) {
     snprintf(_upstream_ip, sizeof(_upstream_ip), "%s", upstream_ip);
     _running.store(true, std::memory_order_release);
     if (_exitSem) xSemaphoreTake(_exitSem, 0);
-    BaseType_t r = xTaskCreatePinnedToCore(dns_task, "dns_task", 8192, this, 10, &_taskHandle, 1);
+    BaseType_t r = xTaskCreatePinnedToCore(dns_task, "dns_task", 12288, this, 10, &_taskHandle, 1);
     if (r != pdPASS) {
         ESP_LOGE(TAG, "task create failed");
         _running.store(false, std::memory_order_release);
@@ -405,6 +405,17 @@ void DnsSinkServer::run_loop()
         if (bind(csock, (sockaddr *)&addr, sizeof(addr)) < 0) {
             ESP_LOGE(TAG, "bind port 53: %d", errno); close(csock); goto done;
         }
+    }
+    /* Enlarge the socket receive buffer so bursts of concurrent queries from
+     * multiple clients don't overflow before dns_task drains them.  Without
+     * CONFIG_LWIP_SO_RCVBUF=y this call is a no-op; with it lwIP honours the
+     * request and uses it to grow the UDP mbox watermark. */
+    {
+        int rcvbuf = 32768;
+        if (setsockopt(csock, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf)) < 0)
+            ESP_LOGW(TAG, "SO_RCVBUF: %d (ignored)", errno);
+        else
+            ESP_LOGI(TAG, "SO_RCVBUF set to %d", rcvbuf);
     }
     _client_fd.store(csock, std::memory_order_release);
 

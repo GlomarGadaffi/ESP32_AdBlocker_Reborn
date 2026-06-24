@@ -403,7 +403,11 @@ static bool wl_contains_locked(const char *domain, size_t len)
 
 bool blocklist_whitelist_contains(const char *domain, size_t len)
 {
-    xSemaphoreTake(s_wl_mutex, portMAX_DELAY);
+    /* Use a bounded wait so the dns_task hot path can't stall indefinitely if
+     * an NVS commit from whitelist_add is holding the mutex (same contract as
+     * the _nb non-blocking variant used by the L2 eth RX task). */
+    if (xSemaphoreTake(s_wl_mutex, pdMS_TO_TICKS(2)) != pdTRUE)
+        return false;  /* mutex busy — treat as not whitelisted; safe fail-closed */
     bool found = wl_contains_locked(domain, len);
     xSemaphoreGive(s_wl_mutex);
     return found;

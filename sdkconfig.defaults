@@ -28,6 +28,9 @@ CONFIG_LWIP_TCPIP_TASK_AFFINITY_CPU0=y
 # message-passing every socket call to tcpip_thread. Measured: blocked sendto()
 # is ~2ms (the entire query cost) — almost all of it the tcpip_thread round-trip.
 CONFIG_LWIP_TCPIP_CORE_LOCKING=y
+# Enable SO_RCVBUF so setsockopt(SO_RCVBUF) actually resizes the socket's
+# receive window; without this the call silently does nothing in lwIP.
+CONFIG_LWIP_SO_RCVBUF=y
 
 # System
 CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=4096
