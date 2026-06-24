@@ -156,6 +156,16 @@ on the monotonic clock so it's unaffected when NTP first sets the time.
 Verified on hardware: clock synced to NIST within seconds of boot; log shows
 dated entries (2026-06-24 14:20 UTC).
 
+## Roadmap: generic ESP32-S3 build (Wi-Fi only) ⬜
+A variant for any plain ESP32-S3 dev board — drops the W5500/Ethernet + SD-card
+dependencies and runs the same sinkhole over built-in Wi-Fi (STA + DHCP). The
+DNS engine, blocklist, forward cache, web UI, DoT, NTP, and query log are all
+hardware-agnostic and carry over unchanged. Changes: Wi-Fi bring-up replaces the
+W5500 init; the L2 Ethernet fast-path (esp_eth RX hook) has no Wi-Fi equivalent,
+so blocked/cached queries take the normal lwIP socket path (~1.8 ms) instead of
+the L2 bypass; blocklist capacity may shrink on quad-PSRAM boards. Tracked on the
+GitHub issue tracker.
+
 ## Open observation (separate from the audit) ⬜
 Some headline ad domains (doubleclick.net, google-analytics.com,
 googleadservices.com, adservice.google.com) resolve as ALLOWED while other

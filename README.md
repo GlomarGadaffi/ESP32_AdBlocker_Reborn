@@ -158,6 +158,16 @@ LilyGO T-ETH-Elite: ESP32-S3-WROOM-1 (16 MB flash, 8 MB OPI PSRAM) plus a W5500.
 
 ## Build and flash
 
+Built for the **LilyGO T-ETH-Elite (ESP32-S3 + W5500)**. Prebuilt images are on
+the [releases page](../../releases) — flash the single merged image with esptool
+(no toolchain needed):
+
+```sh
+esptool.py --chip esp32s3 -p PORT -b 460800 write_flash 0x0 dns-sink-merged.bin
+```
+
+Or build from source (ESP-IDF v6.0.x):
+
 ```sh
 idf.py set-target esp32s3
 idf.py build
@@ -185,3 +195,19 @@ main/
   murmur3.c        MurmurHash3_x86_32
   web_ui.cpp       HTTP status UI, JSON metrics, control endpoints
 ```
+
+## Roadmap
+
+* **Generic ESP32-S3 build (Wi-Fi only) — coming.** A variant that drops the
+  W5500/Ethernet and SD-card dependencies and runs the same sinkhole over
+  built-in Wi-Fi, so it works on any plain ESP32-S3 dev board (no LilyGO
+  hardware required). The DNS engine, blocklist, cache, web UI, DoT, NTP, and
+  query log are all hardware-agnostic and carry over unchanged; what changes is
+  the bring-up (Wi-Fi STA + DHCP instead of W5500), and the L2 Ethernet
+  fast-path is replaced by the normal lwIP socket path (no esp_eth RX hook on
+  Wi-Fi), so blocked/cached queries take the ~1.8 ms socket path rather than the
+  L2 bypass. Blocklist storage may shrink on boards with quad (vs octal) PSRAM.
+  Tracked in #49.
+* DoT upstream as a worker task / persistent session (off the DNS hot path).
+* DoH/DoT *server* (serve secure DNS to clients).
+* Per-list enable/disable toggle + temporary "pause blocking" control (#48).
