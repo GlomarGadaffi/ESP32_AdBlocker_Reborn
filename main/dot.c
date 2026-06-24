@@ -11,7 +11,12 @@
 static const char *TAG = "dot";
 #define NVS_NS  "dns_sink"
 #define DOT_PORT 853
-#define DOT_TIMEOUT_MS 3000
+/* C2: dot_resolve() runs synchronously inside the single dns_task loop, so this
+ * timeout bounds how long ALL DNS service can stall on one slow DoT query. Kept
+ * well under the old 3000ms while still allowing a first TLS handshake (TCP +
+ * ECDHE + cert verify on the ESP32-S3 ≈ 400-700ms) to complete; on timeout we
+ * fall through to plain-UDP upstream. See ISSUES.md C2 for the async follow-up. */
+#define DOT_TIMEOUT_MS 1500
 
 static bool s_enabled    = false;
 static char s_server[64] = "1.1.1.1";
@@ -39,13 +44,6 @@ void dot_get(bool *en, char *srv, char *sni)
     if (en)  *en  = s_enabled;
     if (srv) snprintf(srv, 64, "%s", s_server);
     if (sni) snprintf(sni, 64, "%s", s_sni);
-}
-
-/* Load persisted config at boot */
-__attribute__((constructor))
-static void dot_load_nvs(void)
-{
-    /* called too early — NVS may not be initialized yet; use dot_init instead */
 }
 
 bool dot_init_nvs(void)

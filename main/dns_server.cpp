@@ -8,6 +8,7 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
+#include "esp_random.h"
 #include "lwip/sockets.h"
 #include <cstring>
 #include <cstdio>
@@ -221,16 +222,27 @@ struct UpstreamEntry {
     bool             in_use;
 };
 static UpstreamEntry s_upstream[UPSTREAM_TABLE_SIZE];
-static uint16_t      s_txid_counter = 1;
+
+static bool txid_in_use(uint16_t t)
+{
+    for (int i = 0; i < UPSTREAM_TABLE_SIZE; i++)
+        if (s_upstream[i].in_use && s_upstream[i].our_txid == t) return true;
+    return false;
+}
 
 static UpstreamEntry *upstream_alloc(uint16_t *our_txid_out)
 {
     for (int i = 0; i < UPSTREAM_TABLE_SIZE; i++) {
         if (!s_upstream[i].in_use) {
-            s_upstream[i].in_use = true;
-            s_upstream[i].our_txid = s_txid_counter++;
-            if (s_txid_counter == 0) s_txid_counter = 1;
-            *our_txid_out = s_upstream[i].our_txid;
+            /* Random txid (H2): a predictable sequential counter lets an
+             * off-path attacker guess the in-flight txid and forge a cached
+             * reply. esp_random() is the hardware RNG. Re-roll on the rare
+             * collision with another in-flight query. */
+            uint16_t t;
+            do { t = (uint16_t)(esp_random() & 0xFFFFu); } while (t == 0 || txid_in_use(t));
+            s_upstream[i].in_use   = true;
+            s_upstream[i].our_txid = t;
+            *our_txid_out = t;
             return &s_upstream[i];
         }
     }
@@ -315,10 +327,10 @@ static int extract_qname(const uint8_t *pkt, int pkt_len,
     /* label walk per RFC 1035 §4.1.2 */
     while (offset < pkt_len && pkt[offset] != 0) {
         uint8_t label_len = pkt[offset];
-        if ((label_len & 0xC0) == 0xC0) {
-            if (offset + 1 >= pkt_len) return -1;  /* #27: validate 2nd byte in bounds */
-            offset += 2; break;
-        }
+        /* A compression pointer in a question QNAME is malformed per RFC 1035
+         * (questions don't use compression). Reject it, matching the L2 fast
+         * path's stricter parser (L5). */
+        if ((label_len & 0xC0) == 0xC0) return -1;
         if (label_len & 0xC0) return -1;           /* #42: 0x40-0xBF are reserved */
         if (offset + 1 + label_len >= pkt_len) return -1;
         if (raw_len + label_len + 1 >= sizeof(raw)) return -1;
@@ -474,6 +486,20 @@ void DnsSinkServer::run_loop()
                 uint16_t our_txid = ntohs(reinterpret_cast<DnsHeader *>(rx)->id);
                 UpstreamEntry *ue = upstream_find(our_txid);
                 if (!ue) continue;
+                /* Anti-spoofing (H2): even with a matching txid, verify the
+                 * reply's question matches what we actually asked. An attacker
+                 * who guesses the txid would have to also match the qname+qtype.
+                 * On mismatch, ignore the packet WITHOUT freeing the slot so the
+                 * genuine reply can still be accepted (or the slot times out). */
+                {
+                    char rname[256]; size_t rnlen = 0;
+                    int rqend = extract_qname(rx, rlen, sizeof(DnsHeader),
+                                              rname, sizeof(rname), &rnlen);
+                    if (rqend < 0) continue;
+                    uint16_t rqtype = ntohs(*reinterpret_cast<uint16_t *>(rx + rqend - 4));
+                    if (rqtype != ue->qtype || domain_hash(rname, rnlen) != ue->qhash)
+                        continue;
+                }
                 /* rewrite transaction ID back to client's original */
                 reinterpret_cast<DnsHeader *>(rx)->id = htons(ue->client_txid);
                 /* If recvfrom filled the buffer exactly, the datagram was larger —
