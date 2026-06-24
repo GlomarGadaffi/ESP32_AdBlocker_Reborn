@@ -34,13 +34,23 @@ L2 fast path that answers blocked queries without going through lwIP.
 
 ## Measured performance
 
-LAN client to board, blocked queries served by the L2 fast path:
+LAN client to board. The latency columns are measured at one query in flight
+(c=1), which is the uncontended per-query cost and also what a home network sees
+at its low query rate; throughput is the saturation figure at high concurrency.
 
 | path | p50 | min | throughput |
 | --- | --- | --- | --- |
 | blocked (L2 fast path) | 1.8 ms | 0.8 ms | ~1,200 qps |
 | allowed, cached | ~2 ms | | ~600 qps |
 | allowed, cold (forward) | gateway RTT (~40 ms) | | |
+
+The blocked-query latency is a single continuous mode at ~1.75 ms with a thin
+tail down to the ~0.8 ms floor (two SPI frames, RX + TX); the min is a rare
+jitter-alignment, not the typical case, so ~1.8 ms is the honest deployment
+number, not 0.8 ms. The distribution is smooth (no bimodality, no tick
+artifact, confirmed across two independent client OSes at 5k samples each).
+Under saturation the single SPI bus serializes and latency grows with offered
+load (tens of ms at 20+ concurrent), which is well beyond a home query rate.
 
 Notes on the ceiling, for anyone optimizing further. The blocklist lookup is
 ~128 us, a small fraction of the cost. Raw esp_eth_transmit on this board runs
