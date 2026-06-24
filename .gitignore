@@ -8,3 +8,4 @@
 # Editor / OS cruft
 *.swp
 .DS_Store
+/release/
