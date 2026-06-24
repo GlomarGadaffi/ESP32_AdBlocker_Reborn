@@ -7,6 +7,7 @@ idf_component_register(
         "dot.c"
         "acl.c"
         "query_log.c"
+        "timesync.c"
         "http_fetch.c"
         "murmur3.c"
         "domain.c"

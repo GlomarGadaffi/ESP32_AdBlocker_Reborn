@@ -31,6 +31,8 @@ CONFIG_LWIP_TCPIP_CORE_LOCKING=y
 # Enable SO_RCVBUF so setsockopt(SO_RCVBUF) actually resizes the socket's
 # receive window; without this the call silently does nothing in lwIP.
 CONFIG_LWIP_SO_RCVBUF=y
+# SNTP: allow 2 servers (NIST primary + NTP pool fallback) for wall-clock time.
+CONFIG_LWIP_SNTP_MAX_SERVERS=2
 
 # System
 CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=4096

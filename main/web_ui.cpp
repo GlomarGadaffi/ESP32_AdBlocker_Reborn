@@ -11,7 +11,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstdarg>
+#include <ctime>
 #include <inttypes.h>
+#include "timesync.h"
 
 static const char *TAG = "web_ui";
 static httpd_handle_t  s_server = nullptr;
@@ -172,6 +174,22 @@ static esp_err_t handle_status(httpd_req_t *r)
         "<button>Whitelist</button></form><br>"
         "<a href='/log'>Query log</a> &nbsp; <a href='/top'>Top lists</a>"
         " &nbsp; <a href='/metrics'>Metrics JSON</a>");
+
+    /* Clock status (NTP) */
+    {
+        uint32_t ep = timesync_epoch();
+        if (ep) {
+            time_t t = (time_t)ep;
+            struct tm tmv; gmtime_r(&t, &tmv);
+            char tbuf[32]; strftime(tbuf, sizeof(tbuf), "%Y-%m-%d %H:%M:%S", &tmv);
+            page_appendf(page, sizeof(page), &n,
+                "<p><small>Clock: <b>%s UTC</b> (NTP synced)</small></p>", tbuf);
+        } else {
+            page_appendf(page, sizeof(page), &n,
+                "<p><small>Clock: <span class=warn>syncing via NTP…</span> "
+                "(log shows uptime until synced)</small></p>");
+        }
+    }
 
     /* whitelist table */
     if (wl_n > 0) {
@@ -513,7 +531,7 @@ static esp_err_t handle_log(httpd_req_t *r)
         "th{background:#222;color:#eee}.blk{color:red}.rw{color:blue}"
         ".ok{color:green}</style></head><body>"
         "<h2>Query Log <small>(<a href='/'>home</a>)</small></h2>"
-        "<table><tr><th>Time</th><th>Client</th><th>Domain</th>"
+        "<table><tr><th>Time (UTC)</th><th>Client</th><th>Domain</th>"
         "<th>Type</th><th>Result</th></tr>");
     for (uint32_t i = 0; i < n && pg < (int)sizeof(page) - 256; i++) {
         QLogEntry *e = &entries[i];
@@ -523,10 +541,19 @@ static esp_err_t handle_log(httpd_req_t *r)
         const char *type = e->qtype == 1 ? "A" : (e->qtype == 28 ? "AAAA" :
                            e->qtype == 5 ? "CNAME" : e->qtype == 15 ? "MX" : "?");
         uint32_t ip = e->client_ip;
+        /* Wall-clock time if NTP has synced, else fall back to uptime offset. */
+        char tbuf[24];
+        if (e->epoch_s) {
+            time_t t = (time_t)e->epoch_s;
+            struct tm tmv; gmtime_r(&t, &tmv);
+            strftime(tbuf, sizeof(tbuf), "%m-%d %H:%M:%S", &tmv);
+        } else {
+            snprintf(tbuf, sizeof(tbuf), "+%lus", (unsigned long)e->ts_s);
+        }
         page_appendf(page, sizeof(page), &pg,
-            "<tr><td>+%lus</td><td>%u.%u.%u.%u</td><td>%s</td>"
+            "<tr><td>%s</td><td>%u.%u.%u.%u</td><td>%s</td>"
             "<td>%s</td><td class='%s'>%s</td></tr>",
-            (unsigned long)e->ts_s,
+            tbuf,
             (unsigned)((ip>>24)&0xFF),(unsigned)((ip>>16)&0xFF),
             (unsigned)((ip>>8)&0xFF),(unsigned)(ip&0xFF),
             safe, type, cls, res);

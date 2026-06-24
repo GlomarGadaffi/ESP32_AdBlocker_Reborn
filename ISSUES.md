@@ -109,9 +109,13 @@ Removed the no-op `__attribute__((constructor)) dot_load_nvs()`.
 question section (malformed per RFC 1035). Now rejected, matching the stricter
 L2 fast-path parser.
 
-### L3 — daily reload clock drift ⬜
-`dns_sink.cpp` — the 24×60 fixed-60 s reload loop drifts later each day.
-Functional, cosmetic; left as-is (use absolute time if precision is wanted).
+### L3 — daily reload clock drift ✅
+`dns_sink.cpp` — the old "sleep 24h then reload" loop drifted later each day by
+the download/sort duration.
+**Fix:** the daily reload now uses an absolute monotonic deadline advanced by
+exactly one interval each cycle (`next_us += interval`), so reload duration no
+longer pushes the schedule; a manual `/reload` fires immediately without
+shifting the daily deadline.
 
 ---
 
@@ -125,6 +129,31 @@ Functional, cosmetic; left as-is (use absolute time if precision is wanted).
 - Task stack sizing — dns_task 12288 (HWM ~7.7 KB free), httpd 16384.
 
 ---
+
+## Feature: NTP wall-clock timestamps ✅
+Query-log entries previously carried only seconds-since-boot, useless for
+reconciling logs to real dates after a reboot.
+**Added:** a `timesync` module using the built-in lwIP SNTP client (one UDP
+socket, ~1 KB — the lightweight Espressif-native path) against `time.nist.gov`
++ `pool.ntp.org` (`CONFIG_LWIP_SNTP_MAX_SERVERS=2`). `QLogEntry` now stores a
+wall-clock `epoch_s` (0 until synced) alongside the monotonic `ts_s`; `/log`
+renders real `MM-DD HH:MM:SS` UTC times (falling back to uptime until synced),
+and the dashboard shows clock status. The per-minute history graph stays keyed
+on the monotonic clock so it's unaffected when NTP first sets the time.
+Verified on hardware: clock synced to NIST within seconds of boot; log shows
+dated entries (2026-06-24 14:20 UTC).
+
+## Open observation (separate from the audit) ⬜
+Some headline ad domains (doubleclick.net, google-analytics.com,
+googleadservices.com, adservice.google.com) resolve as ALLOWED while other
+trackers (ssl.google-analytics.com, ads.youtube.com, analytics.tiktok.com) are
+correctly BLOCKED. Blocking itself works (333,795 domains loaded, L2 + dns_task
+block paths both active). The pattern (a subdomain blocks but its parent does
+not) indicates those roots aren't wildcard entries in the currently SD-cached
+list — likely a stale/partial cache or a source-format question, NOT a code
+regression. Suggested next step: trigger a fresh `/reload` (bypasses SD cache)
+and re-check; if still allowed, inspect the OISD source line format in
+`on_domain_line`/`domain_normalize`.
 
 ## Earlier fixes this cycle (pre-audit)
 - `c42662b` — httpd stack overflow in `handle_status` (8 KB non-static local).

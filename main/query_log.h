@@ -15,7 +15,8 @@ extern "C" {
 typedef struct {
     char     domain[64];
     uint32_t client_ip;   /* host byte order */
-    uint32_t ts_s;        /* seconds since boot (esp_timer / 1e6) */
+    uint32_t ts_s;        /* seconds since boot (esp_timer / 1e6) — monotonic */
+    uint32_t epoch_s;     /* wall-clock UNIX time, or 0 if NTP not yet synced */
     uint16_t qtype;
     bool     blocked;
     bool     rewritten;

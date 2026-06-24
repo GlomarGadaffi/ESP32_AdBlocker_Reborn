@@ -1,4 +1,5 @@
 #include "query_log.h"
+#include "timesync.h"
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
 #include "esp_log.h"
@@ -62,12 +63,14 @@ void query_log_record(const char *domain, uint16_t qtype, uint32_t client_ip_hbo
     QLogEntry *e = &s_ring[idx];
     snprintf(e->domain, sizeof(e->domain), "%s", domain ? domain : "");
     e->client_ip = client_ip_hbo;
-    e->ts_s      = (uint32_t)(esp_timer_get_time() / 1000000ULL);
+    e->ts_s      = (uint32_t)(esp_timer_get_time() / 1000000ULL);  /* uptime */
+    e->epoch_s   = timesync_epoch();   /* wall-clock, 0 until NTP syncs */
     e->qtype     = qtype;
     e->blocked   = blocked;
     e->rewritten = rewritten;
 
-    /* Per-minute history bucket */
+    /* Per-minute history bucket — keyed on uptime (ts_s), not wall-clock, so the
+     * graph stays monotonic and is unaffected when NTP first sets the clock. */
     uint32_t now_min = e->ts_s / 60;
     if (now_min != s_hist_minute) {
         /* advance to new minute, clear skipped buckets */

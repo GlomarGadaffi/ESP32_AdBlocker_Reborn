@@ -36,6 +36,7 @@
 #include "acl.h"
 #include "dot.h"
 #include "query_log.h"
+#include "timesync.h"
 #include "dns_server.h"
 #include "web_ui.h"
 #include "mdns.h"
@@ -215,17 +216,30 @@ static void download_task(void *)
     ESP_LOGI(TAG, "download_task stack hwm: %u bytes free",
              (unsigned)uxTaskGetStackHighWaterMark(NULL));
 
-    /* Daily reload */
+    /* Daily reload on a fixed cadence. Use an absolute monotonic deadline and
+     * advance it by exactly one interval each cycle (next += interval), so the
+     * time spent downloading/sorting never pushes the schedule later — the old
+     * "sleep 24h, then reload" loop drifted by the reload duration every day (L3).
+     * A manual /reload fires immediately without shifting the daily schedule. */
+    const int64_t interval_us = 24LL * 60 * 60 * 1000000;  /* 24h */
+    int64_t next_us = esp_timer_get_time() + interval_us;
     for (;;) {
-        for (int i = 0; i < 24 * 60; i++) {
-            vTaskDelay(pdMS_TO_TICKS(60 * 1000));
-            if (s_reload_requested) {
-                s_reload_requested = false;
-                break;
-            }
+        int64_t now_us = esp_timer_get_time();
+        if (now_us >= next_us) {
+            ESP_LOGI(TAG, "Daily reload...");
+            blocklist_load();
+            next_us += interval_us;
+            if (next_us <= esp_timer_get_time())     /* fell behind — catch up */
+                next_us = esp_timer_get_time() + interval_us;
+            continue;
         }
-        ESP_LOGI(TAG, "Reloading blocklist...");
-        blocklist_load();
+        if (s_reload_requested) {
+            s_reload_requested = false;
+            ESP_LOGI(TAG, "Manual reload...");
+            blocklist_load();   /* does not shift the daily deadline */
+            continue;
+        }
+        vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
 
@@ -395,6 +409,11 @@ extern "C" void app_main(void)
 
     /* Start web UI on port 80 */
     web_ui_start(&s_dns);
+
+    /* SNTP: get real wall-clock time so the query log carries dated timestamps.
+     * Lightweight built-in lwIP SNTP (one UDP socket). Resolves via the board's
+     * own DHCP DNS, not our sinkhole, so it works even before the blocklist loads. */
+    timesync_start();
 
     /* mDNS: advertise as esp32adblock.local and expose the HTTP service (#20) */
     if (mdns_init() == ESP_OK) {
