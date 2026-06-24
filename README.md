@@ -26,7 +26,7 @@ L2 fast path that answers blocked queries without going through lwIP.
   unchanged.
 * Forward cache. Allowed responses are cached as raw bytes in PSRAM with TTLs
   parsed from the answer records, then replayed on repeat. CNAME chains and
-  non-A records are preserved. A ~40 ms gateway round trip becomes a ~2 ms
+  non-A records are preserved. A ~40 ms gateway round trip becomes a ~1.8 ms
   local hit.
 * HTTP telemetry. GET /metrics returns JSON counters and per-category
   microsecond latency histograms. GET / is a status page. POST endpoints:
@@ -40,27 +40,64 @@ at its low query rate; throughput is the saturation figure at high concurrency.
 
 | path | p50 | min | throughput |
 | --- | --- | --- | --- |
-| blocked (L2 fast path) | 1.8 ms | 0.8 ms | ~1,200 qps |
-| allowed, cached | ~2 ms | | ~600 qps |
-| allowed, cold (forward) | gateway RTT (~40 ms) | | |
+| blocked (L2 fast path) | 1.8 ms | 0.8 ms (rare) | ~1,200 qps |
+| allowed, cached | ~1.8 ms | ~0.9 ms | ~600 qps |
+| allowed, cold (forward) | ~40 ms (gateway RTT) | — | — |
 
-The blocked-query latency is a single continuous mode at ~1.75 ms with a thin
-tail down to the ~0.8 ms floor (two SPI frames, RX + TX); the min is a rare
-jitter-alignment, not the typical case, so ~1.8 ms is the honest deployment
-number, not 0.8 ms. The distribution is smooth (no bimodality, no tick
-artifact, confirmed across two independent client OSes at 5k samples each).
+Both fast paths (blocked and cached) sit in a single smooth mode at ~1.8 ms with
+a thin tail down to the ~0.8 ms floor (two SPI frames, RX + TX); the min is a
+rare jitter-alignment, not the typical case, so ~1.8 ms is the honest deployment
+number, not 0.8 ms. The distribution has no bimodality and no tick artifact,
+confirmed across two client OSes (Windows and WSL) at 5k samples each per path.
 Under saturation the single SPI bus serializes and latency grows with offered
 load (tens of ms at 20+ concurrent), which is well beyond a home query rate.
 
 Notes on the ceiling, for anyone optimizing further. The blocklist lookup is
 ~128 us, a small fraction of the cost. Raw esp_eth_transmit on this board runs
-at about 405 us per frame (2,469 fps), so the W5500-over-SPI bus is the limit,
-not the CPU. Before the L2 fast path the same blocked query took 2.9 ms at 527
-qps, and almost all of that was lwIP socket overhead rather than the bus. The
-SPI clock stays at 40 MHz: 80 MHz fails the W5500 reset (the chip sits on
-GPIO-matrix pins, not the fast IO_MUX pins, which the SD card uses), and 60 MHz
-works but gives no speedup because the per-query cost is SPI transaction
+at about 405 us per frame (2,469 fps), so the W5500-over-SPI bus is the hard
+limit, not the CPU. Before the L2 fast path the same blocked query took 2.9 ms
+at 527 qps; the L2 bypass plus the Tier-1 stack wins (240 MHz CPU, lwIP in IRAM)
+brought both the blocked and cached paths down to ~1.8 ms. A leak gate over ~60k
+mixed queries shows the internal heap flat — no leak or double-free in the L2
+path. The SPI clock stays at 40 MHz: 80 MHz fails the W5500 reset (the chip sits
+on GPIO-matrix pins, not the fast IO_MUX pins, which the SD card uses), and
+60 MHz works but gives no speedup because the per-query cost is SPI transaction
 overhead, not clock rate.
+
+For comparison, ~1.8 ms typical is about 2.5x dnsmasq's ~0.7 ms — and that gap
+is the Ethernet-over-SPI hardware (the ~405 us/frame SPI floor, two frames per
+query), not software.
+
+## Status and known issues
+
+A full-codebase review (June 2026) audited the firmware and filed the results to
+the issue tracker. The figures above are real bench measurements, but a few of
+the advertised wins are currently undercut by open bugs — worth knowing before
+you rely on them:
+
+* **Forward-cache hit rate is low for dual-stack clients.** Cache slots are
+  indexed by domain hash only, with the query type not folded into the slot, so
+  the A and AAAA records for the same name share one slot and evict each other.
+  Modern stub resolvers (glibc `getaddrinfo`, browsers) issue A+AAAA in
+  parallel, so the ~1.8 ms cached-hit path rarely triggers on repeat lookups until
+  this is fixed. The hit *latency* is accurate; the hit *rate* is not yet. (#43)
+* **The L2 fast path stalls briefly during whitelist edits.** The Ethernet RX
+  hook takes the whitelist mutex, which the writer holds across an NVS commit
+  (~10–100 ms of flash work), so adding or removing a whitelist entry pauses the
+  fast path and frame intake for the commit. Steady-state latency is
+  unaffected. (#37)
+* **The "about a second" SD reload is not independently re-measured.** The load
+  path reads PSRAM directly through FATFS where the save path deliberately
+  bounces through a DRAM buffer, so real cold-boot time may be higher. (#38)
+* **Large upstream responses are truncated.** Replies over 512 bytes are cut to
+  512 with no TC bit set, which breaks DNSSEC, large TXT (SPF/DKIM), and HTTPS
+  RRs for forwarded queries. (#36)
+* **Security: the HTTP control UI is LAN-trust-only.** It has no CSRF protection
+  and reflects/stores user input without escaping, and upstream replies are
+  accepted without source-address validation. Do not expose the board's HTTP
+  port; treat the device as trusted-LAN only. (#22, #23, #24, #28, #35, #44)
+
+See the issue tracker for the full list and the code-grounded analysis on each.
 
 ## Hardware
 
