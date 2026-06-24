@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <cerrno>
 #include <cinttypes>
+#include <atomic>
 #include <sys/select.h>
 
 static const char *TAG = "dns_server";
@@ -107,6 +108,24 @@ struct CacheEntry {
 };
 static CacheEntry *s_cache = nullptr; /* CACHE_SLOTS entries in PSRAM */
 
+/* Seqlock for cross-task cache reads. The dns_task is the only writer; the L2
+ * eth-RX task reads the cache from dns_cache_l2_get() (a different task/core).
+ * Writers bump the counter odd→write→even; a reader that sees an odd value or a
+ * changed value bails (treats it as a miss → passthrough to lwIP). The dns_task's
+ * own cache_lookup() needs no seqlock — it never races itself. */
+static std::atomic<uint32_t> s_cache_seq{0};
+
+static inline void cache_write_begin(void)
+{
+    s_cache_seq.store(s_cache_seq.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+    std::atomic_thread_fence(std::memory_order_release);
+}
+static inline void cache_write_end(void)
+{
+    std::atomic_thread_fence(std::memory_order_release);
+    s_cache_seq.store(s_cache_seq.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+}
+
 static bool cache_init(void)
 {
     s_cache = (CacheEntry *)heap_caps_calloc(CACHE_SLOTS, sizeof(CacheEntry), MALLOC_CAP_SPIRAM);
@@ -122,19 +141,49 @@ static CacheEntry *cache_lookup(uint32_t h, uint16_t qtype, uint64_t now_ms)
 static void cache_store_blocked(uint32_t h, uint16_t qtype, uint32_t ttl_s, uint64_t now_ms)
 {
     CacheEntry *e = &s_cache[(h ^ ((uint32_t)qtype << 1)) & (CACHE_SLOTS - 1)];
+    cache_write_begin();
     e->key_hash = h; e->qtype = qtype; e->blocked = true; e->valid = true;
     e->resp_len = 0;
     e->ttl_deadline_ms = now_ms + (uint64_t)ttl_s * 1000u;
+    cache_write_end();
 }
 static void cache_store_resp(uint32_t h, uint16_t qtype, const uint8_t *resp, int len,
                              uint32_t ttl_s, uint64_t now_ms)
 {
     if (len <= 0 || len > FWD_RESP_MAX) return;
     CacheEntry *e = &s_cache[(h ^ ((uint32_t)qtype << 1)) & (CACHE_SLOTS - 1)];
+    cache_write_begin();
     e->key_hash = h; e->qtype = qtype; e->blocked = false; e->valid = true;
     e->resp_len = (uint16_t)len;
     memcpy(e->resp, resp, len);
     e->ttl_deadline_ms = now_ms + (uint64_t)ttl_s * 1000u;
+    cache_write_end();
+}
+
+/* L2 fast-path cache read (called from the eth-RX task). Seqlock-protected.
+ * Copies the cached ALLOWED response for (qhash,qtype) into out (caller patches
+ * the txid + builds the frame). Returns the DNS length, or -1 on miss / expired /
+ * blocked-entry / write-race. Blocked domains are handled by the blocklist check
+ * in the L2 hook, so we only replay allowed (forward-cached) responses here. */
+extern "C" int dns_cache_l2_get(uint32_t qhash, uint16_t qtype, uint8_t *out, int out_cap)
+{
+    if (!s_cache || !out) return -1;
+    uint64_t now_ms = (uint64_t)(esp_timer_get_time() / 1000);
+    CacheEntry *e = &s_cache[(qhash ^ ((uint32_t)qtype << 1)) & (CACHE_SLOTS - 1)];
+
+    uint32_t s1 = s_cache_seq.load(std::memory_order_relaxed);
+    if (s1 & 1u) return -1;                       /* writer mid-update */
+    std::atomic_thread_fence(std::memory_order_acquire);
+
+    if (!e->valid || e->blocked || e->key_hash != qhash || e->qtype != qtype) return -1;
+    if (e->ttl_deadline_ms <= now_ms) return -1;  /* expired */
+    int len = e->resp_len;
+    if (len <= 0 || len > out_cap || len > FWD_RESP_MAX) return -1;
+    memcpy(out, e->resp, (size_t)len);
+
+    std::atomic_thread_fence(std::memory_order_acquire);
+    if (s_cache_seq.load(std::memory_order_relaxed) != s1) return -1; /* raced */
+    return len;
 }
 
 /* Skip a DNS name (label walk + compression pointer) at *off; advance *off past it.
@@ -726,7 +775,8 @@ done:
 uint64_t DnsSinkServer::queries_total()   const { return s_cnt_total; }
 uint64_t DnsSinkServer::queries_blocked() const { return s_cnt_blocked; }
 
-extern "C" uint32_t dns_sink_l2_blocked(void);  /* L2 fast-path counter (dns_sink.cpp) */
+extern "C" uint32_t dns_sink_l2_blocked(void);  /* L2 fast-path counters (dns_sink.cpp) */
+extern "C" uint32_t dns_sink_l2_cached(void);
 
 static void do_metrics_reset(void)
 {
@@ -761,7 +811,7 @@ int dns_server_metrics_json(char *out, size_t cap)
         "{"
         "\"uptime_s\":%lld,"
         "\"queries_total\":%" PRIu32 ",\"blocked\":%" PRIu32 ",\"forwarded\":%" PRIu32 ","
-        "\"l2_blocked\":%" PRIu32 ","
+        "\"l2_blocked\":%" PRIu32 ",\"l2_cached\":%" PRIu32 ","
         "\"cache_probes\":%" PRIu32 ",\"cache_hits\":%" PRIu32 ",\"cache_hit_rate\":%.1f,"
         "\"dropped\":{\"table_full\":%" PRIu32 "},\"upstream_timeouts\":%" PRIu32 ","
         "\"upstream_inflight\":%d,\"upstream_max\":%d,"
@@ -769,7 +819,7 @@ int dns_server_metrics_json(char *out, size_t cap)
         "\"heap_free\":%u,\"psram_free\":%u,\"dns_task_stack_hwm\":%u,",
         (long long)(esp_timer_get_time() / 1000000),
         s_cnt_total, s_cnt_blocked, s_cnt_forwarded,
-        dns_sink_l2_blocked(),
+        dns_sink_l2_blocked(), dns_sink_l2_cached(),
         probes, hits, hitrate,
         s_cnt_drop_table, s_cnt_upstream_to,
         upstream_inflight(), UPSTREAM_TABLE_SIZE,

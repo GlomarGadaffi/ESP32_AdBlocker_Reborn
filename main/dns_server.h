@@ -25,6 +25,17 @@ int dns_server_metrics_json(char *out, size_t cap);
 /* Zero all counters + latency histograms (for clean per-bench measurement). */
 void dns_server_metrics_reset(void);
 
+/* L2 fast-path forward-cache read, callable from the eth-RX task (C linkage).
+ * Copies the cached ALLOWED response for (qhash,qtype) into out; returns the DNS
+ * length or -1 on miss/expired/race. The caller patches the txid and frames it. */
+#ifdef __cplusplus
+extern "C" {
+#endif
+int dns_cache_l2_get(uint32_t qhash, uint16_t qtype, uint8_t *out, int out_cap);
+#ifdef __cplusplus
+}
+#endif
+
 class DnsSinkServer {
 public:
     DnsSinkServer();

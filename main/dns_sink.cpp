@@ -250,7 +250,9 @@ static void download_task(void *)
  * Everything else passes through to lwIP unchanged (DHCP, httpd, forwarding,
  * cache, allowed queries). Runs single-threaded in the eth RX task. */
 static uint32_t s_l2_blocked = 0;   /* L2-handled blocked queries (bypassed lwIP) */
+static uint32_t s_l2_cached  = 0;   /* L2-handled forward-cache hits (bypassed lwIP) */
 extern "C" uint32_t dns_sink_l2_blocked(void) { return s_l2_blocked; }
+extern "C" uint32_t dns_sink_l2_cached(void)  { return s_l2_cached; }
 
 /* Parse question qname → normalized name; return qend offset within DNS msg. */
 static int l2_qname(const uint8_t *dns, int dns_len, char *out, size_t cap, size_t *outlen)
@@ -297,7 +299,34 @@ static esp_err_t l2_input_cb(esp_eth_handle_t h, uint8_t *buf, uint32_t len,
         if (qend < 0) break;
         uint16_t qtype = (buf[dns + qend - 4] << 8) | buf[dns + qend - 3];
         if (qtype != 1 && qtype != 28) break;            /* A / AAAA only */
-        if (!blocklist_is_blocked_nb(name, nlen)) break; /* not blocked → lwIP; _nb avoids stalling eth RX on mutex (#37) */
+        if (!blocklist_is_blocked_nb(name, nlen)) {      /* not blocked → try L2 cache, else lwIP */
+            /* Forward-cache hit answered straight from L2, skipping lwIP — the
+             * same socket-stack overhead the blocked path already bypasses. Lay
+             * the eth+ip+udp headers into tx, then the seqlock-protected reader
+             * copies the cached DNS reply right after them. Miss/race → lwIP. */
+            int clen = dns_cache_l2_get(domain_hash(name, nlen), qtype,
+                                        tx + dns, (int)sizeof(tx) - dns);
+            if (clen <= 0) break;                        /* miss/expired/race → lwIP */
+            memcpy(tx, buf, dns);                         /* eth+ip+udp headers */
+            uint8_t s6[6]; memcpy(s6,tx,6); memcpy(tx,tx+6,6); memcpy(tx+6,s6,6);            /* swap MAC */
+            uint8_t s4[4]; memcpy(s4,tx+14+12,4); memcpy(tx+14+12,tx+14+16,4); memcpy(tx+14+16,s4,4); /* swap IP */
+            uint8_t s2[2]; memcpy(s2,tx+udp,2); memcpy(tx+udp,tx+udp+2,2); memcpy(tx+udp+2,s2,2);     /* swap ports */
+            tx[dns] = buf[dns]; tx[dns+1] = buf[dns+1];   /* patch txid to this query */
+            int iptot_c = ihl + 8 + clen;
+            tx[14+2]=(iptot_c>>8); tx[14+3]=(iptot_c&0xFF);
+            int udplen_c = 8 + clen;
+            tx[udp+4]=(udplen_c>>8); tx[udp+5]=(udplen_c&0xFF);
+            tx[udp+6]=0; tx[udp+7]=0;                     /* zero UDP checksum (legal IPv4) */
+            tx[14+10]=0; tx[14+11]=0;                     /* IP checksum */
+            uint32_t csum=0;
+            for (int i=0;i<ihl;i+=2) csum += (tx[14+i]<<8)|tx[14+i+1];
+            while (csum>>16) csum=(csum&0xFFFF)+(csum>>16);
+            uint16_t cks=~csum; tx[14+10]=(cks>>8); tx[14+11]=(cks&0xFF);
+            esp_eth_transmit(h, tx, dns + clen);
+            s_l2_cached++;
+            free(buf);                                    /* consumed (== eth_l2_free) */
+            return ESP_OK;
+        }
 
         /* ── craft blocked response in tx ── */
         int rdlen = (qtype == 28) ? 16 : 4;
