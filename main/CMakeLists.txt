@@ -3,6 +3,7 @@ idf_component_register(
         "dns_sink.cpp"
         "dns_server.cpp"
         "blocklist.c"
+        "rewrite.c"
         "http_fetch.c"
         "murmur3.c"
         "domain.c"

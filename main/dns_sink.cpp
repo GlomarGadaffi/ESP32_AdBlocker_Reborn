@@ -32,6 +32,7 @@
 
 #include "blocklist.h"
 #include "domain.h"
+#include "rewrite.h"
 #include "dns_server.h"
 #include "web_ui.h"
 #include "mdns.h"
@@ -370,6 +371,7 @@ extern "C" void app_main(void)
         ESP_LOGE(TAG, "PSRAM blocklist init failed — halting");
         for (;;) vTaskDelay(portMAX_DELAY);
     }
+    rewrite_init();
 
     /* Mount SD card (SPI3 — separate bus from W5500) */
     sd_mount();

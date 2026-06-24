@@ -1,6 +1,7 @@
 #include "dns_server.h"
 #include "blocklist.h"
 #include "domain.h"
+#include "rewrite.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
@@ -544,6 +545,37 @@ void DnsSinkServer::run_loop()
                         goto forward;
                     }
                     continue;
+                }
+
+                /* ── DNS rewrite check (#12): local zone / domain→IP ── */
+                if (qtype == 1 /* A */) {
+                    uint32_t rw_ip = rewrite_lookup(name);
+                    if (rw_ip) {
+                        /* Synthesize an A record response */
+                        memcpy(tx, rx, qend);
+                        uint16_t qf = (rx[2] << 8) | rx[3];
+                        uint16_t rf = dns_resp_flags(qf, 0);
+                        tx[2] = rf >> 8; tx[3] = rf & 0xFF;
+                        reinterpret_cast<DnsHeader *>(tx)->ancount = htons(1);
+                        reinterpret_cast<DnsHeader *>(tx)->nscount = 0;
+                        reinterpret_cast<DnsHeader *>(tx)->arcount = 0;
+                        /* Append answer RR: name (ptr to qname), A, IN, TTL=300, rdata */
+                        int p = qend;
+                        if (p + 16 <= (int)sizeof(tx)) {
+                            tx[p++] = 0xC0; tx[p++] = 0x0C; /* ptr to question name */
+                            tx[p++] = 0x00; tx[p++] = 0x01; /* A */
+                            tx[p++] = 0x00; tx[p++] = 0x01; /* IN */
+                            tx[p++] = 0x00; tx[p++] = 0x00; tx[p++] = 0x01; tx[p++] = 0x2C; /* TTL 300 */
+                            tx[p++] = 0x00; tx[p++] = 0x04; /* rdlength */
+                            tx[p++] = (rw_ip >> 24) & 0xFF;
+                            tx[p++] = (rw_ip >> 16) & 0xFF;
+                            tx[p++] = (rw_ip >> 8)  & 0xFF;
+                            tx[p++] =  rw_ip        & 0xFF;
+                            sendto(csock, tx, p, 0, (sockaddr *)&client_addr, clen);
+                            hist_record(&s_h_cached, esp_timer_get_time() - t_recv);
+                        }
+                        continue;
+                    }
                 }
 
                 /* ── blocklist check (measure CPU-only lookup span) ──

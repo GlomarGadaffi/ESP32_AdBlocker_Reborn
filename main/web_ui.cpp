@@ -1,6 +1,7 @@
 #include "web_ui.h"
 #include "blocklist.h"
 #include "domain.h"
+#include "rewrite.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
 #include <cstring>
@@ -96,25 +97,28 @@ static esp_err_t handle_status(httpd_req_t *r)
         "<!DOCTYPE html><html><head><meta charset=utf-8>"
         "<title>DNS Sinkhole</title>"
         "<meta http-equiv='refresh' content='10'>"
-        "<style>body{font-family:monospace;max-width:600px;margin:2em auto;}"
+        "<style>body{font-family:monospace;max-width:700px;margin:2em auto;}"
         "table{border-collapse:collapse;width:100%%}"
         "td,th{border:1px solid #ccc;padding:.4em .8em;text-align:left}"
-        "th{background:#222;color:#eee}.ok{color:green}.warn{color:orange}</style>"
-        "</head><body><h2>DNS Sinkhole</h2>");
+        "th{background:#222;color:#eee}.ok{color:green}.warn{color:orange}"
+        ".stats{display:flex;gap:1em;flex-wrap:wrap;margin:1em 0}"
+        ".stat{background:#f4f4f4;border:1px solid #ccc;border-radius:6px;"
+        "padding:.6em 1.2em;min-width:110px;text-align:center}"
+        ".stat .val{font-size:1.6em;font-weight:bold;color:#1a1a8c}"
+        ".stat .lbl{font-size:.75em;color:#555}</style>"
+        "</head><body><h2>ESP32 AdBlocker</h2>");
+    float pct = total > 0 ? 100.0f * (float)blocked / (float)total : 0.0f;
     n += snprintf(page + n, sizeof(page) - n,
-        "<table><tr><th>Metric</th><th>Value</th></tr>"
-        "<tr><td>Domains loaded</td><td>%" PRIu32 " %s</td></tr>"
-        "<tr><td>Status</td><td class='%s'>%s</td></tr>"
-        "<tr><td>Queries total</td><td>%" PRIu32 "</td></tr>"
-        "<tr><td>Queries blocked</td><td>%" PRIu32 " (%.1f%%)</td></tr>"
-        "<tr><td>Whitelist entries</td><td>%" PRIu32 " / %d</td></tr>"
-        "</table>",
-        domains, loading ? "(reloading...)" : "",
+        "<div class=stats>"
+        "<div class=stat><div class=val>%" PRIu32 "</div><div class=lbl>Domains</div></div>"
+        "<div class=stat><div class=val>%" PRIu32 "</div><div class=lbl>Queries</div></div>"
+        "<div class=stat><div class=val>%" PRIu32 "</div><div class=lbl>Blocked</div></div>"
+        "<div class=stat><div class=val>%.1f%%</div><div class=lbl>Block rate</div></div>"
+        "<div class=stat><div class=val class='%s'>%s</div><div class=lbl>Status</div></div>"
+        "</div>",
+        domains, total, blocked, pct,
         loading ? "warn" : "ok",
-        loading ? "Reloading" : "Active",
-        total, blocked,
-        total > 0 ? 100.0f * (float)blocked / (float)total : 0.0f,
-        wl_n, WHITELIST_MAX);
+        loading ? "Reloading" : "Active");
 
     n += snprintf(page + n, sizeof(page) - n,
         "<h3>Actions</h3>"
@@ -145,6 +149,37 @@ static esp_err_t handle_status(httpd_req_t *r)
                 safe_text, safe_attr);
         }
         n += snprintf(page + n, sizeof(page) - n, "</table>");
+    }
+
+    /* DNS rewrite table (#12) */
+    {
+        uint32_t rw_n = rewrite_count();
+        n += snprintf(page + n, sizeof(page) - n,
+            "<h3>DNS Rewrites</h3>"
+            "<form method=post action=/rewrite/set>"
+            "<input name=domain placeholder='domain.local' size=24>"
+            " → <input name=ip placeholder='192.168.1.x' size=16>"
+            "<button>Add rewrite</button></form>");
+        if (rw_n > 0) {
+            char rw_domains[REWRITE_MAX][64]; uint32_t rw_ips[REWRITE_MAX]; uint32_t rw_cnt = REWRITE_MAX;
+            rewrite_list(rw_domains, rw_ips, &rw_cnt);
+            n += snprintf(page + n, sizeof(page) - n, "<table><tr><th>Domain</th><th>IP</th><th>Action</th></tr>");
+            for (uint32_t i = 0; i < rw_cnt && n < (int)sizeof(page) - 256; i++) {
+                char safe_d[128]; html_escape(safe_d, sizeof(safe_d), rw_domains[i]);
+                char safe_da[128]; html_escape(safe_da, sizeof(safe_da), rw_domains[i]);
+                uint32_t ip = rw_ips[i];
+                n += snprintf(page + n, sizeof(page) - n,
+                    "<tr><td>%s</td><td>%u.%u.%u.%u</td><td>"
+                    "<form method=post action=/rewrite/clear>"
+                    "<input type=hidden name=domain value=\"%s\">"
+                    "<button>Remove</button></form></td></tr>",
+                    safe_d,
+                    (unsigned)((ip>>24)&0xFF),(unsigned)((ip>>16)&0xFF),
+                    (unsigned)((ip>>8)&0xFF),(unsigned)(ip&0xFF),
+                    safe_da);
+            }
+            n += snprintf(page + n, sizeof(page) - n, "</table>");
+        }
     }
 
     /* Blocklist sources section (#4, #9) */
@@ -293,6 +328,60 @@ static esp_err_t handle_wl_remove(httpd_req_t *r)
     return ESP_OK;
 }
 
+/* ── POST /rewrite/set — add a DNS rewrite rule (#12) ─────────── */
+static esp_err_t handle_rw_set(httpd_req_t *r)
+{
+    if (!csrf_ok(r)) {
+        httpd_resp_send_err(r, HTTPD_403_FORBIDDEN, "CSRF"); return ESP_FAIL;
+    }
+    char body[256] = {}; httpd_req_recv(r, body, sizeof(body) - 1);
+    /* parse: domain=foo.local&ip=192.168.1.5 */
+    const char *pd = strstr(body, "domain=");
+    const char *pi = strstr(body, "ip=");
+    if (!pd || !pi) { httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST, ""); return ESP_FAIL; }
+    pd += 7; pi += 3;
+    /* extract domain value (ends at '&' or '\0') */
+    char raw_d[64] = {};
+    size_t dl = 0;
+    for (const char *c = pd; *c && *c != '&' && *c != '\r' && *c != '\n' && dl < 63; c++, dl++)
+        raw_d[dl] = *c;
+    char decoded_d[64]; url_decode(decoded_d, sizeof(decoded_d), raw_d, dl);
+    char norm[64]; size_t nlen = domain_normalize(norm, sizeof(norm), decoded_d, strlen(decoded_d));
+    if (nlen == 0) { httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST, "bad domain"); return ESP_FAIL; }
+    /* extract IP value */
+    unsigned b0=0,b1=0,b2=0,b3=0;
+    sscanf(pi, "%u.%u.%u.%u", &b0, &b1, &b2, &b3);
+    uint32_t ipv4 = ((uint32_t)b0<<24)|((uint32_t)b1<<16)|((uint32_t)b2<<8)|(uint32_t)b3;
+    if (ipv4 == 0) { httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST, "bad ip"); return ESP_FAIL; }
+    rewrite_set(norm, ipv4);
+    httpd_resp_set_status(r, "303 See Other");
+    httpd_resp_set_hdr(r, "Location", "/");
+    httpd_resp_send(r, nullptr, 0);
+    return ESP_OK;
+}
+
+/* ── POST /rewrite/clear — remove a DNS rewrite rule (#12) ────── */
+static esp_err_t handle_rw_clear(httpd_req_t *r)
+{
+    if (!csrf_ok(r)) {
+        httpd_resp_send_err(r, HTTPD_403_FORBIDDEN, "CSRF"); return ESP_FAIL;
+    }
+    char body[128] = {}; httpd_req_recv(r, body, sizeof(body) - 1);
+    const char *pd = strstr(body, "domain=");
+    if (!pd) { httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST, ""); return ESP_FAIL; }
+    pd += 7;
+    char raw[64] = {}; size_t dl = 0;
+    for (const char *c = pd; *c && *c != '&' && *c != '\r' && *c != '\n' && dl < 63; c++, dl++)
+        raw[dl] = *c;
+    char decoded[64]; url_decode(decoded, sizeof(decoded), raw, dl);
+    char norm[64]; size_t nlen = domain_normalize(norm, sizeof(norm), decoded, strlen(decoded));
+    if (nlen > 0) rewrite_set(norm, 0);
+    httpd_resp_set_status(r, "303 See Other");
+    httpd_resp_set_hdr(r, "Location", "/");
+    httpd_resp_send(r, nullptr, 0);
+    return ESP_OK;
+}
+
 /* ── POST /blocklist/url/set — set extra blocklist URL (#4, #9) ── */
 static esp_err_t handle_bl_url_set(httpd_req_t *r)
 {
@@ -339,7 +428,7 @@ bool web_ui_start(DnsSinkServer *dns)
     s_dns = dns;
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.server_port      = 80;
-    cfg.max_uri_handlers = 16;
+    cfg.max_uri_handlers = 20;
     cfg.stack_size       = 8192;
     if (httpd_start(&s_server, &cfg) != ESP_OK) {
         ESP_LOGE(TAG, "httpd_start failed"); return false;
@@ -355,6 +444,8 @@ bool web_ui_start(DnsSinkServer *dns)
         { "/whitelist/remove",    HTTP_POST, handle_wl_remove,     nullptr },
         { "/blocklist/url/set",   HTTP_POST, handle_bl_url_set,    nullptr },
         { "/blocklist/url/clear", HTTP_POST, handle_bl_url_clear,  nullptr },
+        { "/rewrite/set",         HTTP_POST, handle_rw_set,        nullptr },
+        { "/rewrite/clear",       HTTP_POST, handle_rw_clear,      nullptr },
     };
     for (auto &u : uris) httpd_register_uri_handler(s_server, &u);
 
