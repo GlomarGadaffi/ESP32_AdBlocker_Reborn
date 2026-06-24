@@ -1,0 +1,5 @@
+## IDF Component Manager manifest for dns-sink
+dependencies:
+  idf: ">=6.0.0"
+  espressif/w5500:
+    version: "^1.0.1"

@@ -1,0 +1,30 @@
+idf_component_register(
+    SRCS
+        "dns_sink.cpp"
+        "dns_server.cpp"
+        "blocklist.c"
+        "http_fetch.c"
+        "murmur3.c"
+        "domain.c"
+        "web_ui.cpp"
+    INCLUDE_DIRS "."
+    REQUIRES
+        esp_eth
+        espressif__w5500
+        esp_netif
+        esp_event
+        nvs_flash
+        lwip
+        esp_http_client
+        esp_http_server
+        esp-tls
+        mbedtls
+        esp_driver_gpio
+        esp_driver_spi
+        esp_timer
+        freertos
+        heap
+        sdmmc
+        fatfs
+        esp_driver_sdspi
+)
