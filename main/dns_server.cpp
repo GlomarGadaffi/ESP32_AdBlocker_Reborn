@@ -30,6 +30,7 @@ static Hist s_h_sendto;   /* the blocked-response sendto() call alone (lwIP TX p
 static uint32_t s_cnt_total        = 0;
 static uint32_t s_cnt_blocked      = 0;
 static uint32_t s_cnt_forwarded    = 0;
+static volatile bool s_reset_req   = false;  /* set by httpd; cleared+executed by dns_task */
 static uint32_t s_cnt_drop_table   = 0;  /* upstream table full */
 static uint32_t s_cnt_upstream_to  = 0;  /* upstream timeouts (evicted in_use) */
 static uint32_t s_cnt_cache_probe  = 0;  /* result-cache lookups */
@@ -219,7 +220,7 @@ static int build_blocked_a(const uint8_t *query, int qlen, uint8_t *out, int out
         return -1;
     memcpy(out, query, qlen);
     auto *hdr = reinterpret_cast<DnsHeader *>(out);
-    hdr->flags   = htons(DNS_FLAGS_RESPONSE);
+    hdr->flags   = htons(dns_resp_flags(ntohs(reinterpret_cast<const DnsHeader *>(query)->flags), 0));
     hdr->ancount = htons(1);
     hdr->nscount = 0;
     hdr->arcount = 0;
@@ -241,7 +242,7 @@ static int build_blocked_aaaa(const uint8_t *query, int qlen, uint8_t *out, int 
         return -1;
     memcpy(out, query, qlen);
     auto *hdr = reinterpret_cast<DnsHeader *>(out);
-    hdr->flags   = htons(DNS_FLAGS_RESPONSE);
+    hdr->flags   = htons(dns_resp_flags(ntohs(reinterpret_cast<const DnsHeader *>(query)->flags), 0));
     hdr->ancount = htons(1);
     hdr->nscount = 0;
     hdr->arcount = 0;
@@ -393,14 +394,20 @@ void DnsSinkServer::run_loop()
 
             uint32_t now_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
             upstream_evict_expired(now_ms);
+            if (s_reset_req) { s_reset_req = false; do_metrics_reset(); }
 
             (void)sel;  /* select() is just the wait; we drain non-blocking below */
 
             /* ── Drain ALL upstream replies first (frees table slots) ── */
             for (int dn = 0; dn < 64; dn++) {
-                int rlen = recvfrom(usock, rx, sizeof(rx), MSG_DONTWAIT, nullptr, nullptr);
+                struct sockaddr_in from{}; socklen_t fromlen = sizeof(from);
+                int rlen = recvfrom(usock, rx, sizeof(rx), MSG_DONTWAIT,
+                                    (sockaddr *)&from, &fromlen);
                 if (rlen < 0) break;                           /* EWOULDBLOCK: drained */
                 if (rlen < (int)sizeof(DnsHeader)) continue;
+                /* Reject replies not from our configured upstream (#24) */
+                if (from.sin_addr.s_addr != upstream_addr.sin_addr.s_addr ||
+                    from.sin_port        != upstream_addr.sin_port) continue;
                 int64_t t_ureply = esp_timer_get_time();
                 uint16_t our_txid = ntohs(reinterpret_cast<DnsHeader *>(rx)->id);
                 UpstreamEntry *ue = upstream_find(our_txid);
@@ -456,9 +463,20 @@ void DnsSinkServer::run_loop()
                 if (ce) {
                     s_cnt_cache_hit++;
                     if (ce->blocked) {
-                        int tlen = (qtype == 28)
-                            ? build_blocked_aaaa(rx, qend, tx, sizeof(tx))
-                            : build_blocked_a   (rx, qend, tx, sizeof(tx));
+                        int tlen;
+                        if (qtype == 1)
+                            tlen = build_blocked_a   (rx, qend, tx, sizeof(tx));
+                        else if (qtype == 28)
+                            tlen = build_blocked_aaaa(rx, qend, tx, sizeof(tx));
+                        else {
+                            /* Non-A/AAAA blocked: NXDOMAIN with no answer RRs */
+                            memcpy(tx, rx, qend);
+                            reinterpret_cast<DnsHeader *>(tx)->flags   = htons(DNS_FLAGS_NXDOMAIN);
+                            reinterpret_cast<DnsHeader *>(tx)->ancount = 0;
+                            reinterpret_cast<DnsHeader *>(tx)->nscount = 0;
+                            reinterpret_cast<DnsHeader *>(tx)->arcount = 0;
+                            tlen = qend;
+                        }
                         if (tlen > 0)
                             sendto(csock, tx, tlen, 0, (sockaddr *)&client_addr, clen);
                         s_cnt_blocked++;
@@ -485,9 +503,19 @@ void DnsSinkServer::run_loop()
                     hist_record(&s_h_lookup, esp_timer_get_time() - t_lk);
                     if (is_blk) {
                         s_cnt_blocked++;
-                        int tlen = (qtype == 28)
-                            ? build_blocked_aaaa(rx, qend, tx, sizeof(tx))
-                            : build_blocked_a   (rx, qend, tx, sizeof(tx));
+                        int tlen;
+                        if (qtype == 1)
+                            tlen = build_blocked_a   (rx, qend, tx, sizeof(tx));
+                        else if (qtype == 28)
+                            tlen = build_blocked_aaaa(rx, qend, tx, sizeof(tx));
+                        else {
+                            memcpy(tx, rx, qend);
+                            reinterpret_cast<DnsHeader *>(tx)->flags   = htons(DNS_FLAGS_NXDOMAIN);
+                            reinterpret_cast<DnsHeader *>(tx)->ancount = 0;
+                            reinterpret_cast<DnsHeader *>(tx)->nscount = 0;
+                            reinterpret_cast<DnsHeader *>(tx)->arcount = 0;
+                            tlen = qend;
+                        }
                         if (tlen > 0) {
                             int64_t t_s0 = esp_timer_get_time();
                             sendto(csock, tx, tlen, 0, (sockaddr *)&client_addr, clen);
@@ -543,7 +571,7 @@ uint64_t DnsSinkServer::queries_blocked() const { return s_cnt_blocked; }
 
 extern "C" uint32_t dns_sink_l2_blocked(void);  /* L2 fast-path counter (dns_sink.cpp) */
 
-void dns_server_metrics_reset(void)
+static void do_metrics_reset(void)
 {
     s_cnt_total = s_cnt_blocked = s_cnt_forwarded = 0;
     s_cnt_drop_table = s_cnt_upstream_to = s_cnt_cache_probe = s_cnt_cache_hit = 0;
@@ -554,6 +582,11 @@ void dns_server_metrics_reset(void)
     memset(&s_h_fwd_ourovh, 0, sizeof(s_h_fwd_ourovh));
     memset(&s_h_lookup,     0, sizeof(s_h_lookup));
     memset(&s_h_sendto,     0, sizeof(s_h_sendto));
+}
+
+void dns_server_metrics_reset(void)
+{
+    s_reset_req = true;  /* picked up by dns_task on its next select() wakeup */
 }
 
 /* ── /metrics JSON ───────────────────────────────────────────────── */

@@ -291,7 +291,9 @@ static esp_err_t l2_input_cb(esp_eth_handle_t h, uint8_t *buf, uint32_t len,
         memcpy(t4, tx+14+12, 4); memcpy(tx+14+12, tx+14+16, 4); memcpy(tx+14+16, t4, 4); /* swap IP */
         uint8_t t2[2];
         memcpy(t2, tx+udp, 2); memcpy(tx+udp, tx+udp+2, 2); memcpy(tx+udp+2, t2, 2);     /* swap ports */
-        tx[dns+2] = 0x81; tx[dns+3] = 0x80;              /* QR=1 RD=1 RA=1 */
+        { uint16_t qf = (buf[dns+2] << 8) | buf[dns+3];
+          uint16_t rf = dns_resp_flags(qf, 0);
+          tx[dns+2] = (rf >> 8); tx[dns+3] = (rf & 0xFF); }
         tx[dns+6] = 0; tx[dns+7] = 1;                    /* ancount=1 */
         tx[dns+8] = 0; tx[dns+9] = 0; tx[dns+10] = 0; tx[dns+11] = 0;  /* ns/ar=0 */
         uint8_t *a = tx + dns + qend;

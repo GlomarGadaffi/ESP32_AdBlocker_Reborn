@@ -143,8 +143,12 @@ uint32_t blocklist_load(void)
     ESP_LOGI(TAG, "Downloaded %" PRIu32 " domains; sorting...", lc.n);
 
     /* The sort needs the other buffer as scratch — that's the live one, so we
-     * must drop to degraded mode for the ~1-2s sort only (not the whole fetch). */
+     * must drop to degraded mode for the ~1-2s sort only (not the whole fetch).
+     * After nulling s_live, yield for 2ms so any Core 1 reader that already
+     * latched the old arr pointer completes its binary search before we overwrite
+     * that buffer (#45 — RCU quiescence window). */
     atomic_store_explicit(&s_live, NULL, memory_order_release);
+    vTaskDelay(pdMS_TO_TICKS(2));
     uint32_t *a = s_buf[new_buf];
     uint32_t *b = s_buf[s_active_buf];  /* scratch during sort; live ptr is NULL */
     radix_sort(a, b, lc.n);
@@ -204,6 +208,7 @@ bool blocklist_is_blocked(const char *domain, size_t len)
 
 bool blocklist_whitelist_add(const char *domain)
 {
+    if (strlen(domain) >= sizeof(s_whitelist[0])) return false;  /* #41: reject oversized */
     xSemaphoreTake(s_wl_mutex, portMAX_DELAY);
     bool ok = false;
     if (s_wl_count < WHITELIST_MAX) {
@@ -282,10 +287,22 @@ bool blocklist_load_sd(void)
         fclose(f); return false;
     }
 
-    size_t got = fread(s_buf[s_active_buf], sizeof(uint32_t), hdr.count, f);
+    /* Read via DRAM bounce buffer — same pattern as blocklist_save_sd, avoids
+     * handing the SDSPI/FATFS path a single huge PSRAM-sourced read. */
+    static uint32_t chunk[1024];
+    uint32_t *dst = s_buf[s_active_buf];
+    size_t remaining = hdr.count, total_read = 0;
+    while (remaining > 0) {
+        size_t batch = remaining < 1024 ? remaining : 1024;
+        size_t r = fread(chunk, sizeof(uint32_t), batch, f);
+        if (r == 0) break;
+        memcpy(dst + total_read, chunk, r * sizeof(uint32_t));
+        total_read += r; remaining -= r;
+    }
     fclose(f);
-    if (got != hdr.count) {
-        ESP_LOGW(TAG, "SD blocklist: short read %" PRIu32 "/%" PRIu32, (uint32_t)got, hdr.count);
+    if (total_read != hdr.count) {
+        ESP_LOGW(TAG, "SD blocklist: short read %" PRIu32 "/%" PRIu32,
+                 (uint32_t)total_read, hdr.count);
         return false;
     }
 

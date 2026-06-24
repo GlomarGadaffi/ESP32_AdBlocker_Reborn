@@ -2,9 +2,21 @@
 
 #include <atomic>
 #include <stddef.h>
+#include <stdint.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
+
+/* Build the DNS response flags word from a query flags word (host byte order).
+ * QR=1, OPCODE echoed, AA=1, TC=0, RD echoed, RA=1, Z=0, RCODE as given. */
+static inline uint16_t dns_resp_flags(uint16_t qflags, uint8_t rcode)
+{
+    return (uint16_t)(0x8400u                       /* QR=1 AA=1 */
+        | (qflags & 0x7800u)                        /* OPCODE echoed */
+        | 0x0080u                                   /* RA=1 */
+        | (qflags & 0x0100u)                        /* RD echoed */
+        | (rcode & 0x000Fu));
+}
 
 /* Render the live metrics snapshot as JSON into out (NUL-terminated).
  * Safe to call from the httpd task; reads lock-free counters/histograms. */
