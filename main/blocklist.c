@@ -38,10 +38,17 @@ static _Atomic(uint32_t *) s_live    = NULL;
 static _Atomic uint32_t    s_count   = 0;
 static _Atomic bool        s_loading = false;
 
+/* Mutex guarding the whitelist AND custom-rules arrays. Created first thing in
+ * blocklist_init(), before any NVS loader runs, so every writer/reader below can
+ * rely on it. Serializes the httpd config-writer task against the dns_task
+ * reader hot path (C1). */
+static SemaphoreHandle_t s_wl_mutex = NULL;
+
 /* ── Custom blocking rules (NVS-backed, inline text blob) (#14) ── */
 static char s_custom_entries[CUSTOM_RULES_MAX][64];
 static uint32_t s_custom_count = 0;
 
+/* Caller must hold s_wl_mutex. */
 static void custom_parse(const char *text)
 {
     s_custom_count = 0;
@@ -86,7 +93,9 @@ bool blocklist_custom_set(const char *text)
     nvs_set_str(h, "custom_blk", text);
     nvs_commit(h);
     nvs_close(h);
+    xSemaphoreTake(s_wl_mutex, portMAX_DELAY);
     custom_parse(text);
+    xSemaphoreGive(s_wl_mutex);
     return true;
 }
 
@@ -103,20 +112,31 @@ size_t blocklist_custom_get(char *buf, size_t cap)
 
 bool blocklist_custom_is_blocked(const char *domain, size_t len)
 {
-    if (s_custom_count == 0 || !domain) return false;
-    const char *name = domain;
-    while (name < domain + len) {
-        size_t rlen = (size_t)((domain + len) - name);
-        for (uint32_t i = 0; i < s_custom_count; i++) {
-            size_t elen = strlen(s_custom_entries[i]);
-            if (rlen == elen && memcmp(name, s_custom_entries[i], rlen) == 0)
-                return true;
+    if (!domain) return false;
+    /* Bounded take: if the writer is mid-rewrite, treat as no-match and forward
+     * (fail-open) rather than stall the dns_task hot path. Same contract as
+     * blocklist_whitelist_contains (C1). */
+    if (xSemaphoreTake(s_wl_mutex, pdMS_TO_TICKS(2)) != pdTRUE) return false;
+    bool blocked = false;
+    if (s_custom_count != 0) {
+        const char *name = domain;
+        while (name < domain + len) {
+            size_t rlen = (size_t)((domain + len) - name);
+            for (uint32_t i = 0; i < s_custom_count; i++) {
+                size_t elen = strlen(s_custom_entries[i]);
+                if (rlen == elen && memcmp(name, s_custom_entries[i], rlen) == 0) {
+                    blocked = true;
+                    break;
+                }
+            }
+            if (blocked) break;
+            const char *dot = memchr(name, '.', rlen);
+            if (!dot) break;
+            name = dot + 1;
         }
-        const char *dot = memchr(name, '.', rlen);
-        if (!dot) break;
-        name = dot + 1;
     }
-    return false;
+    xSemaphoreGive(s_wl_mutex);
+    return blocked;
 }
 
 static void custom_load_nvs(void)
@@ -125,8 +145,11 @@ static void custom_load_nvs(void)
     nvs_handle_t h;
     if (nvs_open(NVS_NS, NVS_READONLY, &h) != ESP_OK) return;
     size_t len = sizeof(buf);
-    if (nvs_get_str(h, "custom_blk", buf, &len) == ESP_OK)
+    if (nvs_get_str(h, "custom_blk", buf, &len) == ESP_OK) {
+        xSemaphoreTake(s_wl_mutex, portMAX_DELAY);
         custom_parse(buf);
+        xSemaphoreGive(s_wl_mutex);
+    }
     nvs_close(h);
 }
 
@@ -169,7 +192,7 @@ void blocklist_extra_url_get(int idx, char *buf, size_t cap)
 /* ── Whitelist (SRAM, NVS-backed) ────────────────────────────────── */
 static char s_whitelist[WHITELIST_MAX][64];
 static uint32_t s_wl_count = 0;
-static SemaphoreHandle_t s_wl_mutex = NULL;
+/* s_wl_mutex declared near the top (shared with custom-rules section). */
 
 /* ── Radix sort (4-pass LSD, in-PSRAM ping-pong) ─────────────────── */
 static void radix_sort(uint32_t *a, uint32_t *b, uint32_t n)

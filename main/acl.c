@@ -2,14 +2,20 @@
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include <string.h>
 #include <stdio.h>
 
 static const char *TAG = "acl";
 #define NVS_NS "dns_sink"
 
+/* s_ips/s_count are mutated from the httpd task and read from the dns_task hot
+ * path. The mutex serializes the in-memory mutation against the reader (H3).
+ * NVS writes are done OUTSIDE the lock so the reader never blocks on flash. */
 static uint32_t s_ips[ACL_MAX];
 static uint32_t s_count = 0;
+static SemaphoreHandle_t s_mutex = NULL;
 
 static uint32_t parse_ip(const char *s)
 {
@@ -39,6 +45,8 @@ static void save_nvs(void)
 
 bool acl_init(void)
 {
+    if (!s_mutex) s_mutex = xSemaphoreCreateMutex();
+    if (!s_mutex) return false;
     s_count = 0;
     nvs_handle_t h;
     if (nvs_open(NVS_NS, NVS_READONLY, &h) != ESP_OK) return true;
@@ -60,30 +68,43 @@ bool acl_add(const char *ip_str)
     if (!ip_str || s_count >= ACL_MAX) return false;
     uint32_t ip = parse_ip(ip_str);
     if (ip == 0) return false;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    bool changed = false;
+    bool exists = false;
     for (uint32_t i = 0; i < s_count; i++)
-        if (s_ips[i] == ip) return true;
-    s_ips[s_count++] = ip;
-    save_nvs();
-    return true;
+        if (s_ips[i] == ip) { exists = true; break; }
+    if (!exists && s_count < ACL_MAX) { s_ips[s_count++] = ip; changed = true; }
+    xSemaphoreGive(s_mutex);
+    if (changed) save_nvs();          /* NVS write outside the lock */
+    return exists || changed;
 }
 
 bool acl_remove(const char *ip_str)
 {
     if (!ip_str) return false;
     uint32_t ip = parse_ip(ip_str);
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    bool found = false;
     for (uint32_t i = 0; i < s_count; i++) {
         if (s_ips[i] == ip) {
-            s_ips[i] = s_ips[--s_count];
-            save_nvs();
-            return true;
+            /* shift down so a concurrent reader never sees a duplicate or a
+             * stale slot above the new count (swap-remove could). */
+            for (uint32_t j = i; j + 1 < s_count; j++) s_ips[j] = s_ips[j + 1];
+            s_count--;
+            found = true;
+            break;
         }
     }
-    return false;
+    xSemaphoreGive(s_mutex);
+    if (found) save_nvs();
+    return found;
 }
 
 bool acl_clear(void)
 {
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
     s_count = 0;
+    xSemaphoreGive(s_mutex);
     save_nvs();
     return true;
 }
@@ -92,18 +113,28 @@ uint32_t acl_count(void) { return s_count; }
 
 void acl_list(char out[][20], uint32_t *count_inout)
 {
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
     uint32_t n = s_count < *count_inout ? s_count : *count_inout;
     for (uint32_t i = 0; i < n; i++)
         snprintf(out[i], 20, "%u.%u.%u.%u",
             (unsigned)((s_ips[i]>>24)&0xFF),(unsigned)((s_ips[i]>>16)&0xFF),
             (unsigned)((s_ips[i]>>8)&0xFF),(unsigned)(s_ips[i]&0xFF));
     *count_inout = n;
+    xSemaphoreGive(s_mutex);
 }
 
 bool acl_permits(uint32_t client_ip_hbo)
 {
+    /* Fast lock-free path: an empty allowlist means allow-all, which is the
+     * common case (no ACL configured), so the hot path stays lock-free. */
     if (s_count == 0) return true;
+    /* ACL configured: take a bounded lock. On contention (a config edit is
+     * mid-flight) allow the query through rather than stall DNS or wrongly deny
+     * every client for the brief mutation window. */
+    if (xSemaphoreTake(s_mutex, pdMS_TO_TICKS(2)) != pdTRUE) return true;
+    bool permit = (s_count == 0);
     for (uint32_t i = 0; i < s_count; i++)
-        if (s_ips[i] == client_ip_hbo) return true;
-    return false;
+        if (s_ips[i] == client_ip_hbo) { permit = true; break; }
+    xSemaphoreGive(s_mutex);
+    return permit;
 }
