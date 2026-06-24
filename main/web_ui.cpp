@@ -10,6 +10,7 @@
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
+#include <cstdarg>
 #include <inttypes.h>
 
 static const char *TAG = "web_ui";
@@ -61,6 +62,23 @@ static void url_decode(char *dst, size_t cap, const char *src, size_t src_len)
     dst[d] = '\0';
 }
 
+/* Compare the host component of an Origin/Referer URL against our Host header.
+ * Matches scheme://<host>[:port][/...] — the host must appear immediately after
+ * "://" and be terminated by ':', '/', or end-of-string. A plain substring test
+ * (the old behavior) accepts http://<host>.evil.com because <host> is a prefix
+ * substring; this rejects it (L1). */
+static bool origin_host_matches(const char *url, const char *host)
+{
+    if (host[0] == '\0') return false;
+    const char *p = strstr(url, "://");
+    if (!p) return false;
+    p += 3;
+    size_t hl = strlen(host);
+    if (strncmp(p, host, hl) != 0) return false;
+    char after = p[hl];
+    return after == '\0' || after == '/' || after == ':';
+}
+
 /* Check Origin/Referer header against Host on POST handlers to block CSRF.
  * Returns true when the request looks same-origin (or has no Origin/Referer). */
 static bool csrf_ok(httpd_req_t *r)
@@ -70,12 +88,32 @@ static bool csrf_ok(httpd_req_t *r)
     httpd_req_get_hdr_value_str(r, "Origin",  origin,  sizeof(origin));
     httpd_req_get_hdr_value_str(r, "Referer", referer, sizeof(referer));
 
-    /* If Origin is present it must contain our host. */
-    if (origin[0] != '\0') return (strstr(origin,  host) != nullptr);
-    /* If Referer is present it must contain our host. */
-    if (referer[0] != '\0') return (strstr(referer, host) != nullptr);
-    /* Neither header present — allow (same-origin form with no JS). */
+    /* If Origin is present its host must exactly match ours. */
+    if (origin[0] != '\0') return origin_host_matches(origin, host);
+    /* Else if Referer is present its host must exactly match ours. */
+    if (referer[0] != '\0') return origin_host_matches(referer, host);
+    /* Neither header present — allow (same-origin form, no JS/Origin sent). */
     return true;
+}
+
+/* Bounded append into a page buffer. *pos tracks the current write offset.
+ * snprintf returns the length it WOULD have written, so a naive
+ * `n += snprintf(buf+n, cap-n, ...)` lets n exceed cap; the next call then
+ * computes cap-n as a huge size_t and writes past the buffer (H1). This clamps
+ * *pos to cap-1 on truncation so every subsequent call is a safe no-op. */
+static void page_appendf(char *buf, size_t cap, int *pos, const char *fmt, ...)
+    __attribute__((format(printf, 4, 5)));
+static void page_appendf(char *buf, size_t cap, int *pos, const char *fmt, ...)
+{
+    if (*pos < 0 || (size_t)*pos >= cap) { if (cap) buf[cap - 1] = '\0'; return; }
+    size_t avail = cap - (size_t)*pos;
+    va_list ap;
+    va_start(ap, fmt);
+    int w = vsnprintf(buf + *pos, avail, fmt, ap);
+    va_end(ap);
+    if (w < 0) return;
+    if ((size_t)w >= avail) *pos = (int)cap - 1;   /* truncated — clamp */
+    else                    *pos += w;
 }
 
 static void send_html(httpd_req_t *r, const char *body)
@@ -96,7 +134,7 @@ static esp_err_t handle_status(httpd_req_t *r)
 
     static char page[8192];  /* static: avoids stack overflow in httpd task */
     int  n = 0;
-    n += snprintf(page + n, sizeof(page) - n,
+    page_appendf(page, sizeof(page), &n,
         "<!DOCTYPE html><html><head><meta charset=utf-8>"
         "<title>DNS Sinkhole</title>"
         "<meta http-equiv='refresh' content='10'>"
@@ -111,7 +149,7 @@ static esp_err_t handle_status(httpd_req_t *r)
         ".stat .lbl{font-size:.75em;color:#555}</style>"
         "</head><body><h2>ESP32 AdBlocker</h2>");
     float pct = total > 0 ? 100.0f * (float)blocked / (float)total : 0.0f;
-    n += snprintf(page + n, sizeof(page) - n,
+    page_appendf(page, sizeof(page), &n,
         "<div class=stats>"
         "<div class=stat><div class=val>%" PRIu32 "</div><div class=lbl>Domains</div></div>"
         "<div class=stat><div class=val>%" PRIu32 "</div><div class=lbl>Queries</div></div>"
@@ -123,7 +161,7 @@ static esp_err_t handle_status(httpd_req_t *r)
         loading ? "warn" : "ok",
         loading ? "Reloading" : "Active");
 
-    n += snprintf(page + n, sizeof(page) - n,
+    page_appendf(page, sizeof(page), &n,
         "<h3>Actions</h3>"
         "<form method=post action=/reload><button>Reload blocklist</button></form><br>"
         "<form method=post action=/check>"
@@ -137,7 +175,7 @@ static esp_err_t handle_status(httpd_req_t *r)
 
     /* whitelist table */
     if (wl_n > 0) {
-        n += snprintf(page + n, sizeof(page) - n,
+        page_appendf(page, sizeof(page), &n,
             "<h3>Whitelist</h3><table>"
             "<tr><th>Domain</th><th>Action</th></tr>");
         static char wl[WHITELIST_MAX][64]; uint32_t cnt = WHITELIST_MAX;
@@ -146,14 +184,14 @@ static esp_err_t handle_status(httpd_req_t *r)
             char safe_text[384], safe_attr[384];
             html_escape(safe_text, sizeof(safe_text), wl[i]);
             html_escape(safe_attr, sizeof(safe_attr), wl[i]);
-            n += snprintf(page + n, sizeof(page) - n,
+            page_appendf(page, sizeof(page), &n,
                 "<tr><td>%s</td><td>"
                 "<form method=post action=/whitelist/remove>"
                 "<input type=hidden name=domain value=\"%s\">"
                 "<button>Remove</button></form></td></tr>",
                 safe_text, safe_attr);
         }
-        n += snprintf(page + n, sizeof(page) - n, "</table>");
+        page_appendf(page, sizeof(page), &n, "</table>");
     }
 
     /* Custom block rules (#14) */
@@ -162,7 +200,7 @@ static esp_err_t handle_status(httpd_req_t *r)
         static char safe_cr[CUSTOM_RULES_CAP * 2 + 8];
         size_t clen = blocklist_custom_get(crules, sizeof(crules));
         html_escape(safe_cr, sizeof(safe_cr), crules);
-        n += snprintf(page + n, sizeof(page) - n,
+        page_appendf(page, sizeof(page), &n,
             "<h3>Custom Block Rules</h3>"
             "<form method=post action=/custom/rules>"
             "<textarea name=rules rows=5 cols=60 placeholder='One domain per line. Lines starting with # are comments."
@@ -175,7 +213,7 @@ static esp_err_t handle_status(httpd_req_t *r)
     /* DNS rewrite table (#12) */
     {
         uint32_t rw_n = rewrite_count();
-        n += snprintf(page + n, sizeof(page) - n,
+        page_appendf(page, sizeof(page), &n,
             "<h3>DNS Rewrites</h3>"
             "<form method=post action=/rewrite/set>"
             "<input name=domain placeholder='domain.local' size=24>"
@@ -184,12 +222,12 @@ static esp_err_t handle_status(httpd_req_t *r)
         if (rw_n > 0) {
             char rw_domains[REWRITE_MAX][64]; uint32_t rw_ips[REWRITE_MAX]; uint32_t rw_cnt = REWRITE_MAX;
             rewrite_list(rw_domains, rw_ips, &rw_cnt);
-            n += snprintf(page + n, sizeof(page) - n, "<table><tr><th>Domain</th><th>IP</th><th>Action</th></tr>");
+            page_appendf(page, sizeof(page), &n, "<table><tr><th>Domain</th><th>IP</th><th>Action</th></tr>");
             for (uint32_t i = 0; i < rw_cnt && n < (int)sizeof(page) - 256; i++) {
                 char safe_d[128]; html_escape(safe_d, sizeof(safe_d), rw_domains[i]);
                 char safe_da[128]; html_escape(safe_da, sizeof(safe_da), rw_domains[i]);
                 uint32_t ip = rw_ips[i];
-                n += snprintf(page + n, sizeof(page) - n,
+                page_appendf(page, sizeof(page), &n,
                     "<tr><td>%s</td><td>%u.%u.%u.%u</td><td>"
                     "<form method=post action=/rewrite/clear>"
                     "<input type=hidden name=domain value=\"%s\">"
@@ -199,7 +237,7 @@ static esp_err_t handle_status(httpd_req_t *r)
                     (unsigned)((ip>>8)&0xFF),(unsigned)(ip&0xFF),
                     safe_da);
             }
-            n += snprintf(page + n, sizeof(page) - n, "</table>");
+            page_appendf(page, sizeof(page), &n, "</table>");
         }
     }
 
@@ -207,25 +245,25 @@ static esp_err_t handle_status(httpd_req_t *r)
     {
         char acl_ips[ACL_MAX][20]; uint32_t acl_n = ACL_MAX;
         acl_list(acl_ips, &acl_n);
-        n += snprintf(page + n, sizeof(page) - n,
+        page_appendf(page, sizeof(page), &n,
             "<h3>Client Access Control</h3>"
             "<p><small>Empty = allow all. If any IP is listed, only those clients may use this DNS server.</small></p>"
             "<form method=post action=/acl/add>"
             "<input name=ip placeholder='192.168.x.x' size=18>"
             "<button>Add allowed client</button></form>");
         if (acl_n > 0) {
-            n += snprintf(page + n, sizeof(page) - n, "<table><tr><th>Allowed client IP</th><th>Action</th></tr>");
+            page_appendf(page, sizeof(page), &n, "<table><tr><th>Allowed client IP</th><th>Action</th></tr>");
             for (uint32_t i = 0; i < acl_n && n < (int)sizeof(page) - 256; i++) {
                 char safe_ip[48]; html_escape(safe_ip, sizeof(safe_ip), acl_ips[i]);
                 char safe_ipv[48]; html_escape(safe_ipv, sizeof(safe_ipv), acl_ips[i]);
-                n += snprintf(page + n, sizeof(page) - n,
+                page_appendf(page, sizeof(page), &n,
                     "<tr><td>%s</td><td>"
                     "<form method=post action=/acl/remove>"
                     "<input type=hidden name=ip value=\"%s\">"
                     "<button>Remove</button></form></td></tr>",
                     safe_ip, safe_ipv);
             }
-            n += snprintf(page + n, sizeof(page) - n, "</table>"
+            page_appendf(page, sizeof(page), &n, "</table>"
                 "<form method=post action=/acl/clear style='margin-top:.5em'>"
                 "<button>Clear all (allow everyone)</button></form>");
         }
@@ -235,7 +273,7 @@ static esp_err_t handle_status(httpd_req_t *r)
     {
         bool dot_en = dot_is_enabled(); char dot_srv[64]="", dot_sni[64]="";
         dot_get(nullptr, dot_srv, dot_sni);
-        n += snprintf(page + n, sizeof(page) - n,
+        page_appendf(page, sizeof(page), &n,
             "<h3>Upstream DNS (DoT)</h3>"
             "<form method=post action=/dot/set>"
             "<label><input type=checkbox name=enabled value=1%s> Enable DNS-over-TLS</label><br>"
@@ -247,7 +285,7 @@ static esp_err_t handle_status(httpd_req_t *r)
     }
 
     /* Blocklist sources section (#4, #9) */
-    n += snprintf(page + n, sizeof(page) - n,
+    page_appendf(page, sizeof(page), &n,
         "<h3>Blocklist Sources</h3>"
         "<table><tr><th>#</th><th>URL</th><th>Action</th></tr>"
         "<tr><td>0 (primary)</td><td>%s</td><td>built-in</td></tr>",
@@ -256,14 +294,14 @@ static esp_err_t handle_status(httpd_req_t *r)
         char url[BLOCKLIST_URL_CAP]; blocklist_extra_url_get(i, url, sizeof(url));
         if (url[0]) {
             char safe_url[BLOCKLIST_URL_CAP * 2]; html_escape(safe_url, sizeof(safe_url), url);
-            n += snprintf(page + n, sizeof(page) - n,
+            page_appendf(page, sizeof(page), &n,
                 "<tr><td>%d</td><td>%s</td><td>"
                 "<form method=post action=/blocklist/url/clear>"
                 "<input type=hidden name=idx value=%d>"
                 "<button>Remove</button></form></td></tr>",
                 i + 1, safe_url, i);
         } else {
-            n += snprintf(page + n, sizeof(page) - n,
+            page_appendf(page, sizeof(page), &n,
                 "<tr><td>%d (empty)</td><td>"
                 "<form method=post action=/blocklist/url/set style='display:inline'>"
                 "<input type=hidden name=idx value=%d>"
@@ -272,13 +310,13 @@ static esp_err_t handle_status(httpd_req_t *r)
                 i + 1, i);
         }
     }
-    n += snprintf(page + n, sizeof(page) - n, "</table>"
+    page_appendf(page, sizeof(page), &n, "</table>"
         "<p><small>After adding/removing a source, click <b>Reload blocklist</b> above.</small></p>"
         "<p><small>Suggested security feeds: "
         "<code>https://raw.githubusercontent.com/hagezi/dns-blocklists/main/domains/tif.txt</code> (malware/phishing) &nbsp; "
         "<code>https://nsfw.oisd.nl/domainswild2</code> (adult content)</small></p>");
 
-    n += snprintf(page + n, sizeof(page) - n, "</body></html>");
+    page_appendf(page, sizeof(page), &n, "</body></html>");
     (void)n;
     send_html(r, page);
     return ESP_OK;
@@ -466,7 +504,7 @@ static esp_err_t handle_log(httpd_req_t *r)
     uint32_t n = query_log_snapshot(entries, 64);
     static char page[6144];
     int pg = 0;
-    pg += snprintf(page + pg, sizeof(page) - pg,
+    page_appendf(page, sizeof(page), &pg,
         "<!DOCTYPE html><html><head><meta charset=utf-8>"
         "<title>Query Log</title>"
         "<style>body{font-family:monospace;max-width:900px;margin:1em auto}"
@@ -485,7 +523,7 @@ static esp_err_t handle_log(httpd_req_t *r)
         const char *type = e->qtype == 1 ? "A" : (e->qtype == 28 ? "AAAA" :
                            e->qtype == 5 ? "CNAME" : e->qtype == 15 ? "MX" : "?");
         uint32_t ip = e->client_ip;
-        pg += snprintf(page + pg, sizeof(page) - pg,
+        page_appendf(page, sizeof(page), &pg,
             "<tr><td>+%lus</td><td>%u.%u.%u.%u</td><td>%s</td>"
             "<td>%s</td><td class='%s'>%s</td></tr>",
             (unsigned long)e->ts_s,
@@ -493,7 +531,7 @@ static esp_err_t handle_log(httpd_req_t *r)
             (unsigned)((ip>>8)&0xFF),(unsigned)(ip&0xFF),
             safe, type, cls, res);
     }
-    pg += snprintf(page + pg, sizeof(page) - pg, "</table></body></html>");
+    page_appendf(page, sizeof(page), &pg, "</table></body></html>");
     send_html(r, page);
     return ESP_OK;
 }
@@ -513,7 +551,7 @@ static esp_err_t handle_top(httpd_req_t *r)
 
     static char page[6144];
     int pg = 0;
-    pg += snprintf(page + pg, sizeof(page) - pg,
+    page_appendf(page, sizeof(page), &pg,
         "<!DOCTYPE html><html><head><meta charset=utf-8>"
         "<meta http-equiv='refresh' content='30'>"
         "<title>Stats</title>"
@@ -533,33 +571,33 @@ static esp_err_t handle_top(httpd_req_t *r)
         uint32_t allowed  = h_total[i] > h_blocked[i] ? h_total[i] - h_blocked[i] : 0;
         uint32_t th = (allowed  * 78) / h_max;
         uint32_t bh = (h_blocked[i] * 78) / h_max;
-        pg += snprintf(page + pg, sizeof(page) - pg,
+        page_appendf(page, sizeof(page), &pg,
             "<div class=bar title='%lut %lub'>"
             "<div class=bb style='height:%lupx'></div>"
             "<div class=bt style='height:%lupx'></div></div>",
             (unsigned long)h_total[i], (unsigned long)h_blocked[i],
             (unsigned long)bh, (unsigned long)th);
     }
-    pg += snprintf(page + pg, sizeof(page) - pg,
+    page_appendf(page, sizeof(page), &pg,
         "</div><p><small>Blue=allowed Red=blocked. Each bar=1 min.</small></p>"
         "<h3>Top Queried Domains</h3>"
         "<table><tr><th>Domain</th><th>Total</th><th>Blocked</th></tr>");
     for (uint32_t i = 0; i < nd && top_d[i].total > 0 && pg < (int)sizeof(page) - 256; i++) {
         char safe[128]; html_escape(safe, sizeof(safe), top_d[i].key);
-        pg += snprintf(page + pg, sizeof(page) - pg,
+        page_appendf(page, sizeof(page), &pg,
             "<tr><td>%s</td><td>%lu</td><td>%lu</td></tr>",
             safe, (unsigned long)top_d[i].total, (unsigned long)top_d[i].blocked);
     }
-    pg += snprintf(page + pg, sizeof(page) - pg,
+    page_appendf(page, sizeof(page), &pg,
         "</table><h3>Top Clients</h3>"
         "<table><tr><th>Client IP</th><th>Total</th><th>Blocked</th></tr>");
     for (uint32_t i = 0; i < nc && top_c[i].total > 0 && pg < (int)sizeof(page) - 256; i++) {
         char safe[64]; html_escape(safe, sizeof(safe), top_c[i].key);
-        pg += snprintf(page + pg, sizeof(page) - pg,
+        page_appendf(page, sizeof(page), &pg,
             "<tr><td>%s</td><td>%lu</td><td>%lu</td></tr>",
             safe, (unsigned long)top_c[i].total, (unsigned long)top_c[i].blocked);
     }
-    pg += snprintf(page + pg, sizeof(page) - pg, "</table></body></html>");
+    page_appendf(page, sizeof(page), &pg, "</table></body></html>");
     send_html(r, page);
     return ESP_OK;
 }
@@ -584,9 +622,12 @@ static esp_err_t handle_rw_set(httpd_req_t *r)
     char decoded_d[64]; url_decode(decoded_d, sizeof(decoded_d), raw_d, dl);
     char norm[64]; size_t nlen = domain_normalize(norm, sizeof(norm), decoded_d, strlen(decoded_d));
     if (nlen == 0) { httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST, "bad domain"); return ESP_FAIL; }
-    /* extract IP value */
+    /* extract IP value — require all four octets to parse and be in range */
     unsigned b0=0,b1=0,b2=0,b3=0;
-    sscanf(pi, "%u.%u.%u.%u", &b0, &b1, &b2, &b3);
+    if (sscanf(pi, "%u.%u.%u.%u", &b0, &b1, &b2, &b3) != 4 ||
+        b0 > 255 || b1 > 255 || b2 > 255 || b3 > 255) {
+        httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST, "bad ip"); return ESP_FAIL;
+    }
     uint32_t ipv4 = ((uint32_t)b0<<24)|((uint32_t)b1<<16)|((uint32_t)b2<<8)|(uint32_t)b3;
     if (ipv4 == 0) { httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST, "bad ip"); return ESP_FAIL; }
     rewrite_set(norm, ipv4);
