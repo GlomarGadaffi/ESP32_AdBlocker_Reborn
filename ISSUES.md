@@ -130,6 +130,19 @@ shifting the daily deadline.
 
 ---
 
+## Feature: L2 fast-path for cache hits ✅
+Forward-cache hits previously went through the lwIP socket path (dns_task),
+capping cached throughput at ~600 qps. Extended the L2 eth-RX hook to replay
+forward-cache hits directly (build frame + esp_eth_transmit), bypassing lwIP
+entirely — like blocked queries already did. Cross-task safety via a seqlock
+(`dns_cache_l2_get`): the dns_task is the only writer, the eth-RX task reads
+through the seqlock and bails to lwIP on any write-race. New `/metrics` field
+`l2_cached`. Verified on hardware: cached throughput ~600 → **~2,100 qps**
+(matching the blocked path), 26,586 concurrent L2 reads vs cache writes with
+ZERO corruption, c=1 latency unchanged (SPI-bound). See also the release-build
+perf pass (-O2 + NDEBUG, 32KB I-cache) which halved CPU-bound lookup
+(128→64 us) and lifted blocked throughput ~1,200 → ~2,200 qps.
+
 ## Feature: NTP wall-clock timestamps ✅
 Query-log entries previously carried only seconds-since-boot, useless for
 reconciling logs to real dates after a reboot.

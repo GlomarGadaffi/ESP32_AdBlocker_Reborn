@@ -19,15 +19,17 @@ L2 fast path that answers blocked queries without going through lwIP.
   reloaded in about a second on reboot, instead of a multi-minute HTTPS
   download. The daily refresh runs in the background with the old list still
   serving, so there is no blocking gap.
-* L2 fast path. Blocked queries are answered directly in the Ethernet RX hook
-  (esp_eth_update_input_path_info): the reply frame is built and sent with
-  esp_eth_transmit, never entering lwIP or the socket layer. Everything else
-  (DHCP, the HTTP UI, upstream forwarding, the cache) passes through to lwIP
-  unchanged.
-* Forward cache. Allowed responses are cached as raw bytes in PSRAM with TTLs
-  parsed from the answer records, then replayed on repeat. CNAME chains and
-  non-A records are preserved. A ~40 ms gateway round trip becomes a ~1.8 ms
-  local hit.
+* L2 fast path. Both blocked queries AND forward-cache hits are answered
+  directly in the Ethernet RX hook (esp_eth_update_input_path_info): the reply
+  frame is built and sent with esp_eth_transmit, never entering lwIP or the
+  socket layer. Only cold (uncached, non-blocked) queries fall through to lwIP
+  for upstream forwarding. A cross-task seqlock lets the RX hook read the cache
+  safely while the DNS task writes it.
+* Forward cache. Allowed responses are cached as raw bytes in PSRAM (1024 slots,
+  qtype folded into the key so A and AAAA never evict each other) with TTLs
+  parsed from the answer records, then replayed on repeat — from the L2 fast
+  path. CNAME chains and non-A records are preserved. A ~40 ms gateway round
+  trip becomes a ~1.8 ms local hit at ~2,100 qps.
 * HTTP telemetry and control. GET /metrics returns JSON counters and
   per-category microsecond latency histograms. GET / is a status page with live
   stat boxes and a clock-sync indicator. GET /log shows the recent query log
@@ -69,31 +71,38 @@ LAN client to board. The latency columns are measured at one query in flight
 (c=1), which is the uncontended per-query cost and also what a home network sees
 at its low query rate; throughput is the saturation figure at high concurrency.
 
-| path | p50 | min | throughput |
+| path | p50 (c=1) | min | throughput (saturated) |
 | --- | --- | --- | --- |
-| blocked (L2 fast path) | 1.8 ms | 0.8 ms (rare) | ~1,200 qps |
-| allowed, cached | ~1.8 ms | ~0.9 ms | ~600 qps |
+| blocked (L2 fast path) | 1.8 ms | 0.66 ms | **~2,200 qps** |
+| allowed, cached (L2 fast path) | 1.8 ms | 0.67 ms | **~2,100 qps** |
 | allowed, cold (forward) | ~40 ms (gateway RTT) | — | — |
 
-Both fast paths (blocked and cached) sit in a single smooth mode at ~1.8 ms with
-a thin tail down to the ~0.8 ms floor (two SPI frames, RX + TX); the min is a
-rare jitter-alignment, not the typical case, so ~1.8 ms is the honest deployment
-number, not 0.8 ms. The distribution has no bimodality and no tick artifact,
-confirmed across two client OSes (Windows and WSL) at 5k samples each per path.
-Under saturation the single SPI bus serializes and latency grows with offered
-load (tens of ms at 20+ concurrent), which is well beyond a home query rate.
+Both fast paths sit in a single smooth mode at ~1.8 ms with a thin tail to a
+~0.66 ms floor (two SPI frames, RX + TX); ~1.8 ms is the honest deployment
+number, not the min. Throughput is the saturation figure under multithreaded
+load from a WSL (Linux) client — both L2 paths plateau near **~2,200 qps with
+zero drops**, latency growing linearly with offered load past that (the single
+SPI bus serializing), which is far beyond any home query rate.
+
+Two things lifted these numbers. (1) **The cached path is now an L2 fast path
+too**: a forward-cache hit is answered straight from the Ethernet RX hook
+(seqlock-guarded cross-task read of the cache), never entering lwIP — so cached
+throughput went from ~600 qps (old socket path) to ~2,100 qps, matching the
+blocked path. (2) **A real release build** (-O2, assertions off) halved the
+CPU-bound work — the blocklist binary search dropped from 128 us to 64 us — which
+let the blocked path climb from ~1,200 qps (previously CPU-limited) up to the
+W5500 SPI ceiling.
 
 Notes on the ceiling, for anyone optimizing further. The blocklist lookup is
-~128 us, a small fraction of the cost. Raw esp_eth_transmit on this board runs
-at about 405 us per frame (2,469 fps), so the W5500-over-SPI bus is the hard
-limit, not the CPU. Before the L2 fast path the same blocked query took 2.9 ms
-at 527 qps; the L2 bypass plus the Tier-1 stack wins (240 MHz CPU, lwIP in IRAM)
-brought both the blocked and cached paths down to ~1.8 ms. A leak gate over ~60k
-mixed queries shows the internal heap flat — no leak or double-free in the L2
-path. The SPI clock stays at 40 MHz: 80 MHz fails the W5500 reset (the chip sits
-on GPIO-matrix pins, not the fast IO_MUX pins, which the SD card uses), and
-60 MHz works but gives no speedup because the per-query cost is SPI transaction
-overhead, not clock rate.
+~64 us, a small fraction of the cost; the W5500-over-SPI bus is now the hard
+limit, not the CPU. A leak gate over ~60k mixed queries shows the internal heap
+flat — no leak or double-free in the L2 path, and a 26k-query soak with
+concurrent cache writes confirmed the cache seqlock never yields a torn read.
+The SPI clock stays at 40 MHz (80 MHz fails the W5500 reset — the chip is on
+GPIO-matrix pins, not the IO_MUX pins the SD card uses; 60 MHz gives no speedup,
+the cost is per-transaction overhead). Flash stays DIO@80MHz: the module's 8 MB
+octal (OPI) PSRAM contends with QIO flash on the S3 MSPI controller, so QIO
+isn't usable here.
 
 For comparison, ~1.8 ms typical is about 2.5x dnsmasq's ~0.7 ms — and that gap
 is the Ethernet-over-SPI hardware (the ~405 us/frame SPI floor, two frames per
