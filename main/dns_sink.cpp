@@ -17,8 +17,12 @@
 #include "esp_eth_mac_w5500.h"
 #include "esp_eth_phy_w5500.h"
 #endif
+#if CONFIG_ADBLOCK_NET_WIFI
+#include "esp_wifi.h"
+#endif
 #include "esp_netif.h"
 #include "nvs_flash.h"
+#include "nvs.h"
 #include "esp_mac.h"
 #include "esp_timer.h"
 
@@ -42,6 +46,8 @@
 #include "mdns.h"
 #include <cstring>
 #include <cstdlib>
+#include <cstdio>
+#include <ctime>
 
 static const char *TAG = "dns_sink";
 
@@ -69,11 +75,19 @@ static const char *TAG = "dns_sink";
 #define W5500_SPI_CLOCK  40
 
 /* ── Event group ─────────────────────────────────────────────────── */
-#define ETH_CONNECTED_BIT  BIT0
-#define ETH_GOT_IP_BIT     BIT1
+#define ETH_CONNECTED_BIT   BIT0
+#define ETH_GOT_IP_BIT      BIT1
+#define WIFI_CONNECTED_BIT  BIT2
+#define WIFI_GOT_IP_BIT     BIT3
 static EventGroupHandle_t s_eth_eg = nullptr;
-static char               s_ip[16] = {};
-static char               s_gw[16] = {};   /* DHCP gateway — default upstream DNS */
+static char               s_ip[16] = {};      /* Ethernet IP — the LAN-facing address, reported to clients/mDNS/web UI */
+static char               s_gw[16] = {};      /* Ethernet DHCP gateway */
+static char               s_eth_dns[16] = {}; /* Ethernet DHCP-provided DNS server (option 6) — the real upstream target */
+#if CONFIG_ADBLOCK_NET_WIFI
+static char               s_wifi_ip[16] = {};
+static char               s_wifi_gw[16] = {};   /* Wi-Fi DHCP gateway */
+static char               s_wifi_dns[16] = {};  /* Wi-Fi DHCP-provided DNS server — see s_eth_dns */
+#endif
 
 /* ── Global singletons ───────────────────────────────────────────── */
 static DnsSinkServer s_dns;
@@ -85,6 +99,104 @@ extern "C" void dns_sink_trigger_reload(void)
     s_reload_requested = true;
 }
 
+/* ── Dual-WAN upstream-interface selection (#53) ──────────────────────────
+ * Which interface's gateway egresses upstream resolver queries (persisted in
+ * NVS so it survives reboot). Listening on port 53 already happens on every
+ * up interface (client socket binds INADDR_ANY) — this only steers the
+ * *outbound* forwarding socket, via lwIP's subnet-based routing: sending to
+ * a gateway IP that only one netif's subnet contains routes out that netif
+ * automatically, no explicit interface binding needed. */
+#define NVS_NS       "dns_sink"
+#define NVS_KEY_UPIF "up_if"
+static char s_upstream_iface[8] = "eth";   /* "eth" or "wifi" */
+
+extern "C" bool dns_sink_wifi_built(void)
+{
+#if CONFIG_ADBLOCK_NET_WIFI
+    return true;
+#else
+    return false;
+#endif
+}
+
+/* Populate current interface IPs + active upstream selection for the web UI. */
+extern "C" void dns_sink_net_status(char *iface, size_t iface_cap,
+                                     char *eth_ip, size_t eth_cap,
+                                     char *wifi_ip, size_t wifi_cap)
+{
+    if (iface) snprintf(iface, iface_cap, "%s", s_upstream_iface);
+    if (eth_ip) snprintf(eth_ip, eth_cap, "%s", s_ip);
+#if CONFIG_ADBLOCK_NET_WIFI
+    if (wifi_ip) snprintf(wifi_ip, wifi_cap, "%s", s_wifi_ip);
+#else
+    if (wifi_ip && wifi_cap) wifi_ip[0] = '\0';
+#endif
+}
+
+/* Recompute which resolver is the active upstream and push it live — no DNS
+ * task restart, in-flight queries are unaffected (see DnsSinkServer::set_upstream).
+ *
+ * Upstream = the DHCP-provided DNS server (option 6) for the selected
+ * interface, NOT its gateway. On a typical home router these are often the
+ * same box, but on a mobile-hotspot/CGNAT connection (the Cox link this was
+ * built for) they're not: the gateway is a bare NAT hop with no resolver at
+ * all, while DHCP still hands out real, working DNS server IPs separately
+ * (observed: gw 100.72.0.1 doesn't answer on :53; DNS servers 68.2.16.25/.30
+ * do). Falls back to the gateway, then to 1.1.1.1, only if DHCP genuinely
+ * didn't provide a DNS server. */
+static const char *pick_upstream(const char *dns, const char *gw)
+{
+    if (dns[0] != '\0') return dns;
+    if (gw[0]  != '\0') return gw;
+    return "1.1.1.1";
+}
+
+static void apply_upstream_iface(void)
+{
+    const char *upstream = pick_upstream(s_eth_dns, s_gw);
+#if CONFIG_ADBLOCK_NET_WIFI
+    if (strcmp(s_upstream_iface, "wifi") == 0)
+        upstream = pick_upstream(s_wifi_dns, s_wifi_gw);
+#endif
+    s_dns.set_upstream(upstream);
+}
+
+/* Called from web_ui.cpp POST /net/upstream. Returns false on an invalid or
+ * unavailable (not built / not yet connected) interface — caller keeps the
+ * previous setting in that case. */
+extern "C" bool dns_sink_set_upstream_iface(const char *iface)
+{
+    if (!iface) return false;
+    if (strcmp(iface, "eth") != 0
+#if CONFIG_ADBLOCK_NET_WIFI
+        && strcmp(iface, "wifi") != 0
+#endif
+    ) return false;
+
+    snprintf(s_upstream_iface, sizeof(s_upstream_iface), "%s", iface);
+
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_str(h, NVS_KEY_UPIF, s_upstream_iface);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+    apply_upstream_iface();
+    return true;
+}
+
+static void upstream_iface_init_nvs(void)
+{
+#if CONFIG_ADBLOCK_NET_WIFI
+    snprintf(s_upstream_iface, sizeof(s_upstream_iface), "wifi");  /* default when built dual-stack */
+#endif
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS, NVS_READONLY, &h) != ESP_OK) return;
+    size_t len = sizeof(s_upstream_iface);
+    nvs_get_str(h, NVS_KEY_UPIF, s_upstream_iface, &len);
+    nvs_close(h);
+}
+
 /* ── Ethernet event handlers ─────────────────────────────────────── */
 static void eth_event_handler(void *, esp_event_base_t, int32_t event_id, void *)
 {
@@ -94,16 +206,83 @@ static void eth_event_handler(void *, esp_event_base_t, int32_t event_id, void *
         xEventGroupClearBits(s_eth_eg, ETH_CONNECTED_BIT | ETH_GOT_IP_BIT);
 }
 
+/* Read the DHCP-provided DNS server (option 6) for a netif, if any. */
+static void fetch_dhcp_dns(esp_netif_t *netif, char *out, size_t cap)
+{
+    esp_netif_dns_info_t dns{};
+    if (esp_netif_get_dns_info(netif, ESP_NETIF_DNS_MAIN, &dns) == ESP_OK
+        && dns.ip.type == ESP_IPADDR_TYPE_V4 && dns.ip.u_addr.ip4.addr != 0) {
+        esp_ip4addr_ntoa(&dns.ip.u_addr.ip4, out, cap);
+    } else {
+        out[0] = '\0';
+    }
+}
+
 static void ip_event_handler(void *, esp_event_base_t, int32_t event_id, void *event_data)
 {
     if (event_id == IP_EVENT_ETH_GOT_IP) {
         auto *ev = static_cast<ip_event_got_ip_t *>(event_data);
         esp_ip4addr_ntoa(&ev->ip_info.ip, s_ip, sizeof(s_ip));
         esp_ip4addr_ntoa(&ev->ip_info.gw, s_gw, sizeof(s_gw));
-        ESP_LOGI(TAG, "IP: %s  GW(upstream DNS): %s", s_ip, s_gw);
+        fetch_dhcp_dns(ev->esp_netif, s_eth_dns, sizeof(s_eth_dns));
+        ESP_LOGI(TAG, "Ethernet IP: %s  GW: %s  DNS: %s", s_ip, s_gw, s_eth_dns[0] ? s_eth_dns : "(none)");
         xEventGroupSetBits(s_eth_eg, ETH_GOT_IP_BIT);
+        apply_upstream_iface();
+    }
+#if CONFIG_ADBLOCK_NET_WIFI
+    else if (event_id == IP_EVENT_STA_GOT_IP) {
+        auto *ev = static_cast<ip_event_got_ip_t *>(event_data);
+        esp_ip4addr_ntoa(&ev->ip_info.ip, s_wifi_ip, sizeof(s_wifi_ip));
+        esp_ip4addr_ntoa(&ev->ip_info.gw, s_wifi_gw, sizeof(s_wifi_gw));
+        fetch_dhcp_dns(ev->esp_netif, s_wifi_dns, sizeof(s_wifi_dns));
+        ESP_LOGI(TAG, "Wi-Fi IP: %s  GW: %s  DNS: %s", s_wifi_ip, s_wifi_gw, s_wifi_dns[0] ? s_wifi_dns : "(none)");
+        xEventGroupSetBits(s_eth_eg, WIFI_GOT_IP_BIT);
+        apply_upstream_iface();
+    }
+#endif
+}
+
+#if CONFIG_ADBLOCK_NET_WIFI
+/* ── Wi-Fi STA bring-up (roadmap #49 slice, extended for concurrent dual-WAN
+ * with Ethernet under #53 — both interfaces stay up together rather than
+ * one replacing the other). */
+static void wifi_event_handler(void *, esp_event_base_t, int32_t event_id, void *)
+{
+    if (event_id == WIFI_EVENT_STA_START) {
+        esp_wifi_connect();
+    } else if (event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        xEventGroupClearBits(s_eth_eg, WIFI_CONNECTED_BIT | WIFI_GOT_IP_BIT);
+        ESP_LOGW(TAG, "Wi-Fi disconnected — retrying");
+        esp_wifi_connect();
+    } else if (event_id == WIFI_EVENT_STA_CONNECTED) {
+        xEventGroupSetBits(s_eth_eg, WIFI_CONNECTED_BIT);
     }
 }
+
+static void wifi_init_sta(void)
+{
+    ESP_LOGI(TAG, "Wi-Fi STA: connecting to SSID \"%s\"", CONFIG_ADBLOCK_WIFI_SSID);
+
+    esp_netif_create_default_wifi_sta();
+
+    wifi_init_config_t init_cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&init_cfg));
+
+    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
+                                               wifi_event_handler, nullptr));
+
+    wifi_config_t wifi_cfg = {};
+    strlcpy(reinterpret_cast<char *>(wifi_cfg.sta.ssid),
+            CONFIG_ADBLOCK_WIFI_SSID, sizeof(wifi_cfg.sta.ssid));
+    strlcpy(reinterpret_cast<char *>(wifi_cfg.sta.password),
+            CONFIG_ADBLOCK_WIFI_PASSWORD, sizeof(wifi_cfg.sta.password));
+    wifi_cfg.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg));
+    ESP_ERROR_CHECK(esp_wifi_start());
+}
+#endif
 
 /* ── W5500 init for T-ETH-Elite ──────────────────────────────────── */
 static esp_eth_handle_t eth_init_w5500(void)
@@ -216,17 +395,26 @@ static void download_task(void *)
     ESP_LOGI(TAG, "download_task stack hwm: %u bytes free",
              (unsigned)uxTaskGetStackHighWaterMark(NULL));
 
-    /* Daily reload on a fixed cadence. Use an absolute monotonic deadline and
-     * advance it by exactly one interval each cycle (next += interval), so the
-     * time spent downloading/sorting never pushes the schedule later — the old
-     * "sleep 24h, then reload" loop drifted by the reload duration every day (L3).
-     * A manual /reload fires immediately without shifting the daily schedule. */
-    const int64_t interval_us = 24LL * 60 * 60 * 1000000;  /* 24h */
+    /* Reload every 4h on a fixed cadence. Scheduling itself stays on the
+     * monotonic esp_timer (immune to NTP re-sync jumps — see L3, where an
+     * absolute-wall-clock "sleep then reload" loop drifted); NTP wall-clock
+     * (timesync_epoch()) is used only to log a real timestamp, once synced.
+     * Use an absolute deadline advanced by exactly one interval each cycle
+     * (next += interval) so the download/sort duration never pushes the
+     * schedule later. A manual /reload fires immediately without shifting it. */
+    const int64_t interval_us = 4LL * 60 * 60 * 1000000;  /* 4h */
     int64_t next_us = esp_timer_get_time() + interval_us;
     for (;;) {
         int64_t now_us = esp_timer_get_time();
         if (now_us >= next_us) {
-            ESP_LOGI(TAG, "Daily reload...");
+            if (timesync_is_synced()) {
+                time_t epoch = (time_t)timesync_epoch();
+                char ts[32]; struct tm tmv; gmtime_r(&epoch, &tmv);
+                strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S UTC", &tmv);
+                ESP_LOGI(TAG, "4h reload (%s)...", ts);
+            } else {
+                ESP_LOGI(TAG, "4h reload (clock not yet synced)...");
+            }
             blocklist_load();
             next_us += interval_us;
             if (next_us <= esp_timer_get_time())     /* fell behind — catch up */
@@ -388,13 +576,16 @@ extern "C" void app_main(void)
 
     s_eth_eg = xEventGroupCreate();
 
-    /* Register Ethernet event handlers */
-    ESP_ERROR_CHECK(esp_event_handler_register(ETH_EVENT, ESP_EVENT_ANY_ID,
-                                               eth_event_handler, nullptr));
-    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_ETH_GOT_IP,
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, ESP_EVENT_ANY_ID,
                                                ip_event_handler, nullptr));
 
-    /* Init W5500 + create default Ethernet netif (DHCP client) */
+    /* Register Ethernet event handler */
+    ESP_ERROR_CHECK(esp_event_handler_register(ETH_EVENT, ESP_EVENT_ANY_ID,
+                                               eth_event_handler, nullptr));
+
+    /* Init W5500 + create default Ethernet netif (DHCP client). Always brought
+     * up — the L2 fast-path and LAN-facing IP (mDNS, router DNS target, web UI)
+     * live here regardless of whether Wi-Fi is also enabled. */
     esp_eth_handle_t eth_handle = eth_init_w5500();
     esp_netif_config_t netif_cfg = ESP_NETIF_DEFAULT_ETH();
     esp_netif_t *eth_netif = esp_netif_new(&netif_cfg);
@@ -403,11 +594,30 @@ extern "C" void app_main(void)
     ESP_ERROR_CHECK(esp_eth_update_input_path_info(eth_handle, l2_input_cb, eth_netif));
     ESP_ERROR_CHECK(esp_eth_start(eth_handle));
 
+#if CONFIG_ADBLOCK_NET_WIFI
+    /* Wi-Fi STA bring-up alongside Ethernet (#53: dual-WAN). No L2 fast-path
+     * here — Wi-Fi queries take the normal lwIP socket path. */
+    wifi_init_sta();
+
+    /* Wait for EITHER interface, not both — the Ethernet cable may not be
+     * plugged in at all (Wi-Fi-only operation is a supported mode, not just
+     * a transient boot state), so blocking on both would hang forever with
+     * no cable connected. Whichever interface comes up later still fires its
+     * own IP_EVENT and joins in (apply_upstream_iface() re-runs each time). */
+    ESP_LOGI(TAG, "Waiting for Ethernet or Wi-Fi link and DHCP...");
+    xEventGroupWaitBits(s_eth_eg, ETH_GOT_IP_BIT | WIFI_GOT_IP_BIT,
+                        pdFALSE, pdFALSE, portMAX_DELAY);
+    ESP_LOGI(TAG, "Network ready — Ethernet: %s  Wi-Fi: %s",
+             s_ip[0] ? s_ip : "(down)", s_wifi_ip[0] ? s_wifi_ip : "(down)");
+#else
     /* Wait for link + DHCP lease */
     ESP_LOGI(TAG, "Waiting for Ethernet link and DHCP...");
     xEventGroupWaitBits(s_eth_eg, ETH_CONNECTED_BIT | ETH_GOT_IP_BIT,
                         pdFALSE, pdTRUE, portMAX_DELAY);
     ESP_LOGI(TAG, "Network ready — IP: %s", s_ip);
+#endif
+
+    upstream_iface_init_nvs();
 
     /* (raw W5500 TX floor measured at ~400us/frame, 2497fps — bus has ~5x
      *  headroom over our ~527qps; the gap is the lwIP per-query path.) */
@@ -425,16 +635,29 @@ extern "C" void app_main(void)
     /* Mount SD card (SPI3 — separate bus from W5500) */
     sd_mount();
 
-    /* Start DNS sinkhole (Core 1, priority 10).
-     * Default upstream = the DHCP-provided gateway (it runs dnsmasq on typical
-     * home networks). Config-UI override for other providers comes later.
-     * Falls back to 1.1.1.1 only if no gateway was learned. */
-    const char *upstream = (s_gw[0] != '\0') ? s_gw : "1.1.1.1";
+    /* Start DNS sinkhole (Core 1, priority 10). Upstream = the DHCP-provided
+     * DNS server for whichever interface is selected (see pick_upstream /
+     * apply_upstream_iface — #53). Switchable live from the web UI afterwards
+     * without restarting this task. */
+    const char *upstream = pick_upstream(s_eth_dns, s_gw);
+#if CONFIG_ADBLOCK_NET_WIFI
+    if (strcmp(s_upstream_iface, "wifi") == 0)
+        upstream = pick_upstream(s_wifi_dns, s_wifi_gw);
+#endif
     if (!s_dns.start(upstream)) {
         ESP_LOGE(TAG, "DNS server start failed — halting");
         for (;;) vTaskDelay(portMAX_DELAY);
     }
-    ESP_LOGI(TAG, "DNS sinkhole active. Point your router's DNS at %s", s_ip);
+    {
+        const char *lan_ip = s_ip[0] ? s_ip :
+#if CONFIG_ADBLOCK_NET_WIFI
+                              s_wifi_ip;
+#else
+                              "(no IP yet)";
+#endif
+        ESP_LOGI(TAG, "DNS sinkhole active (upstream via %s: %s). Point your router's DNS at %s",
+                 s_upstream_iface, upstream, lan_ip);
+    }
 
     /* Start web UI on port 80 */
     web_ui_start(&s_dns);
@@ -456,5 +679,11 @@ extern "C" void app_main(void)
      * 24KB stack: mbedTLS (HTTPS fetch) + FATFS (SD save) are both deep. */
     xTaskCreatePinnedToCore(download_task, "bl_download", 24576, nullptr, 2, nullptr, 0);
 
-    ESP_LOGI(TAG, "Startup complete. Board IP: %s — Set as router DNS server.", s_ip);
+    ESP_LOGI(TAG, "Startup complete. Ethernet: %s  Wi-Fi: %s — either can be set as your DNS server.",
+             s_ip[0] ? s_ip : "(down)",
+#if CONFIG_ADBLOCK_NET_WIFI
+             s_wifi_ip[0] ? s_wifi_ip : "(down)");
+#else
+             "(not built)");
+#endif
 }

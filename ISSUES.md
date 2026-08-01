@@ -156,6 +156,16 @@ on the monotonic clock so it's unaffected when NTP first sets the time.
 Verified on hardware: clock synced to NIST within seconds of boot; log shows
 dated entries (2026-06-24 14:20 UTC).
 
+## Feature: blocklist reload cadence 24h → 4h ✅
+Daily reload meant up to 24h of drift against upstream list updates (relevant
+given the live OISD list already grew past a board's SD-cached snapshot by
+~170k domains — see the apex-ad-domain investigation above).
+**Changed:** `download_task`'s reload interval from 24h to 4h. Scheduling
+itself stays on the monotonic `esp_timer` deadline (unaffected by NTP
+re-sync jumps — the same reason L3's absolute-wall-clock loop was replaced);
+`timesync_epoch()` is used only to log a real UTC timestamp on each reload,
+once the clock has synced.
+
 ## Roadmap: generic ESP32-S3 build (Wi-Fi only) ⬜
 A variant for any plain ESP32-S3 dev board — drops the W5500/Ethernet + SD-card
 dependencies and runs the same sinkhole over built-in Wi-Fi (STA + DHCP). The
@@ -166,17 +176,35 @@ so blocked/cached queries take the normal lwIP socket path (~1.8 ms) instead of
 the L2 bypass; blocklist capacity may shrink on quad-PSRAM boards. Tracked on the
 GitHub issue tracker.
 
-## Open observation (separate from the audit) ⬜
+## Investigated: apex ad domains resolve ALLOWED ☑️ (not a bug)
 Some headline ad domains (doubleclick.net, google-analytics.com,
 googleadservices.com, adservice.google.com) resolve as ALLOWED while other
 trackers (ssl.google-analytics.com, ads.youtube.com, analytics.tiktok.com) are
-correctly BLOCKED. Blocking itself works (333,795 domains loaded, L2 + dns_task
-block paths both active). The pattern (a subdomain blocks but its parent does
-not) indicates those roots aren't wildcard entries in the currently SD-cached
-list — likely a stale/partial cache or a source-format question, NOT a code
-regression. Suggested next step: trigger a fresh `/reload` (bypasses SD cache)
-and re-check; if still allowed, inspect the OISD source line format in
-`on_domain_line`/`domain_normalize`.
+correctly BLOCKED. Originally logged as an open observation suspecting a
+stale/partial SD cache or a source-format parsing bug.
+
+**Root cause: none — this is the OISD list's own design, not a firmware bug.**
+Fetched `https://big.oisd.nl/domainswild2` directly (494,654 entries) and
+confirmed the bare apex domains (`doubleclick.net`, `ads.google.com`,
+`googleadservices.com`, `adservice.google.com`) are **not present as their own
+entries** in the current, live source — only specific subdomains are (e.g.
+`accounts.doubleclick.net`, `ad-ace.doubleclick.net`, ~129 doubleclick.net
+subdomains total). The list's own documented semantics ("entry `example.com`
+blocks `example.com` and its subdomains") only flow downward from a listed
+entry; a listed subdomain implies nothing about its parent. OISD's curators
+deliberately don't blocklist these apex domains, likely because they also
+carry legitimate traffic.
+
+Verified the firmware's matcher is correct in both directions on-device:
+`ad-ace.doubleclick.net` (genuinely listed) resolves `0.0.0.0`/`::`
+(sinkholed); `doubleclick.net` itself correctly returns ALLOWED via
+`POST /check`, consistent with never being a list entry. `on_domain_line` /
+`domain_normalize` need no changes.
+
+Separately (not the cause of this symptom, but worth noting): the board's
+SD-cached list had 325,919 domains vs. 494,654 in the current live source —
+a genuinely stale cache. A `/reload` (or the new 4h reload cadence) picks up
+the newer list.
 
 ## Earlier fixes this cycle (pre-audit)
 - `c42662b` — httpd stack overflow in `handle_status` (8 KB non-static local).

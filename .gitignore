@@ -9,3 +9,6 @@
 *.swp
 .DS_Store
 /release/
+
+# Serial monitor scratch output
+monitor_live.log

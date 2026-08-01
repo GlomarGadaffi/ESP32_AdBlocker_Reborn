@@ -45,6 +45,13 @@ public:
     bool start(const char *upstream_ip = "1.1.1.1");
     void stop();
 
+    /* Re-point upstream forwarding at a new resolver IP without restarting
+     * the task (#53: dual-WAN — switching which interface egresses upstream
+     * queries shouldn't drop in-flight client traffic). Safe to call from any
+     * task; run_loop() reads the address atomically each forward/reply. */
+    void set_upstream(const char *upstream_ip);
+    void upstream_ip(char *out, size_t cap) const;
+
     uint64_t queries_total()  const;
     uint64_t queries_blocked() const;
 
@@ -53,6 +60,7 @@ private:
     void        run_loop();
 
     char             _upstream_ip[16];
+    std::atomic<uint32_t> _upstream_addr{0};  /* in_addr_t, network byte order */
     TaskHandle_t     _taskHandle = nullptr;
     std::atomic<int> _client_fd{-1};
     std::atomic<int> _upstream_fd{-1};

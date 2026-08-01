@@ -1,0 +1,28 @@
+menu "ESP32 AdBlocker Reborn"
+
+    config ADBLOCK_NET_WIFI
+        bool "Also bring up Wi-Fi STA alongside W5500 Ethernet (dual-WAN)"
+        default n
+        help
+            Join a Wi-Fi network in addition to the W5500 Ethernet link, so
+            both are up at once — e.g. answer LAN DNS queries on Ethernet
+            while egressing upstream resolver queries out Wi-Fi (or vice
+            versa), useful when the two links sit behind different ISPs/NAT.
+            Which interface egresses upstream is chosen at runtime from the
+            web UI (persisted in NVS); SSID/password below are compile-time
+            since Wi-Fi bring-up itself isn't configurable from the UI yet.
+            SD card, blocklist, DNS server, and web UI are unchanged. The L2
+            fast-path RX hook is Ethernet-only; Wi-Fi-egressed queries take
+            the normal lwIP socket path.
+
+    config ADBLOCK_WIFI_SSID
+        string "Wi-Fi SSID"
+        depends on ADBLOCK_NET_WIFI
+        default ""
+
+    config ADBLOCK_WIFI_PASSWORD
+        string "Wi-Fi password"
+        depends on ADBLOCK_NET_WIFI
+        default ""
+
+endmenu

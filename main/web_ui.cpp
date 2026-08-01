@@ -20,6 +20,11 @@ static httpd_handle_t  s_server = nullptr;
 static DnsSinkServer  *s_dns    = nullptr;
 
 extern "C" void dns_sink_trigger_reload(void);
+extern "C" bool dns_sink_wifi_built(void);
+extern "C" void dns_sink_net_status(char *iface, size_t iface_cap,
+                                     char *eth_ip, size_t eth_cap,
+                                     char *wifi_ip, size_t wifi_cap);
+extern "C" bool dns_sink_set_upstream_iface(const char *iface);
 
 /* ── helpers ─────────────────────────────────────────────────────── */
 
@@ -287,6 +292,24 @@ static esp_err_t handle_status(httpd_req_t *r)
         }
     }
 
+    /* Dual-WAN interface selection (#53) */
+    if (dns_sink_wifi_built()) {
+        char iface[8]="", eth_ip[16]="", wifi_ip[16]="";
+        dns_sink_net_status(iface, sizeof(iface), eth_ip, sizeof(eth_ip), wifi_ip, sizeof(wifi_ip));
+        page_appendf(page, sizeof(page), &n,
+            "<h3>Network Interfaces</h3>"
+            "<p>Ethernet: %s &nbsp; Wi-Fi: %s</p>"
+            "<p><small>Both stay up together. This chooses which one egresses "
+            "upstream resolver queries; LAN clients can query either IP either way.</small></p>"
+            "<form method=post action=/net/upstream>"
+            "<label><input type=radio name=iface value=eth%s> Ethernet</label> "
+            "<label><input type=radio name=iface value=wifi%s> Wi-Fi</label> "
+            "<button>Set upstream interface</button></form>",
+            eth_ip[0] ? eth_ip : "(down)", wifi_ip[0] ? wifi_ip : "(down)",
+            strcmp(iface, "eth") == 0 ? " checked" : "",
+            strcmp(iface, "wifi") == 0 ? " checked" : "");
+    }
+
     /* DoT upstream settings (#5) */
     {
         bool dot_en = dot_is_enabled(); char dot_srv[64]="", dot_sni[64]="";
@@ -460,6 +483,16 @@ static esp_err_t handle_dot_set(httpd_req_t *r)
     const char *pn = strstr(body, "sni=");
     if (pn) { pn += 4; size_t l=0; char raw[64]={0}; for(;pn[l]&&pn[l]!='&'&&pn[l]!='\r'&&l<63;l++) raw[l]=pn[l]; url_decode(sni,sizeof(sni),raw,l); }
     dot_set(enabled, server, sni);
+    httpd_resp_set_status(r, "303 See Other"); httpd_resp_set_hdr(r, "Location", "/"); httpd_resp_send(r,nullptr,0); return ESP_OK;
+}
+
+/* ── POST /net/upstream — choose eth/wifi as upstream egress (#53) ── */
+static esp_err_t handle_net_upstream(httpd_req_t *r)
+{
+    if (!csrf_ok(r)) { httpd_resp_send_err(r, HTTPD_403_FORBIDDEN, "CSRF"); return ESP_FAIL; }
+    char body[32] = {}; httpd_req_recv(r, body, sizeof(body) - 1);
+    const char *iface = strstr(body, "iface=wifi") ? "wifi" : "eth";
+    dns_sink_set_upstream_iface(iface);
     httpd_resp_set_status(r, "303 See Other"); httpd_resp_set_hdr(r, "Location", "/"); httpd_resp_send(r,nullptr,0); return ESP_OK;
 }
 
@@ -732,7 +765,7 @@ bool web_ui_start(DnsSinkServer *dns)
     s_dns = dns;
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.server_port      = 80;
-    cfg.max_uri_handlers = 20;
+    cfg.max_uri_handlers = 24;
     cfg.stack_size       = 16384;
     if (httpd_start(&s_server, &cfg) != ESP_OK) {
         ESP_LOGE(TAG, "httpd_start failed"); return false;
@@ -757,6 +790,7 @@ bool web_ui_start(DnsSinkServer *dns)
         { "/acl/remove",          HTTP_POST, handle_acl_remove,    nullptr },
         { "/acl/clear",           HTTP_POST, handle_acl_clear,     nullptr },
         { "/dot/set",             HTTP_POST, handle_dot_set,       nullptr },
+        { "/net/upstream",        HTTP_POST, handle_net_upstream,  nullptr },
     };
     for (auto &u : uris) httpd_register_uri_handler(s_server, &u);
 

@@ -422,6 +422,18 @@ bool DnsSinkServer::start(const char *upstream_ip) {
     return true;
 }
 
+void DnsSinkServer::set_upstream(const char *upstream_ip) {
+    struct in_addr a{};
+    if (!inet_aton(upstream_ip, &a)) return;
+    snprintf(_upstream_ip, sizeof(_upstream_ip), "%s", upstream_ip);
+    _upstream_addr.store(a.s_addr, std::memory_order_release);
+    ESP_LOGI(TAG, "Upstream re-pointed to %s", _upstream_ip);
+}
+
+void DnsSinkServer::upstream_ip(char *out, size_t cap) const {
+    snprintf(out, cap, "%s", _upstream_ip);
+}
+
 void DnsSinkServer::stop() {
     _running.exchange(false, std::memory_order_acq_rel);
     int fd = _client_fd.exchange(-1, std::memory_order_acq_rel);
@@ -493,11 +505,14 @@ void DnsSinkServer::run_loop()
         }
         _upstream_fd.store(usock, std::memory_order_release);
 
-        /* resolve upstream IP once */
+        /* resolve upstream IP once; _upstream_addr may change at runtime via
+         * set_upstream() (#53), so re-read it each time it's needed below
+         * rather than trusting this snapshot beyond the initial log line. */
         struct sockaddr_in upstream_addr{};
         upstream_addr.sin_family = AF_INET;
         upstream_addr.sin_port   = htons(UPSTREAM_PORT);
         inet_aton(_upstream_ip, &upstream_addr.sin_addr);
+        _upstream_addr.store(upstream_addr.sin_addr.s_addr, std::memory_order_release);
 
         uint8_t rx[1500], tx[512 + sizeof(DnsAnswerHeader) + 16];
         struct sockaddr_in client_addr{};
@@ -529,8 +544,10 @@ void DnsSinkServer::run_loop()
                                     (sockaddr *)&from, &fromlen);
                 if (rlen < 0) break;                           /* EWOULDBLOCK: drained */
                 if (rlen < (int)sizeof(DnsHeader)) continue;
-                /* Reject replies not from our configured upstream (#24) */
-                if (from.sin_addr.s_addr != upstream_addr.sin_addr.s_addr ||
+                /* Reject replies not from our configured upstream (#24).
+                 * Address is re-read live so set_upstream() takes effect without
+                 * dropping in-flight queries sent to the previous upstream. */
+                if (from.sin_addr.s_addr != _upstream_addr.load(std::memory_order_acquire) ||
                     from.sin_port        != upstream_addr.sin_port) continue;
                 int64_t t_ureply = esp_timer_get_time();
                 uint16_t our_txid = ntohs(reinterpret_cast<DnsHeader *>(rx)->id);
@@ -749,8 +766,10 @@ void DnsSinkServer::run_loop()
                     ue->qhash       = h;
                     ue->qtype       = qtype;
 
-                    /* rewrite txid and forward */
+                    /* rewrite txid and forward — read the live upstream address
+                     * so an in-flight query batch can straddle a set_upstream() */
                     hdr->id = htons(our_txid);
+                    upstream_addr.sin_addr.s_addr = _upstream_addr.load(std::memory_order_acquire);
                     ue->upstream_us = esp_timer_get_time();
                     sendto(usock, rx, rlen, 0,
                            (sockaddr *)&upstream_addr, sizeof(upstream_addr));

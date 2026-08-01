@@ -16,6 +16,7 @@ idf_component_register(
     REQUIRES
         esp_eth
         espressif__w5500
+        esp_wifi
         esp_netif
         esp_event
         nvs_flash
