@@ -28,7 +28,8 @@ extern "C" void dns_sink_net_status(char *iface, size_t iface_cap,
                                      char *wifi_ip, size_t wifi_cap);
 extern "C" bool dns_sink_set_upstream_iface(const char *iface);
 extern "C" void dns_sink_wifi_get_ssid(char *out, size_t cap);
-extern "C" int  dns_sink_wifi_scan(char *out, size_t cap);
+extern "C" bool dns_sink_wifi_scan_start(void);
+extern "C" int  dns_sink_wifi_scan_get(char *out, size_t cap);
 extern "C" bool dns_sink_wifi_set_creds(const char *ssid, const char *pass);
 extern "C" bool dns_sink_net_set_static(const char *iface, bool dhcp,
                                          const char *ip, const char *nm,
@@ -437,20 +438,35 @@ static esp_err_t handle_status(httpd_req_t *r)
             "<input id=wifi-pass name=password placeholder='Password' size=24 type=password> "
             "<button>Connect</button></form>"
             "<script>"
-            "function wifiScan(){"
-            "document.getElementById('wifi-scan-status').textContent=' scanning\xe2\x80\xa6 (few seconds)';"
-            "fetch('/wifi/scan',{method:'POST'}).then(function(r){return r.json()}).then(function(list){"
+            "function wifiStat(t){document.getElementById('wifi-scan-status').textContent=t;}"
+            /* Trigger only — the scan runs in a worker task on the device, so
+             * this returns straight away and other viewers aren't blocked. */
+            "function wifiScan(){wifiStat(' starting\xe2\x80\xa6');"
+            "fetch('/wifi/scan',{method:'POST'}).then(function(r){return r.json()})"
+            ".then(function(d){if(d.state=='error'){wifiStat(' '+(d.err||'scan failed'));return;}"
+            "setTimeout(wifiPoll,600);})"
+            ".catch(function(){wifiStat(' scan failed');});}"
+            /* Poll the cached result until the worker publishes it. */
+            "function wifiPoll(){"
+            "fetch('/wifi/scan').then(function(r){return r.json()}).then(function(d){"
+            "if(d.state=='scanning'){wifiStat(' scanning\xe2\x80\xa6');setTimeout(wifiPoll,800);return;}"
+            "if(d.state=='error'){wifiStat(' '+(d.err||'scan failed'));return;}"
+            "wifiRender(d);})"
+            ".catch(function(){wifiStat(' scan failed');});}"
+            "function wifiRender(d){"
             "var ul=document.getElementById('wifi-results');ul.innerHTML='';"
-            "document.getElementById('wifi-scan-status').textContent=' found '+list.length;"
-            "list.forEach(function(ap){"
+            "if(d.state!='done'){wifiStat('');return;}"
+            "wifiStat(' '+d.aps.length+' found'+(d.age_s>=0?' ('+d.age_s+'s ago)':''));"
+            "d.aps.forEach(function(ap){"
             "var li=document.createElement('li');"
             "var btn=document.createElement('button');btn.type='button';"
             "btn.textContent=ap.ssid+' ('+ap.rssi+' dBm)'+(ap.auth==0?' [open]':'');"
-            "btn.onclick=function(){document.getElementById('wifi-ssid').value=ap.ssid;document.getElementById('wifi-pass').focus();};"
-            "li.appendChild(btn);ul.appendChild(li);"
-            "});"
-            "}).catch(function(){document.getElementById('wifi-scan-status').textContent=' scan failed';});"
-            "}"
+            "btn.onclick=function(){document.getElementById('wifi-ssid').value=ap.ssid;"
+            "document.getElementById('wifi-pass').focus();};"
+            "li.appendChild(btn);ul.appendChild(li);});}"
+            /* Repopulate from the device-side cache on load, so the 10s
+             * meta-refresh doesn't wipe results out from under you. */
+            "wifiPoll();"
             "</script>",
             safe_ssid);
     }
@@ -654,15 +670,31 @@ static esp_err_t handle_reboot(httpd_req_t *r)
     return ESP_OK;
 }
 
-/* ── POST /wifi/scan — JSON list of nearby APs (#54) ──────────────────
- * POST rather than GET despite being a read: it drives the radio, and IDF
- * warns a scan can knock the STA off its AP. Behind csrf_ok so an arbitrary
- * page the user happens to load can't spam scans at the device (#59). */
-static esp_err_t handle_wifi_scan(httpd_req_t *r)
+/* ── POST /wifi/scan — start a scan (#54, #62) ────────────────────────
+ * Only kicks off the worker and returns immediately; the radio work happens
+ * off the httpd task so it can't stall other viewers. POST + csrf_ok because
+ * this drives the radio, and IDF warns a scan can knock the STA off its AP,
+ * so it must not be triggerable cross-origin (#59). */
+static esp_err_t handle_wifi_scan_start(httpd_req_t *r)
 {
     if (!csrf_ok(r)) { httpd_resp_send_err(r, HTTPD_403_FORBIDDEN, "CSRF"); return ESP_FAIL; }
-    static char json[2560];
-    int n = dns_sink_wifi_scan(json, sizeof(json));
+    bool ok = dns_sink_wifi_scan_start();
+    httpd_resp_set_type(r, "application/json");
+    httpd_resp_set_hdr(r, "Cache-Control", "no-store");
+    httpd_resp_send(r, ok ? "{\"state\":\"scanning\"}"
+                          : "{\"state\":\"error\",\"err\":\"cannot start scan right now\"}",
+                    HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+/* ── GET /wifi/scan — read the cached result (#62) ────────────────────
+ * Pure read of the published cache, so no CSRF and no radio work: safe as a
+ * GET, and cheap enough that every page load can repopulate the AP list after
+ * the 10s meta-refresh instead of losing it. */
+static esp_err_t handle_wifi_scan_get(httpd_req_t *r)
+{
+    static char json[3072];   /* wrapper + the cached AP array */
+    int n = dns_sink_wifi_scan_get(json, sizeof(json));
     httpd_resp_set_type(r, "application/json");
     httpd_resp_set_hdr(r, "Cache-Control", "no-store");
     httpd_resp_send(r, json, n > 0 ? n : 0);
@@ -986,7 +1018,8 @@ bool web_ui_start(DnsSinkServer *dns)
         { "/acl/clear",           HTTP_POST, handle_acl_clear,     nullptr },
         { "/dot/set",             HTTP_POST, handle_dot_set,       nullptr },
         { "/net/upstream",        HTTP_POST, handle_net_upstream,  nullptr },
-        { "/wifi/scan",           HTTP_POST, handle_wifi_scan,     nullptr },
+        { "/wifi/scan",           HTTP_POST, handle_wifi_scan_start, nullptr },
+        { "/wifi/scan",           HTTP_GET,  handle_wifi_scan_get,   nullptr },
         { "/wifi/connect",        HTTP_POST, handle_wifi_connect,  nullptr },
         { "/net/eth/set",         HTTP_POST, handle_net_eth_set,   nullptr },
         { "/net/wifi/set",        HTTP_POST, handle_net_wifi_set,  nullptr },

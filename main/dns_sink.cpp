@@ -7,6 +7,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
+#include "freertos/semphr.h"
 
 #include "esp_system.h"
 #include "esp_event.h"
@@ -468,9 +469,30 @@ static void wifi_event_handler(void *, esp_event_base_t, int32_t event_id, void 
     }
 }
 
+/* Scan result cache state — declared here because wifi_init_sta() creates the
+ * mutex; the worker and the accessors live further down (#62). */
+enum ScanState { SCAN_IDLE = 0, SCAN_RUNNING, SCAN_DONE, SCAN_ERROR };
+static volatile ScanState  s_scan_state      = SCAN_IDLE;
+static SemaphoreHandle_t   s_scan_mutex      = nullptr;
+static char                s_scan_json[2560] = "[]";
+static int64_t             s_scan_done_us    = 0;
+static esp_err_t           s_scan_err        = ESP_OK;
+
+static const char *scan_state_name(ScanState s)
+{
+    switch (s) {
+        case SCAN_RUNNING: return "scanning";
+        case SCAN_DONE:    return "done";
+        case SCAN_ERROR:   return "error";
+        default:           return "idle";
+    }
+}
+
 static void wifi_init_sta(void)
 {
     wifi_creds_init_nvs();
+    s_scan_mutex = xSemaphoreCreateMutex();   /* guards the scan result cache (#62) */
+    if (!s_scan_mutex) ESP_LOGE(TAG, "scan mutex alloc failed — scanning disabled");
     ESP_LOGI(TAG, "Wi-Fi STA: connecting to SSID \"%s\"", s_wifi_ssid);
 
     esp_netif_t *wifi_netif = esp_netif_create_default_wifi_sta();
@@ -507,37 +529,114 @@ extern "C" void dns_sink_wifi_get_ssid(char *out, size_t cap)
     snprintf(out, cap, "%s", s_wifi_ssid);
 }
 
-/* Blocking scan (esp_wifi_scan_start(..., true)) — runs in the caller's task
- * (httpd), taking a few seconds. That stalls the web UI request, not DNS
- * service, which is an acceptable tradeoff for an on-demand admin action. */
+/* ── Wi-Fi scan: worker task + cached result (#62) ────────────────────────
+ * The scan used to run blocking inside the httpd task, which stalls *every*
+ * viewer for its duration — measured at 3.16s, during which an unrelated page
+ * load took 2.63s instead of 0.50s. esp_http_server is single-tasked, so one
+ * slow handler is head-of-line blocking for the whole UI.
+ *
+ * Now a one-shot worker does the scan and publishes the rendered JSON; the
+ * httpd handlers only ever touch the cached copy, so they never block. That
+ * makes the buffer genuinely shared across tasks (worker writes, httpd reads),
+ * hence the mutex — the single-task safety that the other static render
+ * buffers rely on does NOT apply here. The lock is held only for the render
+ * and the read, never across the scan itself. */
 #define WIFI_SCAN_MAX 20
-extern "C" int dns_sink_wifi_scan(char *out, size_t cap)
+
+static void wifi_scan_task(void *)
 {
+    static wifi_ap_record_t recs[WIFI_SCAN_MAX];   /* only this task touches it */
     wifi_scan_config_t scan_cfg = {};
-    esp_err_t rc = esp_wifi_scan_start(&scan_cfg, true /* block until done */);
-    if (rc != ESP_OK)
-        return snprintf(out, cap, "{\"error\":\"scan failed (%d)\"}", (int)rc);
+    esp_err_t rc = esp_wifi_scan_start(&scan_cfg, true /* block — we're off the httpd task */);
 
-    uint16_t ap_num = 0;
-    esp_wifi_scan_get_ap_num(&ap_num);
-    if (ap_num > WIFI_SCAN_MAX) ap_num = WIFI_SCAN_MAX;
-    static wifi_ap_record_t recs[WIFI_SCAN_MAX];
-    uint16_t got = ap_num;
-    esp_wifi_scan_get_ap_records(&got, recs);
-
-    int n = snprintf(out, cap, "[");
-    for (uint16_t i = 0; i < got && n < (int)cap - 128; i++) {
-        char ssid[64]; size_t sl = 0;   /* minimal JSON-string escape */
-        for (size_t j = 0; recs[i].ssid[j] != 0 && j < sizeof(recs[i].ssid) && sl < sizeof(ssid) - 2; j++) {
-            char c = (char)recs[i].ssid[j];
-            if (c == '"' || c == '\\') ssid[sl++] = '\\';
-            ssid[sl++] = c;
-        }
-        ssid[sl] = '\0';
-        n += snprintf(out + n, cap - n, "%s{\"ssid\":\"%s\",\"rssi\":%d,\"auth\":%d}",
-                      i ? "," : "", ssid, (int)recs[i].rssi, (int)recs[i].authmode);
+    uint16_t got = 0;
+    if (rc == ESP_OK) {
+        uint16_t ap_num = 0;
+        esp_wifi_scan_get_ap_num(&ap_num);
+        got = (ap_num > WIFI_SCAN_MAX) ? WIFI_SCAN_MAX : ap_num;
+        /* Frees the whole internal AP list even when we ask for fewer. */
+        esp_wifi_scan_get_ap_records(&got, recs);
     }
-    n += snprintf(out + n, cap - n, "]");
+
+    xSemaphoreTake(s_scan_mutex, portMAX_DELAY);
+    if (rc != ESP_OK) {
+        s_scan_err   = rc;
+        s_scan_state = SCAN_ERROR;
+        ESP_LOGW(TAG, "Wi-Fi scan failed: %s", esp_err_to_name(rc));
+    } else {
+        const size_t cap = sizeof(s_scan_json);
+        int n = snprintf(s_scan_json, cap, "[");
+        for (uint16_t i = 0; i < got && n < (int)cap - 128; i++) {
+            char ssid[64]; size_t sl = 0;   /* minimal JSON-string escape */
+            for (size_t j = 0; recs[i].ssid[j] != 0 && j < sizeof(recs[i].ssid)
+                               && sl < sizeof(ssid) - 2; j++) {
+                char c = (char)recs[i].ssid[j];
+                if (c == '"' || c == '\\') ssid[sl++] = '\\';
+                ssid[sl++] = c;
+            }
+            ssid[sl] = '\0';
+            n += snprintf(s_scan_json + n, cap - n,
+                          "%s{\"ssid\":\"%s\",\"rssi\":%d,\"auth\":%d}",
+                          i ? "," : "", ssid, (int)recs[i].rssi, (int)recs[i].authmode);
+        }
+        snprintf(s_scan_json + n, cap - n, "]");
+        s_scan_done_us = esp_timer_get_time();
+        s_scan_err     = ESP_OK;
+        s_scan_state   = SCAN_DONE;
+        ESP_LOGI(TAG, "Wi-Fi scan complete: %u AP(s)", (unsigned)got);
+    }
+    xSemaphoreGive(s_scan_mutex);
+    vTaskDelete(nullptr);
+}
+
+/* Kick off a scan. Returns false only if one can't be started right now;
+ * an already-running scan is reported as success so a second viewer clicking
+ * Scan simply joins the one in flight rather than stacking radio work. */
+extern "C" bool dns_sink_wifi_scan_start(void)
+{
+    if (!s_scan_mutex) return false;
+    if (wifi_reconfig_active()) return false;   /* don't scan mid-reassociation */
+
+    xSemaphoreTake(s_scan_mutex, portMAX_DELAY);
+    if (s_scan_state == SCAN_RUNNING) { xSemaphoreGive(s_scan_mutex); return true; }
+    s_scan_state = SCAN_RUNNING;
+    xSemaphoreGive(s_scan_mutex);
+
+    if (xTaskCreate(wifi_scan_task, "wifi_scan", 4096, nullptr, 3, nullptr) != pdPASS) {
+        xSemaphoreTake(s_scan_mutex, portMAX_DELAY);
+        s_scan_state = SCAN_ERROR;
+        s_scan_err   = ESP_ERR_NO_MEM;
+        xSemaphoreGive(s_scan_mutex);
+        ESP_LOGE(TAG, "Wi-Fi scan task create failed");
+        return false;
+    }
+    return true;
+}
+
+/* Read the cached result. Never blocks on the radio; bounded 200ms wait for
+ * the (briefly-held) publish lock, reporting "busy" rather than stalling the
+ * httpd task if it somehow can't be taken. */
+extern "C" int dns_sink_wifi_scan_get(char *out, size_t cap)
+{
+    if (!s_scan_mutex)
+        return snprintf(out, cap, "{\"state\":\"idle\",\"age_s\":-1,\"aps\":[]}");
+
+    if (xSemaphoreTake(s_scan_mutex, pdMS_TO_TICKS(200)) != pdTRUE)
+        return snprintf(out, cap, "{\"state\":\"scanning\",\"age_s\":-1,\"aps\":[]}");
+
+    ScanState st = s_scan_state;
+    int age = (st == SCAN_DONE && s_scan_done_us)
+                ? (int)((esp_timer_get_time() - s_scan_done_us) / 1000000) : -1;
+    int n;
+    if (st == SCAN_DONE) {
+        n = snprintf(out, cap, "{\"state\":\"done\",\"age_s\":%d,\"aps\":%s}", age, s_scan_json);
+    } else if (st == SCAN_ERROR) {
+        n = snprintf(out, cap, "{\"state\":\"error\",\"age_s\":-1,\"err\":\"%s\",\"aps\":[]}",
+                     esp_err_to_name(s_scan_err));
+    } else {
+        n = snprintf(out, cap, "{\"state\":\"%s\",\"age_s\":-1,\"aps\":[]}", scan_state_name(st));
+    }
+    xSemaphoreGive(s_scan_mutex);
     return n;
 }
 
@@ -594,7 +693,11 @@ extern "C" bool dns_sink_wifi_set_creds(const char *ssid, const char *pass)
 }
 #else
 extern "C" void dns_sink_wifi_get_ssid(char *out, size_t cap) { if (cap) out[0] = '\0'; }
-extern "C" int  dns_sink_wifi_scan(char *out, size_t cap) { return snprintf(out, cap, "[]"); }
+extern "C" bool dns_sink_wifi_scan_start(void) { return false; }
+extern "C" int  dns_sink_wifi_scan_get(char *out, size_t cap)
+{
+    return snprintf(out, cap, "{\"state\":\"idle\",\"age_s\":-1,\"aps\":[]}");
+}
 extern "C" bool dns_sink_wifi_set_creds(const char *, const char *) { return false; }
 #endif
 

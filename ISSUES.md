@@ -240,10 +240,11 @@ corrupt. Critically, DNS service is unaffected by web load — **0/150 queries
 lost**, p50 5.98 ms → 6.96 ms (that delta is Wi-Fi airtime, not board CPU;
 on-device processing stays in the microseconds).
 
-Two limits are inherent to the single-task design and remain:
+Two limits followed from the single-task design; the first is now fixed
+(see #62 below), the second is a deliberate trade:
 * **Head-of-line blocking.** Anything slow stalls every viewer. A Wi-Fi scan
   measured 3.16 s, and a page load issued during it took 2.63 s vs 0.50 s idle.
-  With 6 viewers page p99 reached 1.08 s.
+  With 6 viewers page p99 reached 1.08 s. **Fixed in #62.**
 * **Socket ceiling.** `max_open_sockets` stays at the default 7 —
   `CONFIG_LWIP_MAX_SOCKETS` is 16 and httpd already claims ~9, so raising it
   risks starving the DNS server's own sockets, a far worse failure than a slow
@@ -255,6 +256,38 @@ expires. Verified no regression (10 half-open sockets: 200 OK in 0.21 s, vs
 0.25 s before). Note this hardens against stuck clients, not against a
 deliberate flood: 15 concurrent half-open sockets still failed 2 of 6 requests,
 recovering fully afterwards.
+
+## Fix: Wi-Fi scan no longer blocks the web UI ✅ (#62)
+The blocking `esp_wifi_scan_start()` ran inside the httpd task, and since that
+server is single-tasked (above), one scan stalled *every* viewer for its whole
+duration.
+
+**Fixed:** a one-shot worker task does the scan and publishes rendered JSON to
+a cached buffer. `POST /wifi/scan` only triggers and returns immediately;
+`GET /wifi/scan` reads the cache — a pure read, so no CSRF and no radio work,
+which also lets the page repopulate results after the 10 s meta-refresh instead
+of losing them on every reload.
+
+**This buffer is the one exception to the single-task rule.** It's written by
+the worker and read by httpd, so it is genuinely cross-task and is
+mutex-protected; the lock is held only for the render and the read, never
+across the scan itself. A second viewer pressing Scan joins the scan already in
+flight rather than stacking radio work, and scans are refused while a
+reassociation is in progress.
+
+Verified on hardware:
+
+| | before | after |
+| --- | --- | --- |
+| page load during a scan | 2.63 s | **0.21–0.29 s** (idle is 0.23 s) |
+| `POST /wifi/scan` returns in | 3.16 s | **0.35 s** |
+| page p99, 6 concurrent viewers | 1.08 s | **0.26 s** |
+| 12 parallel loads well-formed | 12/12 | 12/12 |
+
+DNS is unaffected: **0/60 queries dropped** before, during *and* after a scan.
+Query p99 does rise to ~367 ms while a scan is running — that's the radio
+channel-hopping off the home channel, not a firmware stall — and it returns to
+~50 ms as soon as the scan finishes.
 
 ## Roadmap: generic ESP32-S3 build (Wi-Fi only) ⬜
 A variant for any plain ESP32-S3 dev board — drops the W5500/Ethernet + SD-card
