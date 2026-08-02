@@ -166,6 +166,65 @@ re-sync jumps — the same reason L3's absolute-wall-clock loop was replaced);
 `timesync_epoch()` is used only to log a real UTC timestamp on each reload,
 once the clock has synced.
 
+## Feature: runtime network configuration + tabbed web UI ✅ (#52)
+Wi-Fi credentials, interface addressing, and network selection were all
+build-time constants; changing any of them meant a reflash.
+**Added:** (a) Wi-Fi credentials moved from Kconfig to NVS, with Kconfig kept
+only as a first-boot seed (#54); (b) in-browser AP scan and connect, so the
+device can be moved between networks without a toolchain (#54); (c) per-
+interface DHCP vs static IP with its own DNS field, persisted in NVS and
+applied at boot (#55); (d) the single long status page split into tabs
+(Dashboard / Blocklist / Network / Access / Upstream DNS), with the active tab
+kept in `location.hash` so the 10s auto-refresh doesn't bounce you back to the
+first one. mDNS (`esp32adblock.local`) already worked and needed no changes.
+
+## Audit round 2 — findings on the #52 work ✅
+Review of the above before it landed; all five fixed in the same commit.
+
+### R1 — static IP published before the link is up ✅ (#56)
+`dns_sink.cpp` — `ETH_GOT_IP_BIT`/`WIFI_GOT_IP_BIT` were raised at *config*
+time, before `esp_eth_start()`/`esp_wifi_start()`. A static netif never fires
+`IP_EVENT_*_GOT_IP`, so the bit does have to be raised by hand — but doing it
+that early made `app_main` declare the network ready and point upstream DNS at
+the static gateway while the link was still down. Reproduced on hardware with
+the Ethernet port empty: `Upstream re-pointed to 192.168.50.1`, `Network ready
+— Ethernet: 192.168.50.10`. Wi-Fi coming up 2.3 s later masked it; on an
+Ethernet-only build upstream stays pinned to an unreachable gateway and every
+forwarded query times out — the same dead-end class as the CGNAT gateway bug.
+**Fix:** `publish_static_eth()`/`publish_static_wifi()`, called from the
+`ETHERNET_EVENT_CONNECTED`/`WIFI_EVENT_STA_CONNECTED` handlers; the addresses
+are also cleared again on link loss. Verified: same config now reports
+`Ethernet: (down)` and waits for a real interface.
+
+### R2 — boot blocklist download failure never retried ✅ (#57)
+`dns_sink.cpp` — `download_task` discarded `blocklist_load()`'s return (a
+domain count, 0 = failure), so a failed boot download left the sinkhole
+answering everything as ALLOWED until the 4h reload, silently. R1 made this
+materially easier to hit by starting the download against a dead interface.
+**Fix:** 15 s / 60 s / 300 s backoff retries, plus an explicit `ESP_LOGE` if
+the list is still empty afterwards.
+
+### R3 — reconfigure guard cleared before the disconnect event ✅ (#58)
+`dns_sink.cpp` — `s_wifi_reconfiguring` was cleared synchronously after
+`esp_wifi_set_config()`, but `esp_wifi_disconnect()` is asynchronous, so the
+`STA_DISCONNECTED` handler could see it already false and fire a duplicate
+`esp_wifi_connect()`. Benign (the new config had already been applied) but the
+flag wasn't doing what its comment claimed. **Fix:** held until
+`WIFI_EVENT_STA_CONNECTED`, with a 15 s deadline so a bad SSID can't suppress
+auto-retry permanently.
+
+### R4 — `/wifi/scan` was an unauthenticated GET with a radio side effect ✅ (#59)
+`web_ui.cpp` — driving the radio from a GET bypassed `csrf_ok()` and was
+triggerable cross-origin; IDF warns a long scan can knock the STA off its AP.
+**Fix:** moved to POST behind `csrf_ok()`, client `fetch` updated to match.
+
+### R5 — status-page buffer headroom after tabs ✅ (#60)
+`web_ui.cpp` — the tabbed markup took the page to ~8.4 KB with every user table
+still empty; `page_appendf` clamps silently (H1), so a fully-populated device
+would truncate mid-markup and leave unbalanced `<div>`s, presenting as dead
+tabs rather than an error. **Fix:** `page[]` 12288 → 16384 and an `ESP_LOGW`
+when the cap is actually hit, so it fails loudly next time.
+
 ## Roadmap: generic ESP32-S3 build (Wi-Fi only) ⬜
 A variant for any plain ESP32-S3 dev board — drops the W5500/Ethernet + SD-card
 dependencies and runs the same sinkhole over built-in Wi-Fi (STA + DHCP). The

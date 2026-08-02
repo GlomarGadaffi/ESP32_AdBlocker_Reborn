@@ -178,6 +178,26 @@ First boot downloads the blocklist over HTTPS and writes it to SD. Later boots
 load from SD in about a second. Point your router's DNS at the board's DHCP
 address.
 
+## Networking
+
+Reachable at **`esp32adblock.local`** (mDNS) from boot, so you don't need to
+hunt for the DHCP lease.
+
+Ethernet (W5500) is always brought up. Wi-Fi STA can run **alongside** it by
+enabling `CONFIG_ADBLOCK_NET_WIFI` — both stay up together, and either link
+can be down without blocking startup (Wi-Fi-only, no cable attached, is a
+supported configuration). The web UI's **Network** tab controls:
+
+| setting | notes |
+| --- | --- |
+| Upstream interface | Which link egresses upstream resolver queries. Lets you answer LAN queries on one ISP and resolve out the other. Applied live, no restart. |
+| DHCP / static IP | Per interface. Static **must** include its DNS field — under static there is no DHCP option 6 to learn from, and falling back to the gateway breaks on CGNAT links whose gateway runs no resolver. Applied at boot; use **Reboot now**. |
+| Wi-Fi network | Scan nearby APs and switch networks from the browser. Credentials live in NVS; the Kconfig SSID/password are only a first-boot seed. |
+
+Upstream defaults to the interface's **DHCP-provided DNS server**, not its
+gateway. On a normal home router those are the same box; on a mobile-hotspot
+or CGNAT connection the gateway is a bare NAT hop that answers nothing on :53.
+
 ## Layout
 
 ```
@@ -198,15 +218,14 @@ main/
 
 ## Roadmap
 
-* **Generic ESP32-S3 build (Wi-Fi only) — coming.** A variant that drops the
-  W5500/Ethernet and SD-card dependencies and runs the same sinkhole over
-  built-in Wi-Fi, so it works on any plain ESP32-S3 dev board (no LilyGO
-  hardware required). The DNS engine, blocklist, cache, web UI, DoT, NTP, and
-  query log are all hardware-agnostic and carry over unchanged; what changes is
-  the bring-up (Wi-Fi STA + DHCP instead of W5500), and the L2 Ethernet
-  fast-path is replaced by the normal lwIP socket path (no esp_eth RX hook on
-  Wi-Fi), so blocked/cached queries take the ~1.8 ms socket path rather than the
-  L2 bypass. Blocklist storage may shrink on boards with quad (vs octal) PSRAM.
+* **Generic ESP32-S3 build (Wi-Fi only) — partly done.** Wi-Fi STA bring-up now
+  exists and runs *alongside* the W5500 rather than replacing it
+  (`CONFIG_ADBLOCK_NET_WIFI`, see Networking above), so the radio half of this
+  is built and proven. What's left for a truly generic board is dropping the
+  hard W5500 + SD-card dependencies so it builds with no LilyGO hardware at
+  all. Note the L2 Ethernet fast-path has no Wi-Fi equivalent (no esp_eth RX
+  hook), so Wi-Fi-served queries take the ~1.8 ms lwIP socket path rather than
+  the L2 bypass, and blocklist storage may shrink on quad (vs octal) PSRAM.
   Tracked in #49.
 * DoT upstream as a worker task / persistent session (off the DNS hot path).
 * DoH/DoT *server* (serve secure DNS to clients).

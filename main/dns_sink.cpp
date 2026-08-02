@@ -25,6 +25,7 @@
 #include "nvs.h"
 #include "esp_mac.h"
 #include "esp_timer.h"
+#include "lwip/inet.h"
 
 #include "driver/gpio.h"
 #include "driver/spi_master.h"
@@ -197,13 +198,143 @@ static void upstream_iface_init_nvs(void)
     nvs_close(h);
 }
 
+/* ── Static IP vs DHCP (#55) ────────────────────────────────────────────
+ * Applied only at boot — no live DHCP-client-state transition on a running
+ * netif, which is the risky part (stopping/starting dhcpc mid-flight can
+ * wedge the netif). Changing a form field here just persists to NVS; the
+ * web UI's save action tells the user to reboot to apply, same as most
+ * router admin panels handle this exact class of change. */
+struct NetStaticCfg {
+    bool dhcp = true;
+    char ip[16]  = {};
+    char nm[16]  = {};
+    char gw[16]  = {};
+    char dns[16] = {};
+};
+
+/* Loaded once at bring-up, then read by the link-up handlers to publish the
+ * address at the right moment (see publish_static_eth/publish_static_wifi). */
+static NetStaticCfg s_eth_static;
+
+static void netcfg_load(const char *prefix, NetStaticCfg *cfg)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS, NVS_READONLY, &h) != ESP_OK) return;
+    char key[24];
+    uint8_t mode = 1;   /* default: DHCP */
+    snprintf(key, sizeof(key), "%s_mode", prefix); nvs_get_u8(h, key, &mode);
+    cfg->dhcp = (mode != 0);
+    size_t len;
+    len = sizeof(cfg->ip);  snprintf(key, sizeof(key), "%s_ip",  prefix); nvs_get_str(h, key, cfg->ip,  &len);
+    len = sizeof(cfg->nm);  snprintf(key, sizeof(key), "%s_nm",  prefix); nvs_get_str(h, key, cfg->nm,  &len);
+    len = sizeof(cfg->gw);  snprintf(key, sizeof(key), "%s_gw",  prefix); nvs_get_str(h, key, cfg->gw,  &len);
+    len = sizeof(cfg->dns); snprintf(key, sizeof(key), "%s_dns", prefix); nvs_get_str(h, key, cfg->dns, &len);
+    nvs_close(h);
+}
+
+/* Called from web_ui.cpp POST /net/{eth,wifi}/set. iface = "eth" or "wifi". */
+extern "C" bool dns_sink_net_set_static(const char *iface, bool dhcp,
+                                         const char *ip, const char *nm,
+                                         const char *gw, const char *dns_ip)
+{
+    if (strcmp(iface, "eth") != 0 && strcmp(iface, "wifi") != 0) return false;
+    if (!dhcp) {
+        struct in_addr a;
+        if (!ip || !inet_aton(ip, &a)) return false;
+        if (!nm || !inet_aton(nm, &a)) return false;
+        if (gw && gw[0] && !inet_aton(gw, &a)) return false;
+        if (dns_ip && dns_ip[0] && !inet_aton(dns_ip, &a)) return false;
+    }
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS, NVS_READWRITE, &h) != ESP_OK) return false;
+    char key[24];
+    snprintf(key, sizeof(key), "%s_mode", iface); nvs_set_u8(h, key, dhcp ? 1 : 0);
+    snprintf(key, sizeof(key), "%s_ip",   iface); nvs_set_str(h, key, ip ? ip : "");
+    snprintf(key, sizeof(key), "%s_nm",   iface); nvs_set_str(h, key, nm ? nm : "");
+    snprintf(key, sizeof(key), "%s_gw",   iface); nvs_set_str(h, key, gw ? gw : "");
+    snprintf(key, sizeof(key), "%s_dns",  iface); nvs_set_str(h, key, dns_ip ? dns_ip : "");
+    nvs_commit(h);
+    nvs_close(h);
+    return true;
+}
+
+/* Populate current NVS-stored config for the web UI form (not necessarily
+ * what's active right now if it hasn't been rebooted since a change). */
+extern "C" void dns_sink_net_get_static(const char *iface, bool *dhcp,
+                                         char *ip, size_t ip_cap,
+                                         char *nm, size_t nm_cap,
+                                         char *gw, size_t gw_cap,
+                                         char *dns_ip, size_t dns_cap)
+{
+    NetStaticCfg cfg;
+    netcfg_load(iface, &cfg);
+    if (dhcp) *dhcp = cfg.dhcp;
+    if (ip)     snprintf(ip,     ip_cap,  "%s", cfg.ip);
+    if (nm)     snprintf(nm,     nm_cap,  "%s", cfg.nm);
+    if (gw)     snprintf(gw,     gw_cap,  "%s", cfg.gw);
+    if (dns_ip) snprintf(dns_ip, dns_cap, "%s", cfg.dns);
+}
+
+extern "C" void dns_sink_reboot(void)
+{
+    esp_restart();
+}
+
+/* Stop the netif's DHCP client and push a static IP/netmask/gateway/DNS.
+ * Must run before esp_eth_start()/esp_wifi_connect() — dhcpc_stop() on an
+ * already-running client mid-connection is the unsupported transition that
+ * risks wedging the netif; doing it here, before the link/radio is even up,
+ * avoids that entirely. */
+static void apply_static_ip(esp_netif_t *netif, const NetStaticCfg &cfg)
+{
+    esp_err_t rc = esp_netif_dhcpc_stop(netif);
+    if (rc != ESP_OK && rc != ESP_ERR_ESP_NETIF_DHCP_ALREADY_STOPPED)
+        ESP_LOGW(TAG, "dhcpc_stop: %s", esp_err_to_name(rc));
+
+    esp_netif_ip_info_t ipinfo = {};
+    struct in_addr a;
+    inet_aton(cfg.ip, &a); ipinfo.ip.addr = a.s_addr;
+    inet_aton(cfg.nm, &a); ipinfo.netmask.addr = a.s_addr;
+    if (cfg.gw[0]) { inet_aton(cfg.gw, &a); ipinfo.gw.addr = a.s_addr; }
+    ESP_ERROR_CHECK(esp_netif_set_ip_info(netif, &ipinfo));
+
+    if (cfg.dns[0]) {
+        esp_netif_dns_info_t dns_info = {};
+        dns_info.ip.type = ESP_IPADDR_TYPE_V4;
+        inet_aton(cfg.dns, &a); dns_info.ip.u_addr.ip4.addr = a.s_addr;
+        esp_netif_set_dns_info(netif, ESP_NETIF_DNS_MAIN, &dns_info);
+    }
+}
+
+/* Publish a statically-configured interface's address — deferred to the
+ * link-up event rather than done at config time (#56). A static netif never
+ * fires IP_EVENT_*_GOT_IP, so the "got IP" bit has to be raised by hand; doing
+ * it at config time (before esp_eth_start/esp_wifi_start) made app_main declare
+ * the network ready and pin upstream DNS to the static gateway while the link
+ * was still down — observed answering on 192.168.50.10 with the port empty,
+ * which leaves every forwarded query timing out on an Ethernet-only build. */
+static void publish_static_eth(void)
+{
+    if (s_eth_static.dhcp) return;
+    snprintf(s_ip,      sizeof(s_ip),      "%s", s_eth_static.ip);
+    snprintf(s_gw,      sizeof(s_gw),      "%s", s_eth_static.gw);
+    snprintf(s_eth_dns, sizeof(s_eth_dns), "%s", s_eth_static.dns);
+    ESP_LOGI(TAG, "Ethernet link up — static IP: %s  GW: %s  DNS: %s",
+             s_ip, s_gw[0] ? s_gw : "(none)", s_eth_dns[0] ? s_eth_dns : "(none)");
+    xEventGroupSetBits(s_eth_eg, ETH_GOT_IP_BIT);
+    apply_upstream_iface();
+}
+
 /* ── Ethernet event handlers ─────────────────────────────────────── */
 static void eth_event_handler(void *, esp_event_base_t, int32_t event_id, void *)
 {
-    if (event_id == ETHERNET_EVENT_CONNECTED)
+    if (event_id == ETHERNET_EVENT_CONNECTED) {
         xEventGroupSetBits(s_eth_eg, ETH_CONNECTED_BIT);
-    else if (event_id == ETHERNET_EVENT_DISCONNECTED)
+        publish_static_eth();      /* no-op under DHCP — the lease drives it instead */
+    } else if (event_id == ETHERNET_EVENT_DISCONNECTED) {
         xEventGroupClearBits(s_eth_eg, ETH_CONNECTED_BIT | ETH_GOT_IP_BIT);
+        if (!s_eth_static.dhcp) { s_ip[0] = '\0'; s_gw[0] = '\0'; s_eth_dns[0] = '\0'; }
+    }
 }
 
 /* Read the DHCP-provided DNS server (option 6) for a netif, if any. */
@@ -243,6 +374,77 @@ static void ip_event_handler(void *, esp_event_base_t, int32_t event_id, void *e
 }
 
 #if CONFIG_ADBLOCK_NET_WIFI
+/* ── Wi-Fi credentials: NVS-backed, Kconfig only as first-boot seed ──────
+ * CONFIG_ADBLOCK_WIFI_SSID/PASSWORD used to be read directly at connect
+ * time, which made the credentials permanently build-time-fixed. Runtime
+ * reconfiguration (GUI network picker, #54) needs them in NVS instead; on
+ * first boot (NVS empty) we seed from Kconfig once and persist that, so an
+ * existing build's behavior is unchanged until someone actually reconfigures. */
+static char s_wifi_ssid[33] = {};   /* 32 + NUL, per 802.11 max SSID length */
+static char s_wifi_pass[65] = {};   /* 64 + NUL, per WPA2-PSK max */
+
+static void wifi_creds_init_nvs(void)
+{
+    nvs_handle_t h;
+    bool have_ssid = false;
+    if (nvs_open(NVS_NS, NVS_READONLY, &h) == ESP_OK) {
+        size_t len = sizeof(s_wifi_ssid);
+        if (nvs_get_str(h, "wifi_ssid", s_wifi_ssid, &len) == ESP_OK && s_wifi_ssid[0] != '\0')
+            have_ssid = true;
+        len = sizeof(s_wifi_pass);
+        nvs_get_str(h, "wifi_pass", s_wifi_pass, &len);
+        nvs_close(h);
+    }
+    if (!have_ssid) {
+        ESP_LOGI(TAG, "No Wi-Fi creds in NVS — seeding from Kconfig default");
+        snprintf(s_wifi_ssid, sizeof(s_wifi_ssid), "%s", CONFIG_ADBLOCK_WIFI_SSID);
+        snprintf(s_wifi_pass, sizeof(s_wifi_pass), "%s", CONFIG_ADBLOCK_WIFI_PASSWORD);
+        if (nvs_open(NVS_NS, NVS_READWRITE, &h) == ESP_OK) {
+            nvs_set_str(h, "wifi_ssid", s_wifi_ssid);
+            nvs_set_str(h, "wifi_pass", s_wifi_pass);
+            nvs_commit(h);
+            nvs_close(h);
+        }
+    }
+}
+
+static NetStaticCfg s_wifi_static;
+
+/* Wi-Fi counterpart of publish_static_eth — see that comment for why this is
+ * deferred to association rather than done at config time (#56). */
+static void publish_static_wifi(void)
+{
+    if (s_wifi_static.dhcp) return;
+    snprintf(s_wifi_ip,  sizeof(s_wifi_ip),  "%s", s_wifi_static.ip);
+    snprintf(s_wifi_gw,  sizeof(s_wifi_gw),  "%s", s_wifi_static.gw);
+    snprintf(s_wifi_dns, sizeof(s_wifi_dns), "%s", s_wifi_static.dns);
+    ESP_LOGI(TAG, "Wi-Fi associated — static IP: %s  GW: %s  DNS: %s",
+             s_wifi_ip, s_wifi_gw[0] ? s_wifi_gw : "(none)",
+             s_wifi_dns[0] ? s_wifi_dns : "(none)");
+    xEventGroupSetBits(s_eth_eg, WIFI_GOT_IP_BIT);
+    apply_upstream_iface();
+}
+
+/* Suppresses the STA_DISCONNECTED auto-retry across a deliberate reconfigure
+ * (set_creds below), so it can't race the new credentials in with the old.
+ * Cleared on association rather than synchronously after set_config: the
+ * disconnect is asynchronous, so clearing it inline left the handler free to
+ * fire its own connect alongside ours (#58). The deadline is a safety net —
+ * if the new network never associates, normal auto-retry must resume rather
+ * than stay suppressed forever. */
+static volatile bool    s_wifi_reconfiguring   = false;
+static volatile int64_t s_wifi_recfg_until_us  = 0;
+
+static bool wifi_reconfig_active(void)
+{
+    if (!s_wifi_reconfiguring) return false;
+    if (esp_timer_get_time() > s_wifi_recfg_until_us) {
+        s_wifi_reconfiguring = false;      /* expired — resume normal retries */
+        return false;
+    }
+    return true;
+}
+
 /* ── Wi-Fi STA bring-up (roadmap #49 slice, extended for concurrent dual-WAN
  * with Ethernet under #53 — both interfaces stay up together rather than
  * one replacing the other). */
@@ -252,18 +454,26 @@ static void wifi_event_handler(void *, esp_event_base_t, int32_t event_id, void 
         esp_wifi_connect();
     } else if (event_id == WIFI_EVENT_STA_DISCONNECTED) {
         xEventGroupClearBits(s_eth_eg, WIFI_CONNECTED_BIT | WIFI_GOT_IP_BIT);
-        ESP_LOGW(TAG, "Wi-Fi disconnected — retrying");
-        esp_wifi_connect();
+        if (!s_wifi_static.dhcp) { s_wifi_ip[0] = '\0'; s_wifi_gw[0] = '\0'; s_wifi_dns[0] = '\0'; }
+        if (wifi_reconfig_active()) {
+            ESP_LOGI(TAG, "Wi-Fi disconnected (reconfiguring — not auto-retrying)");
+        } else {
+            ESP_LOGW(TAG, "Wi-Fi disconnected — retrying");
+            esp_wifi_connect();
+        }
     } else if (event_id == WIFI_EVENT_STA_CONNECTED) {
+        s_wifi_reconfiguring = false;      /* reconfigure landed */
         xEventGroupSetBits(s_eth_eg, WIFI_CONNECTED_BIT);
+        publish_static_wifi();             /* no-op under DHCP — the lease drives it */
     }
 }
 
 static void wifi_init_sta(void)
 {
-    ESP_LOGI(TAG, "Wi-Fi STA: connecting to SSID \"%s\"", CONFIG_ADBLOCK_WIFI_SSID);
+    wifi_creds_init_nvs();
+    ESP_LOGI(TAG, "Wi-Fi STA: connecting to SSID \"%s\"", s_wifi_ssid);
 
-    esp_netif_create_default_wifi_sta();
+    esp_netif_t *wifi_netif = esp_netif_create_default_wifi_sta();
 
     wifi_init_config_t init_cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&init_cfg));
@@ -271,17 +481,121 @@ static void wifi_init_sta(void)
     ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
                                                wifi_event_handler, nullptr));
 
+    /* Static IP (#55): the netif has to be configured before the driver starts
+     * (see apply_static_ip), but the address is only *published* once the STA
+     * actually associates — publish_static_wifi, from the event handler (#56). */
+    netcfg_load("wifi", &s_wifi_static);
+    if (!s_wifi_static.dhcp)
+        apply_static_ip(wifi_netif, s_wifi_static);
+
     wifi_config_t wifi_cfg = {};
     strlcpy(reinterpret_cast<char *>(wifi_cfg.sta.ssid),
-            CONFIG_ADBLOCK_WIFI_SSID, sizeof(wifi_cfg.sta.ssid));
+            s_wifi_ssid, sizeof(wifi_cfg.sta.ssid));
     strlcpy(reinterpret_cast<char *>(wifi_cfg.sta.password),
-            CONFIG_ADBLOCK_WIFI_PASSWORD, sizeof(wifi_cfg.sta.password));
+            s_wifi_pass, sizeof(wifi_cfg.sta.password));
     wifi_cfg.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg));
     ESP_ERROR_CHECK(esp_wifi_start());
 }
+
+/* ── Wi-Fi scan + reconfigure from the web UI (#54) ──────────────────── */
+
+extern "C" void dns_sink_wifi_get_ssid(char *out, size_t cap)
+{
+    snprintf(out, cap, "%s", s_wifi_ssid);
+}
+
+/* Blocking scan (esp_wifi_scan_start(..., true)) — runs in the caller's task
+ * (httpd), taking a few seconds. That stalls the web UI request, not DNS
+ * service, which is an acceptable tradeoff for an on-demand admin action. */
+#define WIFI_SCAN_MAX 20
+extern "C" int dns_sink_wifi_scan(char *out, size_t cap)
+{
+    wifi_scan_config_t scan_cfg = {};
+    esp_err_t rc = esp_wifi_scan_start(&scan_cfg, true /* block until done */);
+    if (rc != ESP_OK)
+        return snprintf(out, cap, "{\"error\":\"scan failed (%d)\"}", (int)rc);
+
+    uint16_t ap_num = 0;
+    esp_wifi_scan_get_ap_num(&ap_num);
+    if (ap_num > WIFI_SCAN_MAX) ap_num = WIFI_SCAN_MAX;
+    static wifi_ap_record_t recs[WIFI_SCAN_MAX];
+    uint16_t got = ap_num;
+    esp_wifi_scan_get_ap_records(&got, recs);
+
+    int n = snprintf(out, cap, "[");
+    for (uint16_t i = 0; i < got && n < (int)cap - 128; i++) {
+        char ssid[64]; size_t sl = 0;   /* minimal JSON-string escape */
+        for (size_t j = 0; recs[i].ssid[j] != 0 && j < sizeof(recs[i].ssid) && sl < sizeof(ssid) - 2; j++) {
+            char c = (char)recs[i].ssid[j];
+            if (c == '"' || c == '\\') ssid[sl++] = '\\';
+            ssid[sl++] = c;
+        }
+        ssid[sl] = '\0';
+        n += snprintf(out + n, cap - n, "%s{\"ssid\":\"%s\",\"rssi\":%d,\"auth\":%d}",
+                      i ? "," : "", ssid, (int)recs[i].rssi, (int)recs[i].authmode);
+    }
+    n += snprintf(out + n, cap - n, "]");
+    return n;
+}
+
+/* The actual Wi-Fi teardown/reconnect, deferred a beat (see set_creds below)
+ * so the httpd response for the /wifi/connect request that triggered this
+ * can flush over the very link we're about to drop — otherwise the client
+ * gets a connection reset instead of the redirect (observed on hardware:
+ * esp_wifi_disconnect() tears down the TCP session serving that request). */
+static void wifi_apply_reconfigure_task(void *)
+{
+    vTaskDelay(pdMS_TO_TICKS(300));
+
+    ESP_LOGI(TAG, "Wi-Fi reconfigure: SSID -> \"%s\"", s_wifi_ssid);
+    s_wifi_recfg_until_us = esp_timer_get_time() + 15LL * 1000000;   /* safety net */
+    s_wifi_reconfiguring  = true;
+    esp_wifi_disconnect();
+
+    wifi_config_t wifi_cfg = {};
+    strlcpy(reinterpret_cast<char *>(wifi_cfg.sta.ssid),
+            s_wifi_ssid, sizeof(wifi_cfg.sta.ssid));
+    strlcpy(reinterpret_cast<char *>(wifi_cfg.sta.password),
+            s_wifi_pass, sizeof(wifi_cfg.sta.password));
+    wifi_cfg.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+    esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg);
+
+    /* Flag stays set until WIFI_EVENT_STA_CONNECTED clears it (or the deadline
+     * expires), so the async disconnect event can't slip past it — see
+     * wifi_reconfig_active. */
+    esp_wifi_connect();
+    vTaskDelete(nullptr);
+}
+
+/* Reconfigure to a new SSID/password: persist to NVS and update the in-memory
+ * copy synchronously (so it and the web UI agree immediately), then hand the
+ * disruptive part (disconnect/reconnect) to a deferred one-shot task. */
+extern "C" bool dns_sink_wifi_set_creds(const char *ssid, const char *pass)
+{
+    if (!ssid || ssid[0] == '\0' || strlen(ssid) >= sizeof(s_wifi_ssid)) return false;
+    if (pass && strlen(pass) >= sizeof(s_wifi_pass)) return false;
+
+    snprintf(s_wifi_ssid, sizeof(s_wifi_ssid), "%s", ssid);
+    snprintf(s_wifi_pass, sizeof(s_wifi_pass), "%s", pass ? pass : "");
+
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_str(h, "wifi_ssid", s_wifi_ssid);
+        nvs_set_str(h, "wifi_pass", s_wifi_pass);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+
+    xTaskCreate(wifi_apply_reconfigure_task, "wifi_recfg", 3072, nullptr, 3, nullptr);
+    return true;
+}
+#else
+extern "C" void dns_sink_wifi_get_ssid(char *out, size_t cap) { if (cap) out[0] = '\0'; }
+extern "C" int  dns_sink_wifi_scan(char *out, size_t cap) { return snprintf(out, cap, "[]"); }
+extern "C" bool dns_sink_wifi_set_creds(const char *, const char *) { return false; }
 #endif
 
 /* ── W5500 init for T-ETH-Elite ──────────────────────────────────── */
@@ -387,7 +701,25 @@ static void download_task(void *)
     bool from_sd = blocklist_load_sd();
     if (!from_sd) {
         ESP_LOGI(TAG, "No SD cache — downloading blocklist...");
-        blocklist_load();
+        /* Retry with backoff (#57). blocklist_load() returns the domain count,
+         * so 0 means the fetch failed; that used to be discarded, leaving the
+         * sinkhole with an empty list — every query ALLOWED, silently — until
+         * the next 4h reload. Most boot failures are just the network not being
+         * ready yet, so a few spaced retries recover without waiting hours. */
+        static const int retry_delay_s[] = { 15, 60, 300 };
+        if (blocklist_load() == 0) {
+            for (size_t i = 0; i < sizeof(retry_delay_s) / sizeof(retry_delay_s[0]); i++) {
+                ESP_LOGW(TAG, "Boot blocklist download failed — retry %u/%u in %ds",
+                         (unsigned)(i + 1),
+                         (unsigned)(sizeof(retry_delay_s) / sizeof(retry_delay_s[0])),
+                         retry_delay_s[i]);
+                vTaskDelay(pdMS_TO_TICKS(retry_delay_s[i] * 1000));
+                if (blocklist_load() > 0) break;
+            }
+            if (blocklist_domain_count() == 0)
+                ESP_LOGE(TAG, "Blocklist still empty after retries — NOT blocking "
+                              "until the next 4h reload or a manual /reload");
+        }
     } else {
         ESP_LOGI(TAG, "SD cache active (%" PRIu32 " domains) — skipping boot refresh",
                  blocklist_domain_count());
@@ -592,6 +924,13 @@ extern "C" void app_main(void)
     esp_netif_attach(eth_netif, esp_eth_new_netif_glue(eth_handle));
     /* Override the glue's input with our L2 fast-path hook (passthrough for now) */
     ESP_ERROR_CHECK(esp_eth_update_input_path_info(eth_handle, l2_input_cb, eth_netif));
+
+    /* Static IP (#55): the netif has to be configured before the driver starts
+     * (see apply_static_ip), but the address is only *published* once the link
+     * actually comes up — publish_static_eth, from the event handler (#56). */
+    netcfg_load("eth", &s_eth_static);
+    if (!s_eth_static.dhcp)
+        apply_static_ip(eth_netif, s_eth_static);
     ESP_ERROR_CHECK(esp_eth_start(eth_handle));
 
 #if CONFIG_ADBLOCK_NET_WIFI

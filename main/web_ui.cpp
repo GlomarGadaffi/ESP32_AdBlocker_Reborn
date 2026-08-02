@@ -1,4 +1,6 @@
 #include "web_ui.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "blocklist.h"
 #include "domain.h"
 #include "rewrite.h"
@@ -25,6 +27,18 @@ extern "C" void dns_sink_net_status(char *iface, size_t iface_cap,
                                      char *eth_ip, size_t eth_cap,
                                      char *wifi_ip, size_t wifi_cap);
 extern "C" bool dns_sink_set_upstream_iface(const char *iface);
+extern "C" void dns_sink_wifi_get_ssid(char *out, size_t cap);
+extern "C" int  dns_sink_wifi_scan(char *out, size_t cap);
+extern "C" bool dns_sink_wifi_set_creds(const char *ssid, const char *pass);
+extern "C" bool dns_sink_net_set_static(const char *iface, bool dhcp,
+                                         const char *ip, const char *nm,
+                                         const char *gw, const char *dns_ip);
+extern "C" void dns_sink_net_get_static(const char *iface, bool *dhcp,
+                                         char *ip, size_t ip_cap,
+                                         char *nm, size_t nm_cap,
+                                         char *gw, size_t gw_cap,
+                                         char *dns_ip, size_t dns_cap);
+extern "C" void dns_sink_reboot(void);
 
 /* ── helpers ─────────────────────────────────────────────────────── */
 
@@ -139,7 +153,12 @@ static esp_err_t handle_status(httpd_req_t *r)
     bool     loading = blocklist_is_loading();
     uint32_t wl_n    = blocklist_whitelist_count();
 
-    static char page[8192];  /* static: avoids stack overflow in httpd task */
+    /* static: avoids stack overflow in httpd task. Sized with headroom for a
+     * fully-populated device (whitelist + ACL + rewrites + extra sources all
+     * at once) — page_appendf clamps silently on overflow (H1), which with the
+     * tabbed layout would truncate mid-markup and leave unbalanced <div>s, so
+     * the failure would present as dead tabs rather than an error (#60). */
+    static char page[16384];
     int  n = 0;
     page_appendf(page, sizeof(page), &n,
         "<!DOCTYPE html><html><head><meta charset=utf-8>"
@@ -153,8 +172,35 @@ static esp_err_t handle_status(httpd_req_t *r)
         ".stat{background:#f4f4f4;border:1px solid #ccc;border-radius:6px;"
         "padding:.6em 1.2em;min-width:110px;text-align:center}"
         ".stat .val{font-size:1.6em;font-weight:bold;color:#1a1a8c}"
-        ".stat .lbl{font-size:.75em;color:#555}</style>"
-        "</head><body><h2>ESP32 AdBlocker</h2>");
+        ".stat .lbl{font-size:.75em;color:#555}"
+        ".tabs{display:flex;gap:.3em;flex-wrap:wrap;border-bottom:2px solid #ccc;margin-bottom:1em}"
+        ".tabs button{background:none;border:none;border-bottom:3px solid transparent;"
+        "padding:.5em .9em;font:inherit;cursor:pointer;color:#555}"
+        ".tabs button.active{border-bottom-color:#1a1a8c;color:#1a1a8c;font-weight:bold}"
+        ".tab{display:none}.tab.active{display:block}</style>"
+        "<script>"
+        "function showTab(id){"
+        "document.querySelectorAll('.tab').forEach(function(e){e.classList.remove('active')});"
+        "document.querySelectorAll('.tabs button').forEach(function(e){e.classList.remove('active')});"
+        "document.getElementById('tab-'+id).classList.add('active');"
+        "document.getElementById('btn-'+id).classList.add('active');"
+        "location.hash=id;"
+        "}"
+        "window.onload=function(){"
+        "var id=location.hash?location.hash.substring(1):'dashboard';"
+        "if(!document.getElementById('tab-'+id))id='dashboard';"
+        "showTab(id);"
+        "}"
+        "</script>"
+        "</head><body><h2>ESP32 AdBlocker</h2>"
+        "<div class=tabs>"
+        "<button id=btn-dashboard onclick=\"showTab('dashboard')\">Dashboard</button>"
+        "<button id=btn-blocklist onclick=\"showTab('blocklist')\">Blocklist</button>"
+        "<button id=btn-network onclick=\"showTab('network')\">Network</button>"
+        "<button id=btn-access onclick=\"showTab('access')\">Access</button>"
+        "<button id=btn-upstream onclick=\"showTab('upstream')\">Upstream DNS</button>"
+        "</div>"
+        "<div class='tab' id=tab-dashboard>");
     float pct = total > 0 ? 100.0f * (float)blocked / (float)total : 0.0f;
     page_appendf(page, sizeof(page), &n,
         "<div class=stats>"
@@ -195,6 +241,7 @@ static esp_err_t handle_status(httpd_req_t *r)
                 "(log shows uptime until synced)</small></p>");
         }
     }
+    page_appendf(page, sizeof(page), &n, "</div><div class='tab' id=tab-blocklist>");
 
     /* whitelist table */
     if (wl_n > 0) {
@@ -264,67 +311,6 @@ static esp_err_t handle_status(httpd_req_t *r)
         }
     }
 
-    /* Client ACL section (#10) */
-    {
-        char acl_ips[ACL_MAX][20]; uint32_t acl_n = ACL_MAX;
-        acl_list(acl_ips, &acl_n);
-        page_appendf(page, sizeof(page), &n,
-            "<h3>Client Access Control</h3>"
-            "<p><small>Empty = allow all. If any IP is listed, only those clients may use this DNS server.</small></p>"
-            "<form method=post action=/acl/add>"
-            "<input name=ip placeholder='192.168.x.x' size=18>"
-            "<button>Add allowed client</button></form>");
-        if (acl_n > 0) {
-            page_appendf(page, sizeof(page), &n, "<table><tr><th>Allowed client IP</th><th>Action</th></tr>");
-            for (uint32_t i = 0; i < acl_n && n < (int)sizeof(page) - 256; i++) {
-                char safe_ip[48]; html_escape(safe_ip, sizeof(safe_ip), acl_ips[i]);
-                char safe_ipv[48]; html_escape(safe_ipv, sizeof(safe_ipv), acl_ips[i]);
-                page_appendf(page, sizeof(page), &n,
-                    "<tr><td>%s</td><td>"
-                    "<form method=post action=/acl/remove>"
-                    "<input type=hidden name=ip value=\"%s\">"
-                    "<button>Remove</button></form></td></tr>",
-                    safe_ip, safe_ipv);
-            }
-            page_appendf(page, sizeof(page), &n, "</table>"
-                "<form method=post action=/acl/clear style='margin-top:.5em'>"
-                "<button>Clear all (allow everyone)</button></form>");
-        }
-    }
-
-    /* Dual-WAN interface selection (#53) */
-    if (dns_sink_wifi_built()) {
-        char iface[8]="", eth_ip[16]="", wifi_ip[16]="";
-        dns_sink_net_status(iface, sizeof(iface), eth_ip, sizeof(eth_ip), wifi_ip, sizeof(wifi_ip));
-        page_appendf(page, sizeof(page), &n,
-            "<h3>Network Interfaces</h3>"
-            "<p>Ethernet: %s &nbsp; Wi-Fi: %s</p>"
-            "<p><small>Both stay up together. This chooses which one egresses "
-            "upstream resolver queries; LAN clients can query either IP either way.</small></p>"
-            "<form method=post action=/net/upstream>"
-            "<label><input type=radio name=iface value=eth%s> Ethernet</label> "
-            "<label><input type=radio name=iface value=wifi%s> Wi-Fi</label> "
-            "<button>Set upstream interface</button></form>",
-            eth_ip[0] ? eth_ip : "(down)", wifi_ip[0] ? wifi_ip : "(down)",
-            strcmp(iface, "eth") == 0 ? " checked" : "",
-            strcmp(iface, "wifi") == 0 ? " checked" : "");
-    }
-
-    /* DoT upstream settings (#5) */
-    {
-        bool dot_en = dot_is_enabled(); char dot_srv[64]="", dot_sni[64]="";
-        dot_get(nullptr, dot_srv, dot_sni);
-        page_appendf(page, sizeof(page), &n,
-            "<h3>Upstream DNS (DoT)</h3>"
-            "<form method=post action=/dot/set>"
-            "<label><input type=checkbox name=enabled value=1%s> Enable DNS-over-TLS</label><br>"
-            "Server IP: <input name=server value=\"%s\" size=18> "
-            "SNI: <input name=sni value=\"%s\" size=28><br>"
-            "<small>Default: 1.1.1.1 / one.one.one.one &nbsp; or &nbsp; 9.9.9.9 / dns.quad9.net</small><br>"
-            "<button>Save &amp; apply (restart DNS task)</button></form>",
-            dot_en ? " checked" : "", dot_srv, dot_sni);
-    }
-
     /* Blocklist sources section (#4, #9) */
     page_appendf(page, sizeof(page), &n,
         "<h3>Blocklist Sources</h3>"
@@ -357,8 +343,139 @@ static esp_err_t handle_status(httpd_req_t *r)
         "<code>https://raw.githubusercontent.com/hagezi/dns-blocklists/main/domains/tif.txt</code> (malware/phishing) &nbsp; "
         "<code>https://nsfw.oisd.nl/domainswild2</code> (adult content)</small></p>");
 
+    page_appendf(page, sizeof(page), &n, "</div><div class='tab' id=tab-access>");
+
+    /* Client ACL section (#10) */
+    {
+        char acl_ips[ACL_MAX][20]; uint32_t acl_n = ACL_MAX;
+        acl_list(acl_ips, &acl_n);
+        page_appendf(page, sizeof(page), &n,
+            "<h3>Client Access Control</h3>"
+            "<p><small>Empty = allow all. If any IP is listed, only those clients may use this DNS server.</small></p>"
+            "<form method=post action=/acl/add>"
+            "<input name=ip placeholder='192.168.x.x' size=18>"
+            "<button>Add allowed client</button></form>");
+        if (acl_n > 0) {
+            page_appendf(page, sizeof(page), &n, "<table><tr><th>Allowed client IP</th><th>Action</th></tr>");
+            for (uint32_t i = 0; i < acl_n && n < (int)sizeof(page) - 256; i++) {
+                char safe_ip[48]; html_escape(safe_ip, sizeof(safe_ip), acl_ips[i]);
+                char safe_ipv[48]; html_escape(safe_ipv, sizeof(safe_ipv), acl_ips[i]);
+                page_appendf(page, sizeof(page), &n,
+                    "<tr><td>%s</td><td>"
+                    "<form method=post action=/acl/remove>"
+                    "<input type=hidden name=ip value=\"%s\">"
+                    "<button>Remove</button></form></td></tr>",
+                    safe_ip, safe_ipv);
+            }
+            page_appendf(page, sizeof(page), &n, "</table>"
+                "<form method=post action=/acl/clear style='margin-top:.5em'>"
+                "<button>Clear all (allow everyone)</button></form>");
+        }
+    }
+    page_appendf(page, sizeof(page), &n, "</div><div class='tab' id=tab-network>");
+
+    /* Dual-WAN interface selection (#53) */
+    if (dns_sink_wifi_built()) {
+        char iface[8]="", eth_ip[16]="", wifi_ip[16]="";
+        dns_sink_net_status(iface, sizeof(iface), eth_ip, sizeof(eth_ip), wifi_ip, sizeof(wifi_ip));
+        page_appendf(page, sizeof(page), &n,
+            "<h3>Network Interfaces</h3>"
+            "<p>Ethernet: %s &nbsp; Wi-Fi: %s</p>"
+            "<p><small>Both stay up together. This chooses which one egresses "
+            "upstream resolver queries; LAN clients can query either IP either way.</small></p>"
+            "<form method=post action=/net/upstream>"
+            "<label><input type=radio name=iface value=eth%s> Ethernet</label> "
+            "<label><input type=radio name=iface value=wifi%s> Wi-Fi</label> "
+            "<button>Set upstream interface</button></form>",
+            eth_ip[0] ? eth_ip : "(down)", wifi_ip[0] ? wifi_ip : "(down)",
+            strcmp(iface, "eth") == 0 ? " checked" : "",
+            strcmp(iface, "wifi") == 0 ? " checked" : "");
+    }
+
+    /* DHCP vs static IP, per interface (#55). Saved to NVS; takes effect on
+     * next reboot (see apply_static_ip in dns_sink.cpp for why this isn't
+     * hot-applied). */
+    {
+        const char *ifaces[2] = { "eth", "wifi" };
+        const char *labels[2] = { "Ethernet", "Wi-Fi" };
+        for (int i = 0; i < (dns_sink_wifi_built() ? 2 : 1); i++) {
+            bool dhcp = true; char ip[16]="", nm[16]="", gw[16]="", dns_ip[16]="";
+            dns_sink_net_get_static(ifaces[i], &dhcp, ip, sizeof(ip), nm, sizeof(nm),
+                                     gw, sizeof(gw), dns_ip, sizeof(dns_ip));
+            page_appendf(page, sizeof(page), &n,
+                "<h3>%s: DHCP / Static IP</h3>"
+                "<form method=post action=/net/%s/set>"
+                "<label><input type=radio name=mode value=dhcp%s> DHCP</label> "
+                "<label><input type=radio name=mode value=static%s> Static</label><br>"
+                "IP: <input name=ip value=\"%s\" placeholder='192.168.1.50' size=16> "
+                "Netmask: <input name=nm value=\"%s\" placeholder='255.255.255.0' size=16><br>"
+                "Gateway: <input name=gw value=\"%s\" placeholder='192.168.1.1' size=16> "
+                "DNS: <input name=dns value=\"%s\" placeholder='192.168.1.1' size=16><br>"
+                "<button>Save</button>"
+                "<small> — requires reboot to take effect</small></form>",
+                labels[i], ifaces[i],
+                dhcp ? " checked" : "", dhcp ? "" : " checked",
+                ip, nm, gw, dns_ip);
+        }
+        page_appendf(page, sizeof(page), &n,
+            "<form method=post action=/reboot style='margin-top:.5em'>"
+            "<button>Reboot now</button></form>");
+    }
+
+    /* Wi-Fi scan + reconfigure (#54) */
+    if (dns_sink_wifi_built()) {
+        char ssid[33] = ""; dns_sink_wifi_get_ssid(ssid, sizeof(ssid));
+        char safe_ssid[80]; html_escape(safe_ssid, sizeof(safe_ssid), ssid);
+        page_appendf(page, sizeof(page), &n,
+            "<h3>Wi-Fi</h3>"
+            "<p>Currently configured SSID: <b>%s</b></p>"
+            "<button type=button onclick=\"wifiScan()\">Scan for networks</button>"
+            "<span id=wifi-scan-status></span>"
+            "<ul id=wifi-results></ul>"
+            "<form method=post action=/wifi/connect>"
+            "<input id=wifi-ssid name=ssid placeholder='SSID' size=24> "
+            "<input id=wifi-pass name=password placeholder='Password' size=24 type=password> "
+            "<button>Connect</button></form>"
+            "<script>"
+            "function wifiScan(){"
+            "document.getElementById('wifi-scan-status').textContent=' scanning\xe2\x80\xa6 (few seconds)';"
+            "fetch('/wifi/scan',{method:'POST'}).then(function(r){return r.json()}).then(function(list){"
+            "var ul=document.getElementById('wifi-results');ul.innerHTML='';"
+            "document.getElementById('wifi-scan-status').textContent=' found '+list.length;"
+            "list.forEach(function(ap){"
+            "var li=document.createElement('li');"
+            "var btn=document.createElement('button');btn.type='button';"
+            "btn.textContent=ap.ssid+' ('+ap.rssi+' dBm)'+(ap.auth==0?' [open]':'');"
+            "btn.onclick=function(){document.getElementById('wifi-ssid').value=ap.ssid;document.getElementById('wifi-pass').focus();};"
+            "li.appendChild(btn);ul.appendChild(li);"
+            "});"
+            "}).catch(function(){document.getElementById('wifi-scan-status').textContent=' scan failed';});"
+            "}"
+            "</script>",
+            safe_ssid);
+    }
+    page_appendf(page, sizeof(page), &n, "</div><div class='tab' id=tab-upstream>");
+
+    /* DoT upstream settings (#5) */
+    {
+        bool dot_en = dot_is_enabled(); char dot_srv[64]="", dot_sni[64]="";
+        dot_get(nullptr, dot_srv, dot_sni);
+        page_appendf(page, sizeof(page), &n,
+            "<h3>Upstream DNS (DoT)</h3>"
+            "<form method=post action=/dot/set>"
+            "<label><input type=checkbox name=enabled value=1%s> Enable DNS-over-TLS</label><br>"
+            "Server IP: <input name=server value=\"%s\" size=18> "
+            "SNI: <input name=sni value=\"%s\" size=28><br>"
+            "<small>Default: 1.1.1.1 / one.one.one.one &nbsp; or &nbsp; 9.9.9.9 / dns.quad9.net</small><br>"
+            "<button>Save &amp; apply (restart DNS task)</button></form>",
+            dot_en ? " checked" : "", dot_srv, dot_sni);
+    }
+    page_appendf(page, sizeof(page), &n, "</div>");
+
     page_appendf(page, sizeof(page), &n, "</body></html>");
-    (void)n;
+    if (n >= (int)sizeof(page) - 1)
+        ESP_LOGW(TAG, "status page hit the %u B cap — markup truncated, tabs "
+                      "may not render; raise page[]", (unsigned)sizeof(page));
     send_html(r, page);
     return ESP_OK;
 }
@@ -494,6 +611,76 @@ static esp_err_t handle_net_upstream(httpd_req_t *r)
     const char *iface = strstr(body, "iface=wifi") ? "wifi" : "eth";
     dns_sink_set_upstream_iface(iface);
     httpd_resp_set_status(r, "303 See Other"); httpd_resp_set_hdr(r, "Location", "/"); httpd_resp_send(r,nullptr,0); return ESP_OK;
+}
+
+/* ── POST /net/{eth,wifi}/set — DHCP vs static IP (#55) ──────────────
+ * Persists to NVS only; takes effect on the next boot (see apply_static_ip
+ * in dns_sink.cpp for why this isn't hot-applied to a running netif). */
+static esp_err_t handle_net_static_set(httpd_req_t *r, const char *iface)
+{
+    if (!csrf_ok(r)) { httpd_resp_send_err(r, HTTPD_403_FORBIDDEN, "CSRF"); return ESP_FAIL; }
+    char body[256] = {}; httpd_req_recv(r, body, sizeof(body) - 1);
+    bool dhcp = (strstr(body, "mode=dhcp") != nullptr);
+    char ip[16]="", nm[16]="", gw[16]="", dns_ip[16]="";
+    struct { const char *key; char *out; size_t cap; } fields[] = {
+        {"ip=", ip, sizeof(ip)}, {"nm=", nm, sizeof(nm)},
+        {"gw=", gw, sizeof(gw)}, {"dns=", dns_ip, sizeof(dns_ip)},
+    };
+    for (auto &f : fields) {
+        const char *p = strstr(body, f.key);
+        if (!p) continue;
+        p += strlen(f.key);
+        size_t l = 0; char raw[32] = {0};
+        for (; p[l] && p[l] != '&' && p[l] != '\r' && l < 31; l++) raw[l] = p[l];
+        url_decode(f.out, f.cap, raw, l);
+    }
+    if (!dns_sink_net_set_static(iface, dhcp, ip, nm, gw, dns_ip)) {
+        httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST, "Invalid IP/netmask/gateway/DNS");
+        return ESP_FAIL;
+    }
+    httpd_resp_set_status(r, "303 See Other"); httpd_resp_set_hdr(r, "Location", "/#network"); httpd_resp_send(r,nullptr,0); return ESP_OK;
+}
+static esp_err_t handle_net_eth_set(httpd_req_t *r)  { return handle_net_static_set(r, "eth"); }
+static esp_err_t handle_net_wifi_set(httpd_req_t *r) { return handle_net_static_set(r, "wifi"); }
+
+/* ── POST /reboot — apply a saved static-IP change (#55) ─────────── */
+static esp_err_t handle_reboot(httpd_req_t *r)
+{
+    if (!csrf_ok(r)) { httpd_resp_send_err(r, HTTPD_403_FORBIDDEN, "CSRF"); return ESP_FAIL; }
+    send_html(r, "<!DOCTYPE html><html><body><h2>Rebooting…</h2>"
+                 "<p>Reconnecting in ~10s. <a href='/'>Back</a> (once it's up).</p></body></html>");
+    vTaskDelay(pdMS_TO_TICKS(300));   /* let the response flush before the reset */
+    dns_sink_reboot();
+    return ESP_OK;
+}
+
+/* ── POST /wifi/scan — JSON list of nearby APs (#54) ──────────────────
+ * POST rather than GET despite being a read: it drives the radio, and IDF
+ * warns a scan can knock the STA off its AP. Behind csrf_ok so an arbitrary
+ * page the user happens to load can't spam scans at the device (#59). */
+static esp_err_t handle_wifi_scan(httpd_req_t *r)
+{
+    if (!csrf_ok(r)) { httpd_resp_send_err(r, HTTPD_403_FORBIDDEN, "CSRF"); return ESP_FAIL; }
+    static char json[2560];
+    int n = dns_sink_wifi_scan(json, sizeof(json));
+    httpd_resp_set_type(r, "application/json");
+    httpd_resp_set_hdr(r, "Cache-Control", "no-store");
+    httpd_resp_send(r, json, n > 0 ? n : 0);
+    return ESP_OK;
+}
+
+/* ── POST /wifi/connect — reconfigure Wi-Fi STA (#54) ────────────── */
+static esp_err_t handle_wifi_connect(httpd_req_t *r)
+{
+    if (!csrf_ok(r)) { httpd_resp_send_err(r, HTTPD_403_FORBIDDEN, "CSRF"); return ESP_FAIL; }
+    char body[512] = {}; httpd_req_recv(r, body, sizeof(body) - 1);
+    char ssid[33] = "", pass[65] = "";
+    const char *ps = strstr(body, "ssid=");
+    if (ps) { ps += 5; size_t l=0; char raw[128]={0}; for(;ps[l]&&ps[l]!='&'&&ps[l]!='\r'&&l<127;l++) raw[l]=ps[l]; url_decode(ssid,sizeof(ssid),raw,l); }
+    const char *pp = strstr(body, "password=");
+    if (pp) { pp += 9; size_t l=0; char raw[256]={0}; for(;pp[l]&&pp[l]!='&'&&pp[l]!='\r'&&l<255;l++) raw[l]=pp[l]; url_decode(pass,sizeof(pass),raw,l); }
+    dns_sink_wifi_set_creds(ssid, pass);
+    httpd_resp_set_status(r, "303 See Other"); httpd_resp_set_hdr(r, "Location", "/#network"); httpd_resp_send(r,nullptr,0); return ESP_OK;
 }
 
 /* ── POST /acl/add — add allowed client IP (#10) ────────────────── */
@@ -765,7 +952,7 @@ bool web_ui_start(DnsSinkServer *dns)
     s_dns = dns;
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.server_port      = 80;
-    cfg.max_uri_handlers = 24;
+    cfg.max_uri_handlers = 28;
     cfg.stack_size       = 16384;
     if (httpd_start(&s_server, &cfg) != ESP_OK) {
         ESP_LOGE(TAG, "httpd_start failed"); return false;
@@ -791,6 +978,11 @@ bool web_ui_start(DnsSinkServer *dns)
         { "/acl/clear",           HTTP_POST, handle_acl_clear,     nullptr },
         { "/dot/set",             HTTP_POST, handle_dot_set,       nullptr },
         { "/net/upstream",        HTTP_POST, handle_net_upstream,  nullptr },
+        { "/wifi/scan",           HTTP_POST, handle_wifi_scan,     nullptr },
+        { "/wifi/connect",        HTTP_POST, handle_wifi_connect,  nullptr },
+        { "/net/eth/set",         HTTP_POST, handle_net_eth_set,   nullptr },
+        { "/net/wifi/set",        HTTP_POST, handle_net_wifi_set,  nullptr },
+        { "/reboot",              HTTP_POST, handle_reboot,        nullptr },
     };
     for (auto &u : uris) httpd_register_uri_handler(s_server, &u);
 
