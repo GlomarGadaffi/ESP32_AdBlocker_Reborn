@@ -225,6 +225,37 @@ would truncate mid-markup and leave unbalanced `<div>`s, presenting as dead
 tabs rather than an error. **Fix:** `page[]` 12288 → 16384 and an `ESP_LOGW`
 when the cap is actually hit, so it fails loudly next time.
 
+## Concurrency: multiple simultaneous web-UI viewers ☑️ / ✅ (#61)
+Checked whether the dashboard is safe with several people watching it at once.
+
+`esp_http_server` runs a **single** task — one `select()` loop walking sessions
+sequentially — so requests are serialised, never parallel. That is what makes
+the `static char page[16384]` render buffer (and the `static` buffers in
+`/metrics`, `/log`, `/top`, `/wifi/scan`) safe: **this is load-bearing**, and
+adding a worker pool would turn them into a cross-viewer data race.
+
+Measured on hardware: 12 simultaneous page loads all returned byte-identical,
+well-formed pages; 6 viewers hammering `/` produced 186 loads with **0**
+corrupt. Critically, DNS service is unaffected by web load — **0/150 queries
+lost**, p50 5.98 ms → 6.96 ms (that delta is Wi-Fi airtime, not board CPU;
+on-device processing stays in the microseconds).
+
+Two limits are inherent to the single-task design and remain:
+* **Head-of-line blocking.** Anything slow stalls every viewer. A Wi-Fi scan
+  measured 3.16 s, and a page load issued during it took 2.63 s vs 0.50 s idle.
+  With 6 viewers page p99 reached 1.08 s.
+* **Socket ceiling.** `max_open_sockets` stays at the default 7 —
+  `CONFIG_LWIP_MAX_SOCKETS` is 16 and httpd already claims ~9, so raising it
+  risks starving the DNS server's own sockets, a far worse failure than a slow
+  dashboard.
+
+**Fixed:** `lru_purge_enable = true`, so a client that disappears mid-request
+gets its slot recycled instead of refusing new connections until the timeout
+expires. Verified no regression (10 half-open sockets: 200 OK in 0.21 s, vs
+0.25 s before). Note this hardens against stuck clients, not against a
+deliberate flood: 15 concurrent half-open sockets still failed 2 of 6 requests,
+recovering fully afterwards.
+
 ## Roadmap: generic ESP32-S3 build (Wi-Fi only) ⬜
 A variant for any plain ESP32-S3 dev board — drops the W5500/Ethernet + SD-card
 dependencies and runs the same sinkhole over built-in Wi-Fi (STA + DHCP). The
