@@ -289,6 +289,25 @@ Query p99 does rise to ~367 ms while a scan is running — that's the radio
 channel-hopping off the home channel, not a firmware stall — and it returns to
 ~50 ms as soon as the scan finishes.
 
+## Fix: tabs reset to Dashboard every 10s ✅ (#63)
+Reported from actual use: a tab would hold for only a second or two before the
+page snapped back to Dashboard. The `<meta http-equiv="refresh" content="10">`
+reload dropped the URL fragment, losing the tab selection — and on the config
+tabs the same reload discarded anything half-typed into a form (Wi-Fi password,
+static IP, custom rules), which was the more damaging half of the bug.
+
+**Fixed:** meta refresh removed. Refresh is JS-driven via `location.reload()`
+(which *does* keep the fragment) and is armed **only while the Dashboard is
+showing** — that's the only tab with live counters, so the config tabs now
+never auto-reload out from under an edit. The selected tab is also mirrored
+into `sessionStorage`, so it survives even a navigation that drops the
+fragment; the fix therefore doesn't depend on fragment-preservation behaviour
+at all. The Dashboard states the behaviour inline so it isn't surprising.
+
+Worth noting the original tabs shipped believing hash-preservation worked
+across a meta refresh — it doesn't, and that only surfaced in real use. Markup
+that validates structurally can still behave wrong in a browser.
+
 ## Roadmap: generic ESP32-S3 build (Wi-Fi only) ⬜
 A variant for any plain ESP32-S3 dev board — drops the W5500/Ethernet + SD-card
 dependencies and runs the same sinkhole over built-in Wi-Fi (STA + DHCP). The

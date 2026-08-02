@@ -164,7 +164,10 @@ static esp_err_t handle_status(httpd_req_t *r)
     page_appendf(page, sizeof(page), &n,
         "<!DOCTYPE html><html><head><meta charset=utf-8>"
         "<title>DNS Sinkhole</title>"
-        "<meta http-equiv='refresh' content='10'>"
+        /* No <meta refresh>: it dropped the URL fragment, so every reload
+         * kicked you back to the Dashboard mid-edit, and it wiped half-typed
+         * form input on the config tabs (#63). Refresh is JS-driven below and
+         * only runs while the Dashboard is actually showing. */
         "<style>body{font-family:monospace;max-width:700px;margin:2em auto;}"
         "table{border-collapse:collapse;width:100%%}"
         "td,th{border:1px solid #ccc;padding:.4em .8em;text-align:left}"
@@ -180,16 +183,31 @@ static esp_err_t handle_status(httpd_req_t *r)
         ".tabs button.active{border-bottom-color:#1a1a8c;color:#1a1a8c;font-weight:bold}"
         ".tab{display:none}.tab.active{display:block}</style>"
         "<script>"
+        "var RT=null;"
         "function showTab(id){"
         "document.querySelectorAll('.tab').forEach(function(e){e.classList.remove('active')});"
         "document.querySelectorAll('.tabs button').forEach(function(e){e.classList.remove('active')});"
         "document.getElementById('tab-'+id).classList.add('active');"
         "document.getElementById('btn-'+id).classList.add('active');"
         "location.hash=id;"
+        /* sessionStorage as well as the hash: belt and braces, so the tab
+         * survives even a navigation that drops the fragment. */
+        "try{sessionStorage.setItem('tab',id);}catch(e){}"
+        "schedRefresh();"
+        "}"
+        /* Only the Dashboard shows live counters, so only the Dashboard needs
+         * reloading. On the config tabs a reload is pure harm — it would throw
+         * away whatever you were typing. location.reload() keeps the fragment,
+         * unlike the <meta refresh> this replaced. */
+        "function schedRefresh(){"
+        "if(RT){clearTimeout(RT);RT=null;}"
+        "var a=document.querySelector('.tab.active');"
+        "if(a&&a.id=='tab-dashboard'){RT=setTimeout(function(){location.reload();},10000);}"
         "}"
         "window.onload=function(){"
-        "var id=location.hash?location.hash.substring(1):'dashboard';"
-        "if(!document.getElementById('tab-'+id))id='dashboard';"
+        "var id=location.hash?location.hash.substring(1):'';"
+        "if(!id){try{id=sessionStorage.getItem('tab')||'';}catch(e){id='';}}"
+        "if(!id||!document.getElementById('tab-'+id))id='dashboard';"
         "showTab(id);"
         "}"
         "</script>"
@@ -225,7 +243,9 @@ static esp_err_t handle_status(httpd_req_t *r)
         "<input name=domain placeholder='Add to whitelist' size=40>"
         "<button>Whitelist</button></form><br>"
         "<a href='/log'>Query log</a> &nbsp; <a href='/top'>Top lists</a>"
-        " &nbsp; <a href='/metrics'>Metrics JSON</a>");
+        " &nbsp; <a href='/metrics'>Metrics JSON</a>"
+        "<p><small>This tab auto-refreshes every 10s; the other tabs don't, so "
+        "they won't reload while you're editing.</small></p>");
 
     /* Clock status (NTP) */
     {
