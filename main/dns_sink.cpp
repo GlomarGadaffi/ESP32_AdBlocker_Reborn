@@ -45,6 +45,7 @@
 #include "timesync.h"
 #include "dns_server.h"
 #include "web_ui.h"
+#include "console.h"
 #include "mdns.h"
 #include <cstring>
 #include <cstdlib>
@@ -1120,6 +1121,9 @@ extern "C" void app_main(void)
     /* Launch blocklist download + daily reload (Core 0, priority 2).
      * 24KB stack: mbedTLS (HTTPS fetch) + FATFS (SD save) are both deep. */
     xTaskCreatePinnedToCore(download_task, "bl_download", 24576, nullptr, 2, nullptr, 0);
+
+    /* USB recovery console: rescue a headless board over the flash cable. */
+    console_start();
 
     ESP_LOGI(TAG, "Startup complete. Ethernet: %s  Wi-Fi: %s — either can be set as your DNS server.",
              s_ip[0] ? s_ip : "(down)",

@@ -11,6 +11,7 @@ idf_component_register(
         "http_fetch.c"
         "murmur3.c"
         "domain.c"
+        "console.c"
         "web_ui.cpp"
     INCLUDE_DIRS "."
     REQUIRES
@@ -27,6 +28,7 @@ idf_component_register(
         mbedtls
         esp_driver_gpio
         esp_driver_spi
+        esp_driver_usb_serial_jtag
         esp_timer
         freertos
         heap
