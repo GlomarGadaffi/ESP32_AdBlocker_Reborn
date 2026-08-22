@@ -10,6 +10,7 @@
 #include "esp_heap_caps.h"
 #include "esp_random.h"
 #include "lwip/sockets.h"
+#include <fcntl.h>
 #include <cstring>
 #include <cstdio>
 #include <cerrno>
@@ -87,6 +88,14 @@ static constexpr uint32_t BLOCKED_TTL_S        = 10;
 static constexpr int      UPSTREAM_PORT        = 53;
 static constexpr uint32_t UPSTREAM_TIMEOUT_MS  = 3000;
 static constexpr int      UPSTREAM_TABLE_SIZE  = 64;
+
+/* TCP/53 (RFC 7766): required so a TC=1 answer has somewhere to land — without
+ * it the client's mandated TCP retry hits RST and resolution either fails or
+ * escapes to an unfiltered secondary resolver (completes #36 / #66). One
+ * listener + one active connection (+2 against the lwIP socket budget), one
+ * query per connection, everything non-blocking inside the dns_task loop. */
+static constexpr uint32_t TCP_CONN_IDLE_MS = 3000;
+static constexpr int      TCP_QUERY_MAX    = 768;
 
 /* ── Result cache (PSRAM): blocked verdicts + full forwarded responses ─
  * Direct-mapped, 256 slots. Blocked entries regenerate 0.0.0.0/::; allowed
@@ -270,8 +279,43 @@ struct UpstreamEntry {
     uint32_t         qhash;          /* domain hash — to key the forward cache on reply */
     uint16_t         qtype;
     bool             in_use;
+    bool             via_tcp;        /* reply goes to the TCP conn, not client_addr */
+    uint32_t         tcp_gen;        /* s_tcp.gen at forward time — stale-conn detector */
 };
 static UpstreamEntry s_upstream[UPSTREAM_TABLE_SIZE];
+
+/* ── TCP/53 connection state (dns_task only) ─────────────────────── */
+struct TcpConn {
+    int      fd;
+    uint32_t gen;          /* bumped on every close; upstream entries snapshot it */
+    int      have;
+    bool     awaiting;     /* query forwarded upstream; conn held for the reply */
+    uint64_t deadline_ms;
+    uint32_t peer_ip;      /* host order, for ACL + query log */
+    uint8_t  buf[2 + TCP_QUERY_MAX];
+};
+static TcpConn  s_tcp = { -1, 0, 0, false, 0, 0, {0} };
+static uint32_t s_cnt_tcp = 0;
+
+static void tcp_conn_close(void)
+{
+    if (s_tcp.fd != -1) { close(s_tcp.fd); s_tcp.fd = -1; }
+    s_tcp.gen++;
+    s_tcp.have = 0;
+    s_tcp.awaiting = false;
+}
+
+/* Length-prefix + message assembled into one send (dns_task is the only
+ * caller). A partial non-blocking send of ≤1502 B on a fresh connection
+ * means the peer is wedged — treat it as failure; the caller closes. */
+static bool tcp_send_dns(int fd, const uint8_t *msg, int len)
+{
+    static uint8_t frame[2 + 1500];
+    if (len <= 0 || len > 1500) return false;
+    frame[0] = (uint8_t)(len >> 8); frame[1] = (uint8_t)(len & 0xFF);
+    memcpy(frame + 2, msg, len);
+    return send(fd, frame, len + 2, MSG_DONTWAIT) == len + 2;
+}
 
 static bool txid_in_use(uint16_t t)
 {
@@ -292,6 +336,7 @@ static UpstreamEntry *upstream_alloc(uint16_t *our_txid_out)
             do { t = (uint16_t)(esp_random() & 0xFFFFu); } while (t == 0 || txid_in_use(t));
             s_upstream[i].in_use   = true;
             s_upstream[i].our_txid = t;
+            s_upstream[i].via_tcp  = false;
             *our_txid_out = t;
             return &s_upstream[i];
         }
@@ -363,6 +408,50 @@ static int build_blocked_aaaa(const uint8_t *query, int qlen, uint8_t *out, int 
     memcpy(p, &ans, sizeof(ans)); p += sizeof(ans);
     memset(p, 0, 16);            /* :: */
     return qlen + (int)sizeof(ans) + 16;
+}
+
+/* qtype dispatch for a blocked verdict: A → 0.0.0.0, AAAA → ::, else NXDOMAIN
+ * with no answer RRs. Shared by the UDP path (cached + fresh verdicts) and the
+ * TCP/53 path so all three agree forever. */
+static int build_blocked_any(const uint8_t *query, int qend, uint16_t qtype,
+                             uint8_t *out, int out_cap)
+{
+    if (qtype == 1)  return build_blocked_a   (query, qend, out, out_cap);
+    if (qtype == 28) return build_blocked_aaaa(query, qend, out, out_cap);
+    if (qend < (int)sizeof(DnsHeader) || qend > out_cap) return -1;
+    memcpy(out, query, qend);
+    auto *hdr = reinterpret_cast<DnsHeader *>(out);
+    hdr->flags   = htons(DNS_FLAGS_NXDOMAIN);
+    hdr->ancount = 0;
+    hdr->nscount = 0;
+    hdr->arcount = 0;
+    return qend;
+}
+
+/* Synthesize the A response for a DNS-rewrite hit (#12): answer RR is a
+ * pointer to the question name, IN A, TTL 300, rdata = rw_ip. */
+static int build_rewrite_a(const uint8_t *query, int qend, uint32_t rw_ip,
+                           uint8_t *out, int out_cap)
+{
+    if (qend < (int)sizeof(DnsHeader) || qend + 16 > out_cap) return -1;
+    memcpy(out, query, qend);
+    uint16_t qf = ((uint16_t)query[2] << 8) | query[3];
+    uint16_t rf = dns_resp_flags(qf, 0);
+    out[2] = rf >> 8; out[3] = rf & 0xFF;
+    reinterpret_cast<DnsHeader *>(out)->ancount = htons(1);
+    reinterpret_cast<DnsHeader *>(out)->nscount = 0;
+    reinterpret_cast<DnsHeader *>(out)->arcount = 0;
+    int p = qend;
+    out[p++] = 0xC0; out[p++] = 0x0C; /* ptr to question name */
+    out[p++] = 0x00; out[p++] = 0x01; /* A */
+    out[p++] = 0x00; out[p++] = 0x01; /* IN */
+    out[p++] = 0x00; out[p++] = 0x00; out[p++] = 0x01; out[p++] = 0x2C; /* TTL 300 */
+    out[p++] = 0x00; out[p++] = 0x04; /* rdlength */
+    out[p++] = (rw_ip >> 24) & 0xFF;
+    out[p++] = (rw_ip >> 16) & 0xFF;
+    out[p++] = (rw_ip >> 8)  & 0xFF;
+    out[p++] =  rw_ip        & 0xFF;
+    return p;
 }
 
 
@@ -469,6 +558,7 @@ void DnsSinkServer::run_loop()
              (unsigned)(CACHE_SLOTS * sizeof(CacheEntry) / 1024));
 
     /* ── Open client socket ─────────────────────────────────────── */
+    int lsock = -1;   /* TCP/53 listener; created below, -1 = UDP-only */
     int csock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
     if (csock < 0) { ESP_LOGE(TAG, "socket: %d", errno); goto done; }
     {
@@ -514,26 +604,49 @@ void DnsSinkServer::run_loop()
         inet_aton(_upstream_ip, &upstream_addr.sin_addr);
         _upstream_addr.store(upstream_addr.sin_addr.s_addr, std::memory_order_release);
 
+        /* ── Open TCP/53 listener (RFC 7766) ────────────────────── */
+        lsock = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
+        if (lsock >= 0) {
+            int one = 1;
+            setsockopt(lsock, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+            struct sockaddr_in la{};
+            la.sin_family = AF_INET;
+            la.sin_addr.s_addr = INADDR_ANY;
+            la.sin_port = htons(53);
+            if (bind(lsock, (sockaddr *)&la, sizeof(la)) < 0 || listen(lsock, 1) < 0) {
+                ESP_LOGW(TAG, "TCP/53 unavailable (bind/listen: %d) — UDP-only", errno);
+                close(lsock); lsock = -1;
+            }
+        } else {
+            ESP_LOGW(TAG, "TCP/53 unavailable (socket: %d) — UDP-only", errno);
+        }
+
         uint8_t rx[1500], tx[512 + sizeof(DnsAnswerHeader) + 16];
         struct sockaddr_in client_addr{};
         socklen_t clen = sizeof(client_addr);
 
-        ESP_LOGI(TAG, "DNS sinkhole running on port 53, upstream %s", _upstream_ip);
+        ESP_LOGI(TAG, "DNS sinkhole running on port 53 (UDP%s), upstream %s",
+                 lsock >= 0 ? "+TCP" : " only", _upstream_ip);
 
         while (_running.load(std::memory_order_acquire)) {
-            /* select() on both sockets with 100ms timeout */
+            /* select() on all sockets with 100ms timeout */
             fd_set rset;
             FD_ZERO(&rset);
             FD_SET(csock, &rset);
             FD_SET(usock, &rset);
+            int nfds = (csock > usock ? csock : usock);
+            if (lsock >= 0)     { FD_SET(lsock, &rset);    if (lsock    > nfds) nfds = lsock; }
+            if (s_tcp.fd != -1) { FD_SET(s_tcp.fd, &rset); if (s_tcp.fd > nfds) nfds = s_tcp.fd; }
+            nfds += 1;
             struct timeval tv{ .tv_sec = 0, .tv_usec = 100000 };
-            int nfds = (csock > usock ? csock : usock) + 1;
             int sel = select(nfds, &rset, nullptr, nullptr, &tv);
             if (sel < 0 && errno != EINTR) break;
 
             uint64_t now_ms = (uint64_t)(esp_timer_get_time() / 1000);
             upstream_evict_expired((uint32_t)now_ms);   /* upstream table uses uint32_t; 49d ok for 3s timeout */
             if (s_reset_req) { s_reset_req = false; do_metrics_reset(); }
+            if (s_tcp.fd != -1 && now_ms > s_tcp.deadline_ms)
+                tcp_conn_close();   /* idle/stuck client can't hold the slot */
 
             (void)sel;  /* select() is just the wait; we drain non-blocking below */
 
@@ -574,8 +687,21 @@ void DnsSinkServer::run_loop()
                  * over TCP, and skip caching this incomplete response (#36). */
                 bool truncated = (rlen == (int)sizeof(rx));
                 if (truncated) rx[2] |= 0x02;  /* TC bit in flags high byte */
-                sendto(csock, rx, rlen, 0,
-                       (sockaddr *)&ue->client_addr, sizeof(ue->client_addr));
+                if (ue->via_tcp) {
+                    /* Deliver over the TCP conn that asked — if it's still the
+                     * same connection (gen match) and still waiting. A closed
+                     * conn just means we cache the answer for the retry. */
+                    if (s_tcp.fd != -1 && s_tcp.awaiting && ue->tcp_gen == s_tcp.gen) {
+                        if (truncated)
+                            ESP_LOGW(TAG, "upstream reply exceeded %d B — relayed TC over TCP",
+                                     (int)sizeof(rx));
+                        tcp_send_dns(s_tcp.fd, rx, rlen);
+                        tcp_conn_close();
+                    }
+                } else {
+                    sendto(csock, rx, rlen, 0,
+                           (sockaddr *)&ue->client_addr, sizeof(ue->client_addr));
+                }
                 int64_t t_csent = esp_timer_get_time();
                 /* Latency split: (a) recv→upstream-send, (b) upstream RTT,
                  * (c) upstream-recv→client-send. Parity overhead = (a)+(c). */
@@ -626,20 +752,7 @@ void DnsSinkServer::run_loop()
                 if (ce) {
                     s_cnt_cache_hit++;
                     if (ce->blocked) {
-                        int tlen;
-                        if (qtype == 1)
-                            tlen = build_blocked_a   (rx, qend, tx, sizeof(tx));
-                        else if (qtype == 28)
-                            tlen = build_blocked_aaaa(rx, qend, tx, sizeof(tx));
-                        else {
-                            /* Non-A/AAAA blocked: NXDOMAIN with no answer RRs */
-                            memcpy(tx, rx, qend);
-                            reinterpret_cast<DnsHeader *>(tx)->flags   = htons(DNS_FLAGS_NXDOMAIN);
-                            reinterpret_cast<DnsHeader *>(tx)->ancount = 0;
-                            reinterpret_cast<DnsHeader *>(tx)->nscount = 0;
-                            reinterpret_cast<DnsHeader *>(tx)->arcount = 0;
-                            tlen = qend;
-                        }
+                        int tlen = build_blocked_any(rx, qend, qtype, tx, sizeof(tx));
                         if (tlen > 0)
                             sendto(csock, tx, tlen, 0, (sockaddr *)&client_addr, clen);
                         s_cnt_blocked++;
@@ -661,27 +774,9 @@ void DnsSinkServer::run_loop()
                 if (qtype == 1 /* A */) {
                     uint32_t rw_ip = rewrite_lookup(name);
                     if (rw_ip) {
-                        /* Synthesize an A record response */
-                        memcpy(tx, rx, qend);
-                        uint16_t qf = (rx[2] << 8) | rx[3];
-                        uint16_t rf = dns_resp_flags(qf, 0);
-                        tx[2] = rf >> 8; tx[3] = rf & 0xFF;
-                        reinterpret_cast<DnsHeader *>(tx)->ancount = htons(1);
-                        reinterpret_cast<DnsHeader *>(tx)->nscount = 0;
-                        reinterpret_cast<DnsHeader *>(tx)->arcount = 0;
-                        /* Append answer RR: name (ptr to qname), A, IN, TTL=300, rdata */
-                        int p = qend;
-                        if (p + 16 <= (int)sizeof(tx)) {
-                            tx[p++] = 0xC0; tx[p++] = 0x0C; /* ptr to question name */
-                            tx[p++] = 0x00; tx[p++] = 0x01; /* A */
-                            tx[p++] = 0x00; tx[p++] = 0x01; /* IN */
-                            tx[p++] = 0x00; tx[p++] = 0x00; tx[p++] = 0x01; tx[p++] = 0x2C; /* TTL 300 */
-                            tx[p++] = 0x00; tx[p++] = 0x04; /* rdlength */
-                            tx[p++] = (rw_ip >> 24) & 0xFF;
-                            tx[p++] = (rw_ip >> 16) & 0xFF;
-                            tx[p++] = (rw_ip >> 8)  & 0xFF;
-                            tx[p++] =  rw_ip        & 0xFF;
-                            sendto(csock, tx, p, 0, (sockaddr *)&client_addr, clen);
+                        int tlen = build_rewrite_a(rx, qend, rw_ip, tx, sizeof(tx));
+                        if (tlen > 0) {
+                            sendto(csock, tx, tlen, 0, (sockaddr *)&client_addr, clen);
                             hist_record(&s_h_cached, esp_timer_get_time() - t_recv);
                             query_log_record(name, qtype,
                                 ntohl(client_addr.sin_addr.s_addr), false, true);
@@ -700,19 +795,7 @@ void DnsSinkServer::run_loop()
                     hist_record(&s_h_lookup, esp_timer_get_time() - t_lk);
                     if (is_blk) {
                         s_cnt_blocked++;
-                        int tlen;
-                        if (qtype == 1)
-                            tlen = build_blocked_a   (rx, qend, tx, sizeof(tx));
-                        else if (qtype == 28)
-                            tlen = build_blocked_aaaa(rx, qend, tx, sizeof(tx));
-                        else {
-                            memcpy(tx, rx, qend);
-                            reinterpret_cast<DnsHeader *>(tx)->flags   = htons(DNS_FLAGS_NXDOMAIN);
-                            reinterpret_cast<DnsHeader *>(tx)->ancount = 0;
-                            reinterpret_cast<DnsHeader *>(tx)->nscount = 0;
-                            reinterpret_cast<DnsHeader *>(tx)->arcount = 0;
-                            tlen = qend;
-                        }
+                        int tlen = build_blocked_any(rx, qend, qtype, tx, sizeof(tx));
                         if (tlen > 0) {
                             int64_t t_s0 = esp_timer_get_time();
                             sendto(csock, tx, tlen, 0, (sockaddr *)&client_addr, clen);
@@ -777,10 +860,147 @@ void DnsSinkServer::run_loop()
                     }
                 }
             }
+
+            /* ── TCP/53: accept + read + serve (one conn, one query) ──
+             * Same verdict ladder as the UDP path above; contained duplication
+             * until the shared-verdict-helper refactor (roadmap wave 4). */
+            if (lsock >= 0 && FD_ISSET(lsock, &rset)) {
+                struct sockaddr_in pa{}; socklen_t pl = sizeof(pa);
+                int nfd = accept(lsock, (sockaddr *)&pa, &pl);
+                if (nfd >= 0) {
+                    if (s_tcp.fd != -1 || !acl_permits(ntohl(pa.sin_addr.s_addr))) {
+                        close(nfd);   /* busy (client retries) or unlisted client */
+                    } else {
+                        int fl = fcntl(nfd, F_GETFL, 0);
+                        fcntl(nfd, F_SETFL, fl | O_NONBLOCK);
+                        s_tcp.fd = nfd;
+                        s_tcp.have = 0;
+                        s_tcp.awaiting = false;
+                        s_tcp.peer_ip = ntohl(pa.sin_addr.s_addr);
+                        s_tcp.deadline_ms = now_ms + TCP_CONN_IDLE_MS;
+                    }
+                }
+            }
+            if (s_tcp.fd != -1 && !s_tcp.awaiting) {
+                int r = recv(s_tcp.fd, s_tcp.buf + s_tcp.have,
+                             sizeof(s_tcp.buf) - s_tcp.have, MSG_DONTWAIT);
+                if (r == 0 || (r < 0 && errno != EWOULDBLOCK && errno != EAGAIN)) {
+                    tcp_conn_close();
+                } else if (r > 0) {
+                    s_tcp.have += r;
+                    s_tcp.deadline_ms = now_ms + TCP_CONN_IDLE_MS;
+                }
+            }
+            if (s_tcp.fd != -1 && !s_tcp.awaiting && s_tcp.have >= 2) {
+                int mlen = ((int)s_tcp.buf[0] << 8) | s_tcp.buf[1];
+                if (mlen < (int)sizeof(DnsHeader) || mlen > TCP_QUERY_MAX) {
+                    tcp_conn_close();               /* oversize or garbage framing */
+                } else if (s_tcp.have >= 2 + mlen) {
+                    uint8_t *q = s_tcp.buf + 2;
+                    auto *qh = reinterpret_cast<DnsHeader *>(q);
+                    int64_t t_recv = esp_timer_get_time();
+                    char name[256]; size_t nlen = 0;
+                    int qend = -1;
+                    if (!(ntohs(qh->flags) & 0x8000) && ntohs(qh->qdcount) != 0)
+                        qend = extract_qname(q, mlen, sizeof(DnsHeader),
+                                             name, sizeof(name), &nlen);
+                    if (qend < 0) {
+                        tcp_conn_close();
+                    } else {
+                        s_cnt_total++; s_cnt_tcp++;
+                        uint16_t qtype = ntohs(*reinterpret_cast<uint16_t *>(q + qend - 4));
+                        uint32_t h = domain_hash(name, nlen);
+                        int tlen = 0;    /* >0: answer in tx; 0: forwarded, conn held */
+
+                        s_cnt_cache_probe++;
+                        CacheEntry *ce = cache_lookup(h, qtype, now_ms);
+                        if (ce && (ce->blocked ||
+                                   (ce->resp_len > 0 && ce->resp_len <= (int)sizeof(tx)))) {
+                            s_cnt_cache_hit++;
+                            if (ce->blocked) {
+                                s_cnt_blocked++;
+                                tlen = build_blocked_any(q, qend, qtype, tx, sizeof(tx));
+                                hist_record(&s_h_blocked, esp_timer_get_time() - t_recv);
+                            } else {
+                                memcpy(tx, ce->resp, ce->resp_len);
+                                tx[0] = q[0]; tx[1] = q[1];   /* client's txid */
+                                tlen = ce->resp_len;
+                                hist_record(&s_h_cached, esp_timer_get_time() - t_recv);
+                            }
+                        } else {
+                            uint32_t rw_ip = (qtype == 1) ? rewrite_lookup(name) : 0;
+                            if (rw_ip) {
+                                tlen = build_rewrite_a(q, qend, rw_ip, tx, sizeof(tx));
+                                query_log_record(name, qtype, s_tcp.peer_ip, false, true);
+                            } else if (blocklist_is_blocked(name, nlen) ||
+                                       blocklist_custom_is_blocked(name, nlen)) {
+                                s_cnt_blocked++;
+                                tlen = build_blocked_any(q, qend, qtype, tx, sizeof(tx));
+                                cache_store_blocked(h, qtype, BLOCKED_TTL_S, now_ms);
+                                query_log_record(name, qtype, s_tcp.peer_ip, true, false);
+                                hist_record(&s_h_blocked, esp_timer_get_time() - t_recv);
+                            } else {
+                                query_log_record(name, qtype, s_tcp.peer_ip, false, false);
+                                if (dot_is_enabled()) {
+                                    int dot_rlen = dot_resolve(q, qend, tx, sizeof(tx));
+                                    if (dot_rlen > 1) {
+                                        tx[0] = q[0]; tx[1] = q[1];
+                                        cache_store_resp(h, qtype, tx, dot_rlen,
+                                                         dns_resp_min_ttl(tx, dot_rlen, 60),
+                                                         now_ms);
+                                        s_cnt_forwarded++;
+                                        tlen = dot_rlen;
+                                    }
+                                }
+                                if (tlen == 0) {
+                                    uint16_t our_txid;
+                                    UpstreamEntry *ue = upstream_alloc(&our_txid);
+                                    if (!ue) {
+                                        s_cnt_drop_table++;
+                                        /* SERVFAIL: fail fast instead of hanging the conn */
+                                        memcpy(tx, q, qend);
+                                        uint16_t qf = ((uint16_t)q[2] << 8) | q[3];
+                                        uint16_t rf = dns_resp_flags(qf, 2);
+                                        tx[2] = rf >> 8; tx[3] = rf & 0xFF;
+                                        reinterpret_cast<DnsHeader *>(tx)->ancount = 0;
+                                        reinterpret_cast<DnsHeader *>(tx)->nscount = 0;
+                                        reinterpret_cast<DnsHeader *>(tx)->arcount = 0;
+                                        tlen = qend;
+                                    } else {
+                                        ue->client_txid = ntohs(qh->id);
+                                        memset(&ue->client_addr, 0, sizeof(ue->client_addr));
+                                        ue->sent_ms  = (uint32_t)now_ms;
+                                        ue->recv_us  = t_recv;
+                                        ue->qhash    = h;
+                                        ue->qtype    = qtype;
+                                        ue->via_tcp  = true;
+                                        ue->tcp_gen  = s_tcp.gen;
+                                        qh->id = htons(our_txid);
+                                        upstream_addr.sin_addr.s_addr =
+                                            _upstream_addr.load(std::memory_order_acquire);
+                                        ue->upstream_us = esp_timer_get_time();
+                                        sendto(usock, q, mlen, 0,
+                                               (sockaddr *)&upstream_addr, sizeof(upstream_addr));
+                                        s_cnt_forwarded++;
+                                        s_tcp.awaiting = true;
+                                    }
+                                }
+                            }
+                        }
+                        if (!s_tcp.awaiting) {
+                            /* direct answer (or builder failure) — send and close */
+                            if (tlen > 0) tcp_send_dns(s_tcp.fd, tx, tlen);
+                            tcp_conn_close();
+                        }
+                    }
+                }
+            }
         }  /* while running */
     }
 
 done:
+    tcp_conn_close();
+    if (lsock >= 0) close(lsock);
     int fd = _client_fd.exchange(-1, std::memory_order_acq_rel);
     if (fd != -1) close(fd);
     fd = _upstream_fd.exchange(-1, std::memory_order_acq_rel);
@@ -799,7 +1019,7 @@ extern "C" uint32_t dns_sink_l2_cached(void);
 
 static void do_metrics_reset(void)
 {
-    s_cnt_total = s_cnt_blocked = s_cnt_forwarded = 0;
+    s_cnt_total = s_cnt_blocked = s_cnt_forwarded = s_cnt_tcp = 0;
     s_cnt_drop_table = s_cnt_upstream_to = s_cnt_cache_probe = s_cnt_cache_hit = 0;
     memset(&s_h_blocked,    0, sizeof(s_h_blocked));
     memset(&s_h_cached,     0, sizeof(s_h_cached));
@@ -830,6 +1050,7 @@ int dns_server_metrics_json(char *out, size_t cap)
         "{"
         "\"uptime_s\":%lld,"
         "\"queries_total\":%" PRIu32 ",\"blocked\":%" PRIu32 ",\"forwarded\":%" PRIu32 ","
+        "\"tcp_queries\":%" PRIu32 ","
         "\"l2_blocked\":%" PRIu32 ",\"l2_cached\":%" PRIu32 ","
         "\"cache_probes\":%" PRIu32 ",\"cache_hits\":%" PRIu32 ",\"cache_hit_rate\":%.1f,"
         "\"dropped\":{\"table_full\":%" PRIu32 "},\"upstream_timeouts\":%" PRIu32 ","
@@ -838,6 +1059,7 @@ int dns_server_metrics_json(char *out, size_t cap)
         "\"heap_free\":%u,\"psram_free\":%u,\"dns_task_stack_hwm\":%u,",
         (long long)(esp_timer_get_time() / 1000000),
         s_cnt_total, s_cnt_blocked, s_cnt_forwarded,
+        s_cnt_tcp,
         dns_sink_l2_blocked(), dns_sink_l2_cached(),
         probes, hits, hitrate,
         s_cnt_drop_table, s_cnt_upstream_to,
