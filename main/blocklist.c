@@ -54,24 +54,18 @@ static void custom_parse(const char *text)
     s_custom_count = 0;
     const char *p = text;
     while (*p && s_custom_count < CUSTOM_RULES_MAX) {
-        /* skip whitespace/newlines */
-        while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
-        if (!*p) break;
-        /* skip comment lines */
-        if (*p == '#' || *p == '!') {
-            while (*p && *p != '\n') p++;
-            continue;
-        }
-        /* skip "0.0.0.0 " or "127.0.0.1 " prefix if present (hosts format) */
-        if ((*p >= '0' && *p <= '9') || *p == ':') {
-            while (*p && *p != ' ' && *p != '\t') p++;
-            while (*p == ' ' || *p == '\t') p++;
-            if (!*p || *p == '\r' || *p == '\n') continue;
-        }
-        /* read domain token */
-        const char *start = p;
-        while (*p && *p != ' ' && *p != '\t' && *p != '\r' && *p != '\n' && *p != '#') p++;
-        size_t len = (size_t)(p - start);
+        /* isolate one line */
+        const char *line = p;
+        while (*p && *p != '\n') p++;
+        size_t llen = (size_t)(p - line);
+        if (*p) p++;
+        while (llen > 0 && (line[llen-1] == '\r' || line[llen-1] == ' ')) llen--;
+        if (llen == 0 || line[0] == '#' || line[0] == '!') continue;
+
+        /* same extractor as the URL feeds: hosts prefixes, ||anchors^,
+         * digit-leading bare domains all handled in one place */
+        const char *start;
+        size_t len = domain_extract_token(line, llen, &start);
         if (len == 0 || len >= 64) continue;
         /* strip trailing dot */
         while (len > 0 && start[len-1] == '.') len--;
@@ -80,8 +74,6 @@ static void custom_parse(const char *text)
             s_custom_entries[s_custom_count][i] = (char)tolower((unsigned char)start[i]);
         s_custom_entries[s_custom_count][len] = '\0';
         s_custom_count++;
-        /* skip rest of line */
-        while (*p && *p != '\n') p++;
     }
 }
 
@@ -209,15 +201,22 @@ static void radix_sort(uint32_t *a, uint32_t *b, uint32_t n)
 }
 
 /* ── Download callback ───────────────────────────────────────────── */
-typedef struct { uint32_t *buf; uint32_t cap; uint32_t n; } load_ctx_t;
+typedef struct { uint32_t *buf; uint32_t cap; uint32_t n; uint32_t rejected; } load_ctx_t;
 
 static bool on_domain_line(const char *line, size_t len, void *ctx)
 {
     load_ctx_t *lc = (load_ctx_t *)ctx;
     if (lc->n >= lc->cap) return true;  /* silently skip if over capacity */
 
+    /* Hosts-format prefixes and adblock ||anchors^ must be peeled off, or the
+     * whole raw line hashes as one junk entry: the feed then reports a healthy
+     * domain count while blocking nothing (silent-corruption bug, wave 1). */
+    const char *tok;
+    size_t tlen = domain_extract_token(line, len, &tok);
+    if (tlen == 0) { lc->rejected++; return true; }
+
     char norm[256];
-    size_t nlen = domain_normalize(norm, sizeof(norm), line, len);
+    size_t nlen = domain_normalize(norm, sizeof(norm), tok, tlen);
     if (nlen == 0 || domain_is_bare_tld(norm, nlen)) return true;
 
     lc->buf[lc->n++] = domain_hash(norm, nlen);
@@ -285,7 +284,7 @@ uint32_t blocklist_load(void)
     /* Point to the buffer NOT currently live. Download into it while the
      * OLD list keeps serving — no null-blocking window during the fetch. */
     int new_buf = 1 - s_active_buf;
-    load_ctx_t lc = { .buf = s_buf[new_buf], .cap = BLOCKLIST_CAPACITY, .n = 0 };
+    load_ctx_t lc = { .buf = s_buf[new_buf], .cap = BLOCKLIST_CAPACITY, .n = 0, .rejected = 0 };
 
     ESP_LOGI(TAG, "Downloading primary blocklist (old list stays live)...");
     bool ok = http_fetch_lines(BLOCKLIST_URL, on_domain_line, &lc);
@@ -294,15 +293,19 @@ uint32_t blocklist_load(void)
         atomic_store(&s_loading, false);
         return 0;
     }
-    ESP_LOGI(TAG, "Primary: %" PRIu32 " domains", lc.n);
+    ESP_LOGI(TAG, "Primary: %" PRIu32 " domains (%" PRIu32 " lines rejected)",
+             lc.n, lc.rejected);
 
     /* Fetch extra blocklists and append to the same buffer */
     for (int i = 0; i < BLOCKLIST_EXTRA_MAX; i++) {
         if (s_extra_urls[i][0] == '\0') continue;
-        uint32_t before = lc.n;
+        uint32_t before = lc.n, rej_before = lc.rejected;
         ESP_LOGI(TAG, "Downloading extra list %d: %s", i, s_extra_urls[i]);
         http_fetch_lines(s_extra_urls[i], on_domain_line, &lc);
-        ESP_LOGI(TAG, "Extra list %d: %" PRIu32 " domains added", i, lc.n - before);
+        ESP_LOGI(TAG, "Extra list %d: %" PRIu32 " domains added, %" PRIu32 " lines rejected",
+                 i, lc.n - before, lc.rejected - rej_before);
+        if (lc.n == before && lc.rejected > rej_before)
+            ESP_LOGW(TAG, "Extra list %d contributed nothing usable — wrong format?", i);
     }
     ESP_LOGI(TAG, "Total %" PRIu32 " domains before dedup; sorting...", lc.n);
 

@@ -22,6 +22,18 @@ size_t domain_normalize(char *buf, size_t buf_size, const char *src, size_t src_
  */
 bool domain_is_bare_tld(const char *name, size_t len);
 
+/*
+ * Extract the blockable domain token from one raw blocklist line.
+ * Accepts bare domains, hosts format ("0.0.0.0 dom" / "::1 dom"), and
+ * adblock anchors ("||dom^"); "*.dom" collapses to "dom" (suffix-walk
+ * already covers subdomains — this over-blocks only the apex).
+ * Lines that cannot mean "block this whole domain" — exceptions (@@),
+ * path rules (/), option rules ($), cosmetic rules (##) — and tokens
+ * with characters outside [A-Za-z0-9._-] yield 0.
+ * On success *tok_out points into line; the token is NOT normalized.
+ */
+size_t domain_extract_token(const char *line, size_t len, const char **tok_out);
+
 /* Hash a normalized domain. Caller must normalize first. */
 static inline uint32_t domain_hash(const char *name, size_t len)
 {
