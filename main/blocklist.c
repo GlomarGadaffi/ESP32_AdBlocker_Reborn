@@ -277,6 +277,41 @@ bool blocklist_init(void)
     return true;
 }
 
+/* Reload diff (#67): exact +added/-removed vs the previous SD snapshot. The
+ * old PSRAM buffer is consumed as sort scratch, but the SD file still holds
+ * the previously-serving sorted list — stream it in 4KB chunks and merge-walk
+ * against the new sorted array (both ascending, single pass). Runs in the
+ * download_task once per reload, never on the query path. Would have caught
+ * the 170k-domain stale-cache incident at first boot. */
+static void reload_diff_vs_sd(const uint32_t *neu, uint32_t n_new)
+{
+    FILE *f = fopen(SD_BL_PATH, "rb");
+    if (!f) return;                       /* no SD / first boot: nothing to diff */
+    bl_sd_header_t hdr;
+    if (fread(&hdr, sizeof(hdr), 1, f) != 1 || hdr.magic != SD_MAGIC || hdr.count == 0) {
+        fclose(f);
+        return;
+    }
+    uint32_t *chunk = (uint32_t *)heap_caps_malloc(4096, MALLOC_CAP_SPIRAM);
+    if (!chunk) { fclose(f); return; }
+    uint32_t remaining = hdr.count, i = 0, common = 0;
+    while (remaining > 0) {
+        size_t take = remaining > 1024 ? 1024 : remaining;
+        if (fread(chunk, sizeof(uint32_t), take, f) != take) break;
+        for (size_t k = 0; k < take; k++) {
+            uint32_t h = chunk[k];
+            while (i < n_new && neu[i] < h) i++;
+            if (i < n_new && neu[i] == h) { common++; i++; }
+        }
+        remaining -= (uint32_t)take;
+    }
+    heap_caps_free(chunk);
+    fclose(f);
+    ESP_LOGI(TAG, "Reload diff vs previous snapshot: +%" PRIu32 " added, -%" PRIu32
+             " removed (%" PRIu32 " -> %" PRIu32 ")",
+             n_new - common, hdr.count - common, hdr.count, n_new);
+}
+
 uint32_t blocklist_load(void)
 {
     atomic_store(&s_loading, true);
@@ -334,6 +369,7 @@ uint32_t blocklist_load(void)
 
     ESP_LOGI(TAG, "Blocklist live: %" PRIu32 " domains (%" PRIu32 " dupes removed)", unique, lc.n - unique);
     atomic_store(&s_loading, false);
+    reload_diff_vs_sd(s_buf[new_buf], unique);   /* before the snapshot is overwritten */
     blocklist_save_sd();
     return unique;
 }
