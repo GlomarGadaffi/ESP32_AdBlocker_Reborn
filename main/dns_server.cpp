@@ -682,6 +682,74 @@ void DnsSinkServer::run_loop()
         ESP_LOGI(TAG, "DNS sinkhole running on port 53 (UDP%s), upstream %s",
                  lsock >= 0 ? "+TCP" : " only", _upstream_ip);
 
+        /* Shared upstream-reply processing: validation (H2), delivery
+         * (UDP client / TCP conn / refresh-only), histograms, cache store.
+         * Used for plain-UDP replies from usock AND raw DoT-worker replies —
+         * the transports differ, the trust and delivery logic must not. */
+        auto process_reply = [&](uint8_t *pkt, int plen, int64_t t_ureply,
+                                 uint64_t now_ms_) {
+            uint16_t our_txid = ntohs(reinterpret_cast<DnsHeader *>(pkt)->id);
+            UpstreamEntry *ue = upstream_find(our_txid);
+            if (!ue) return;
+            /* Anti-spoofing (H2): even with a matching txid, verify the
+             * reply's question matches what we actually asked. An attacker
+             * who guesses the txid would have to also match the qname+qtype.
+             * On mismatch, ignore the packet WITHOUT freeing the slot so the
+             * genuine reply can still be accepted (or the slot times out). */
+            {
+                char rname[256]; size_t rnlen = 0;
+                int rqend = extract_qname(pkt, plen, sizeof(DnsHeader),
+                                          rname, sizeof(rname), &rnlen);
+                if (rqend < 0) return;
+                uint16_t rqtype = ntohs(*reinterpret_cast<uint16_t *>(pkt + rqend - 4));
+                if (rqtype != ue->qtype || domain_hash(rname, rnlen) != ue->qhash)
+                    return;
+            }
+            /* rewrite transaction ID back to client's original */
+            reinterpret_cast<DnsHeader *>(pkt)->id = htons(ue->client_txid);
+            /* If the receive filled the buffer exactly, the datagram was larger —
+             * we silently truncated it. Set TC=1 so the client knows to retry
+             * over TCP, and skip caching this incomplete response (#36). */
+            bool truncated = (plen == (int)sizeof(rx));
+            if (truncated) pkt[2] |= 0x02;  /* TC bit in flags high byte */
+            if (ue->refresh_only) {
+                /* Stale-refresh (#68): nobody is waiting — just cache below.
+                 * Only the upstream RTT is a real latency measurement here. */
+                hist_record(&s_h_fwd_rtt, t_ureply - ue->upstream_us);
+            } else {
+                if (ue->via_tcp) {
+                    /* Deliver over the TCP conn that asked — if it's still the
+                     * same connection (gen match) and still waiting. A closed
+                     * conn just means we cache the answer for the retry. */
+                    if (s_tcp.fd != -1 && s_tcp.awaiting && ue->tcp_gen == s_tcp.gen) {
+                        if (truncated)
+                            ESP_LOGW(TAG, "upstream reply exceeded %d B — relayed TC over TCP",
+                                     (int)sizeof(rx));
+                        tcp_send_dns(s_tcp.fd, pkt, plen);
+                        tcp_conn_close();
+                    }
+                } else {
+                    sendto(csock, pkt, plen, 0,
+                           (sockaddr *)&ue->client_addr, sizeof(ue->client_addr));
+                }
+                int64_t t_csent = esp_timer_get_time();
+                /* Latency split: (a) recv→upstream-send, (b) upstream RTT,
+                 * (c) upstream-recv→client-send. Parity overhead = (a)+(c). */
+                hist_record(&s_h_fwd_rtt,    t_ureply - ue->upstream_us);
+                hist_record(&s_h_fwd_ourovh, (ue->upstream_us - ue->recv_us) + (t_csent - t_ureply));
+                hist_record(&s_h_fwd_total,  t_csent - ue->recv_us);
+            }
+
+            /* Forward cache: stash the response so a repeat identical query
+             * is answered locally. Only NOERROR/NXDOMAIN; TTL from the RRs
+             * (NXDOMAIN → short negative TTL). Skip truncated responses. */
+            uint8_t rcode = pkt[3] & 0x0F;
+            if (!truncated && (rcode == 0 || rcode == 3))
+                cache_store_resp(ue->qhash, ue->qtype, pkt, plen,
+                                 dns_resp_min_ttl(pkt, plen, 30), now_ms_);
+            ue->in_use = false;
+        };
+
         while (_running.load(std::memory_order_acquire)) {
             /* select() on all sockets with 100ms timeout */
             fd_set rset;
@@ -716,67 +784,33 @@ void DnsSinkServer::run_loop()
                  * dropping in-flight queries sent to the previous upstream. */
                 if (from.sin_addr.s_addr != _upstream_addr.load(std::memory_order_acquire) ||
                     from.sin_port        != upstream_addr.sin_port) continue;
-                int64_t t_ureply = esp_timer_get_time();
-                uint16_t our_txid = ntohs(reinterpret_cast<DnsHeader *>(rx)->id);
-                UpstreamEntry *ue = upstream_find(our_txid);
-                if (!ue) continue;
-                /* Anti-spoofing (H2): even with a matching txid, verify the
-                 * reply's question matches what we actually asked. An attacker
-                 * who guesses the txid would have to also match the qname+qtype.
-                 * On mismatch, ignore the packet WITHOUT freeing the slot so the
-                 * genuine reply can still be accepted (or the slot times out). */
-                {
-                    char rname[256]; size_t rnlen = 0;
-                    int rqend = extract_qname(rx, rlen, sizeof(DnsHeader),
-                                              rname, sizeof(rname), &rnlen);
-                    if (rqend < 0) continue;
-                    uint16_t rqtype = ntohs(*reinterpret_cast<uint16_t *>(rx + rqend - 4));
-                    if (rqtype != ue->qtype || domain_hash(rname, rnlen) != ue->qhash)
-                        continue;
-                }
-                /* rewrite transaction ID back to client's original */
-                reinterpret_cast<DnsHeader *>(rx)->id = htons(ue->client_txid);
-                /* If recvfrom filled the buffer exactly, the datagram was larger —
-                 * we silently truncated it. Set TC=1 so the client knows to retry
-                 * over TCP, and skip caching this incomplete response (#36). */
-                bool truncated = (rlen == (int)sizeof(rx));
-                if (truncated) rx[2] |= 0x02;  /* TC bit in flags high byte */
-                if (ue->refresh_only) {
-                    /* Stale-refresh (#68): nobody is waiting — just cache below.
-                     * Only the upstream RTT is a real latency measurement here. */
-                    hist_record(&s_h_fwd_rtt, t_ureply - ue->upstream_us);
-                } else {
-                    if (ue->via_tcp) {
-                        /* Deliver over the TCP conn that asked — if it's still the
-                         * same connection (gen match) and still waiting. A closed
-                         * conn just means we cache the answer for the retry. */
-                        if (s_tcp.fd != -1 && s_tcp.awaiting && ue->tcp_gen == s_tcp.gen) {
-                            if (truncated)
-                                ESP_LOGW(TAG, "upstream reply exceeded %d B — relayed TC over TCP",
-                                         (int)sizeof(rx));
-                            tcp_send_dns(s_tcp.fd, rx, rlen);
-                            tcp_conn_close();
-                        }
-                    } else {
-                        sendto(csock, rx, rlen, 0,
-                               (sockaddr *)&ue->client_addr, sizeof(ue->client_addr));
-                    }
-                    int64_t t_csent = esp_timer_get_time();
-                    /* Latency split: (a) recv→upstream-send, (b) upstream RTT,
-                     * (c) upstream-recv→client-send. Parity overhead = (a)+(c). */
-                    hist_record(&s_h_fwd_rtt,    t_ureply - ue->upstream_us);
-                    hist_record(&s_h_fwd_ourovh, (ue->upstream_us - ue->recv_us) + (t_csent - t_ureply));
-                    hist_record(&s_h_fwd_total,  t_csent - ue->recv_us);
-                }
+                process_reply(rx, rlen, esp_timer_get_time(), now_ms);
+            }
 
-                /* Forward cache: stash the response so a repeat identical query
-                 * is answered locally. Only NOERROR/NXDOMAIN; TTL from the RRs
-                 * (NXDOMAIN → short negative TTL). Skip truncated responses. */
-                uint8_t rcode = rx[3] & 0x0F;
-                if (!truncated && (rcode == 0 || rcode == 3))
-                    cache_store_resp(ue->qhash, ue->qtype, rx, rlen,
-                                     dns_resp_min_ttl(rx, rlen, 30), now_ms);
-                ue->in_use = false;
+            /* ── Drain DoT worker results (replies + failed-query echoes) ──
+             * Replies arrived over an authenticated TLS session, so the
+             * source-address check above has no equivalent here; everything
+             * else (H2 question match, delivery, caching) is identical. */
+            for (int dn = 0; dn < 8; dn++) {
+                bool dot_failed = false;
+                int rlen = dot_reply_get(rx, sizeof(rx), &dot_failed);
+                if (rlen <= 0) break;
+                if (!dot_failed) {
+                    process_reply(rx, rlen, esp_timer_get_time(), now_ms);
+                } else if (rlen >= (int)sizeof(DnsHeader)) {
+                    /* rx holds the original query (txid = our table txid):
+                     * fall back to plain UDP for this one, same entry. */
+                    uint16_t t = ntohs(reinterpret_cast<DnsHeader *>(rx)->id);
+                    UpstreamEntry *ue = upstream_find(t);
+                    if (ue) {
+                        upstream_addr.sin_addr.s_addr =
+                            _upstream_addr.load(std::memory_order_acquire);
+                        ue->upstream_us = esp_timer_get_time();
+                        sendto(usock, rx, rlen, 0,
+                               (sockaddr *)&upstream_addr, sizeof(upstream_addr));
+                        ESP_LOGW(TAG, "DoT failed — query re-sent over plain UDP");
+                    }
+                }
             }
 
             /* ── Drain client queries (cap per wakeup so upstream stays serviced) ── */
@@ -831,12 +865,11 @@ void DnsSinkServer::run_loop()
                 }
 
                 /* ── serve-stale (#68): replay an expired allowed entry now,
-                 * refresh it upstream in the background. Skipped when DoT is
-                 * on: the refresh would either leak the qname to plaintext
-                 * UDP or block the task in TLS — the DoT worker (C2) unifies
-                 * this. Same reason the L2 path stays fresh-only: its miss
-                 * falls through to here at ~1.8 ms, still invisible. */
-                if (!dot_is_enabled()) {
+                 * refresh it upstream in the background (over the DoT worker
+                 * when enabled — same transport choice as a cold forward).
+                 * The L2 path stays fresh-only: its miss falls through to
+                 * here at ~1.8 ms, still invisible. */
+                {
                     CacheEntry *se = cache_lookup_stale(h, qtype, now_ms);
                     if (se && se->resp_len <= (int)sizeof(tx)) {
                         memcpy(tx, se->resp, se->resp_len);
@@ -857,11 +890,13 @@ void DnsSinkServer::run_loop()
                                 ue->qtype        = qtype;
                                 ue->refresh_only = true;
                                 hdr->id = htons(our_txid);
-                                upstream_addr.sin_addr.s_addr =
-                                    _upstream_addr.load(std::memory_order_acquire);
                                 ue->upstream_us = esp_timer_get_time();
-                                sendto(usock, rx, rlen, 0,
-                                       (sockaddr *)&upstream_addr, sizeof(upstream_addr));
+                                if (!(dot_is_enabled() && dot_enqueue(rx, rlen))) {
+                                    upstream_addr.sin_addr.s_addr =
+                                        _upstream_addr.load(std::memory_order_acquire);
+                                    sendto(usock, rx, rlen, 0,
+                                           (sockaddr *)&upstream_addr, sizeof(upstream_addr));
+                                }
                             } else {
                                 se->refresh_after_ms = 0;  /* table full — retry next hit */
                             }
@@ -912,28 +947,8 @@ void DnsSinkServer::run_loop()
                         ntohl(client_addr.sin_addr.s_addr), false, false);
                 }
 
-                /* ── forward to upstream ────────────────────── */
+                /* ── forward to upstream: DoT worker if enabled, else UDP ── */
                 forward: {
-                    /* DoT path (#5): synchronous TLS query-response */
-                    if (dot_is_enabled()) {
-                        int dot_rlen = dot_resolve((uint8_t *)rx, qend, (uint8_t *)tx, sizeof(tx));
-                        if (dot_rlen > 1) {
-                            /* patch txid to match client's request */
-                            tx[0] = rx[0]; tx[1] = rx[1];
-                            cache_store_resp(h, qtype, (uint8_t *)tx, dot_rlen,
-                                            dns_resp_min_ttl((uint8_t *)tx, dot_rlen, 60),
-                                            now_ms);
-                            sendto(csock, tx, dot_rlen, 0,
-                                   (sockaddr *)&client_addr, clen);
-                            s_cnt_forwarded++;
-                            hist_record(&s_h_fwd_total, esp_timer_get_time() - t_recv);
-                        } else {
-                            ESP_LOGW(TAG, "DoT failed for %s — falling through to UDP", name);
-                            goto udp_forward;
-                        }
-                        continue;
-                    }
-                    udp_forward: {
                     uint16_t our_txid;
                     UpstreamEntry *ue = upstream_alloc(&our_txid);
                     if (!ue) {
@@ -952,12 +967,13 @@ void DnsSinkServer::run_loop()
                     /* rewrite txid and forward — read the live upstream address
                      * so an in-flight query batch can straddle a set_upstream() */
                     hdr->id = htons(our_txid);
-                    upstream_addr.sin_addr.s_addr = _upstream_addr.load(std::memory_order_acquire);
                     ue->upstream_us = esp_timer_get_time();
-                    sendto(usock, rx, rlen, 0,
-                           (sockaddr *)&upstream_addr, sizeof(upstream_addr));
-                    s_cnt_forwarded++;
+                    if (!(dot_is_enabled() && dot_enqueue(rx, rlen))) {
+                        upstream_addr.sin_addr.s_addr = _upstream_addr.load(std::memory_order_acquire);
+                        sendto(usock, rx, rlen, 0,
+                               (sockaddr *)&upstream_addr, sizeof(upstream_addr));
                     }
+                    s_cnt_forwarded++;
                 }
             }
 
@@ -1041,49 +1057,38 @@ void DnsSinkServer::run_loop()
                                 hist_record(&s_h_blocked, esp_timer_get_time() - t_recv);
                             } else {
                                 query_log_record(name, qtype, s_tcp.peer_ip, false, false);
-                                if (dot_is_enabled()) {
-                                    int dot_rlen = dot_resolve(q, qend, tx, sizeof(tx));
-                                    if (dot_rlen > 1) {
-                                        tx[0] = q[0]; tx[1] = q[1];
-                                        cache_store_resp(h, qtype, tx, dot_rlen,
-                                                         dns_resp_min_ttl(tx, dot_rlen, 60),
-                                                         now_ms);
-                                        s_cnt_forwarded++;
-                                        tlen = dot_rlen;
-                                    }
-                                }
-                                if (tlen == 0) {
-                                    uint16_t our_txid;
-                                    UpstreamEntry *ue = upstream_alloc(&our_txid);
-                                    if (!ue) {
-                                        s_cnt_drop_table++;
-                                        /* SERVFAIL: fail fast instead of hanging the conn */
-                                        memcpy(tx, q, qend);
-                                        uint16_t qf = ((uint16_t)q[2] << 8) | q[3];
-                                        uint16_t rf = dns_resp_flags(qf, 2);
-                                        tx[2] = rf >> 8; tx[3] = rf & 0xFF;
-                                        reinterpret_cast<DnsHeader *>(tx)->ancount = 0;
-                                        reinterpret_cast<DnsHeader *>(tx)->nscount = 0;
-                                        reinterpret_cast<DnsHeader *>(tx)->arcount = 0;
-                                        tlen = qend;
-                                    } else {
-                                        ue->client_txid = ntohs(qh->id);
-                                        memset(&ue->client_addr, 0, sizeof(ue->client_addr));
-                                        ue->sent_ms  = (uint32_t)now_ms;
-                                        ue->recv_us  = t_recv;
-                                        ue->qhash    = h;
-                                        ue->qtype    = qtype;
-                                        ue->via_tcp  = true;
-                                        ue->tcp_gen  = s_tcp.gen;
-                                        qh->id = htons(our_txid);
+                                uint16_t our_txid;
+                                UpstreamEntry *ue = upstream_alloc(&our_txid);
+                                if (!ue) {
+                                    s_cnt_drop_table++;
+                                    /* SERVFAIL: fail fast instead of hanging the conn */
+                                    memcpy(tx, q, qend);
+                                    uint16_t qf = ((uint16_t)q[2] << 8) | q[3];
+                                    uint16_t rf = dns_resp_flags(qf, 2);
+                                    tx[2] = rf >> 8; tx[3] = rf & 0xFF;
+                                    reinterpret_cast<DnsHeader *>(tx)->ancount = 0;
+                                    reinterpret_cast<DnsHeader *>(tx)->nscount = 0;
+                                    reinterpret_cast<DnsHeader *>(tx)->arcount = 0;
+                                    tlen = qend;
+                                } else {
+                                    ue->client_txid = ntohs(qh->id);
+                                    memset(&ue->client_addr, 0, sizeof(ue->client_addr));
+                                    ue->sent_ms  = (uint32_t)now_ms;
+                                    ue->recv_us  = t_recv;
+                                    ue->qhash    = h;
+                                    ue->qtype    = qtype;
+                                    ue->via_tcp  = true;
+                                    ue->tcp_gen  = s_tcp.gen;
+                                    qh->id = htons(our_txid);
+                                    ue->upstream_us = esp_timer_get_time();
+                                    if (!(dot_is_enabled() && dot_enqueue(q, mlen))) {
                                         upstream_addr.sin_addr.s_addr =
                                             _upstream_addr.load(std::memory_order_acquire);
-                                        ue->upstream_us = esp_timer_get_time();
                                         sendto(usock, q, mlen, 0,
                                                (sockaddr *)&upstream_addr, sizeof(upstream_addr));
-                                        s_cnt_forwarded++;
-                                        s_tcp.awaiting = true;
                                     }
+                                    s_cnt_forwarded++;
+                                    s_tcp.awaiting = true;
                                 }
                             }
                         }
