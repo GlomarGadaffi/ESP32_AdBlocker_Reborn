@@ -13,8 +13,13 @@ CONFIG_SPIRAM_MEMTEST=y
 CONFIG_ETH_USE_SPI_ETHERNET=y
 CONFIG_ETH_SPI_ETHERNET_W5500=y
 
-# lwIP — raise socket ceiling; DNS server + upstream + httpd + download all need sockets simultaneously
-CONFIG_LWIP_MAX_SOCKETS=16
+# lwIP — raise socket ceiling; DNS server + upstream + httpd + download all need sockets simultaneously.
+# 24 (was 16): the old budget stopped closing once TCP/53 (+2, #66) and the
+# persistent-DoT worker (+1, #5/C2) landed — httpd ~9 + DNS 2 + TCP 2 + DoT 1
+# + SNTP + mDNS left zero slack. Each socket costs a few hundred bytes of
+# internal RAM; httpd's own max_open_sockets guard (#61) is a separate knob
+# and stays at 7.
+CONFIG_LWIP_MAX_SOCKETS=24
 # Mailbox depth: under bursty concurrent load, queries drop here before dns_task
 # drains them. Raise UDP per-socket + the driver->tcpip_thread mailbox.
 CONFIG_LWIP_UDP_RECVMBOX_SIZE=64
