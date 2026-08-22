@@ -352,3 +352,16 @@ the newer list.
 - `c42662b` — httpd stack overflow in `handle_status` (8 KB non-static local).
 - `67114b9` — DNS timeout under load: `CONFIG_LWIP_SO_RCVBUF=y` + 32 KB
   SO_RCVBUF, dns_task stack 8192→12288, whitelist mutex `portMAX_DELAY`→2 ms.
+
+---
+
+## Architecture Review Feedback
+
+Based on an external review of the audit findings, the architectural approach aligns closely with embedded C and ESP-IDF best practices:
+
+* **Concurrency (C1 & H3):** Excellent use of bounded lock waits (e.g., 2 ms) and failing open (forward upstream). This prevents priority inversion and system stalls. **Caveat (H3):** Ensure the lock-free fast path uses proper atomic barriers (e.g., `__atomic_load_n` or `std::atomic`) if state is mutated from another core.
+* **DNS Validation (H2):** Using hardware RNG (`esp_random()`) for TXIDs and validating `qname`/`qtype` effectively mitigates Kaminsky-style off-path cache poisoning.
+* **String Handling (H1 & L1):** Replacing `snprintf` accumulators with a clamped wrapper prevents buffer overflows. **Caveat (H1):** Ensure `page_appendf` guarantees strict null-termination on truncation.
+* **L2 Fast-Path Seqlock:** The seqlock is an advanced and correct primitive here, protecting high-frequency lock-free reads without thrashing cache lines with atomic writes.
+* **Blocking DoT (C2):** The 1.5s timeout prevents a total DoS, but blocking the main `dns_task` for a TLS handshake remains an anti-pattern. The documented follow-up (moving it to a dedicated worker task fed by a queue) is the correct architectural fix.
+
