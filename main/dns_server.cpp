@@ -42,6 +42,7 @@ static uint32_t s_cnt_drop_table   = 0;  /* upstream table full */
 static uint32_t s_cnt_upstream_to  = 0;  /* upstream timeouts (evicted in_use) */
 static uint32_t s_cnt_cache_probe  = 0;  /* result-cache lookups */
 static uint32_t s_cnt_cache_hit    = 0;  /* result-cache hits */
+static uint32_t s_cnt_stale        = 0;  /* serve-stale replays (#68) */
 static TaskHandle_t      s_dns_task_handle  = nullptr;
 
 static inline int hist_bucket(uint32_t us)
@@ -106,6 +107,14 @@ static constexpr int      TCP_QUERY_MAX    = 768;
 #define FWD_RESP_MAX   512
 #define FWD_TTL_MIN_S  10u
 #define FWD_TTL_MAX_S  3600u
+
+/* Serve-stale (#68, RFC 8767 / AdGuard "optimistic cache"): an expired allowed
+ * entry is replayed immediately (answer TTLs clamped to STALE_TTL_S) and a
+ * background refresh is forwarded upstream, so a repeat visitor never eats the
+ * ~40ms cold path for a name we've resolved before. Stale window capped at
+ * STALE_MAX_S past expiry; refresh launches are rate-limited per entry. */
+#define STALE_MAX_S    86400u
+#define STALE_TTL_S    30u
 struct CacheEntry {
     uint32_t   key_hash;
     uint64_t   ttl_deadline_ms;       /* esp_timer ms — 64-bit, no 49-day wrap (#30) */
@@ -113,6 +122,8 @@ struct CacheEntry {
     bool       blocked;
     uint16_t   qtype;
     uint16_t   resp_len;              /* allowed: cached raw response length (0 = blocked) */
+    uint64_t   refresh_after_ms;      /* stale-refresh rate gate; dns_task only, not
+                                         read by the L2 path so no seqlock needed */
     uint8_t    resp[FWD_RESP_MAX];    /* allowed: raw upstream response */
 };
 static CacheEntry *s_cache = nullptr; /* CACHE_SLOTS entries in PSRAM */
@@ -165,8 +176,49 @@ static void cache_store_resp(uint32_t h, uint16_t qtype, const uint8_t *resp, in
     e->key_hash = h; e->qtype = qtype; e->blocked = false; e->valid = true;
     e->resp_len = (uint16_t)len;
     memcpy(e->resp, resp, len);
-    e->ttl_deadline_ms = now_ms + (uint64_t)ttl_s * 1000u;
+    e->ttl_deadline_ms   = now_ms + (uint64_t)ttl_s * 1000u;
+    e->refresh_after_ms  = 0;
     cache_write_end();
+}
+
+/* Serve-stale lookup (#68): expired ALLOWED entry within the stale window.
+ * Fresh entries are cache_lookup()'s job; expired blocked entries stay misses
+ * (re-blocking via the blocklist is microseconds — no staleness needed). */
+static CacheEntry *cache_lookup_stale(uint32_t h, uint16_t qtype, uint64_t now_ms)
+{
+    CacheEntry *e = &s_cache[(h ^ ((uint32_t)qtype << 1)) & (CACHE_SLOTS - 1)];
+    if (e->valid && !e->blocked && e->resp_len > 0 &&
+        e->key_hash == h && e->qtype == qtype &&
+        e->ttl_deadline_ms <= now_ms &&
+        e->ttl_deadline_ms + (uint64_t)STALE_MAX_S * 1000u > now_ms)
+        return e;
+    return nullptr;
+}
+
+static bool skip_name(const uint8_t *pkt, int len, int *off);   /* defined below */
+
+/* Rewrite every RR TTL in a response to ttl_s (RFC 8767: serve stale data
+ * with a short TTL so clients re-ask soon). Walks an+ns+ar like
+ * dns_resp_min_ttl; on any malformed step it stops, leaving later TTLs
+ * untouched — harmless, the response was already served as-is before. */
+static void rewrite_answer_ttls(uint8_t *pkt, int len, uint32_t ttl_s)
+{
+    if (len < 12) return;
+    int rrs = ((pkt[6] << 8) | pkt[7]) + ((pkt[8] << 8) | pkt[9]) +
+              ((pkt[10] << 8) | pkt[11]);
+    int off = 12;
+    if (!skip_name(pkt, len, &off)) return;
+    off += 4;                                   /* qtype + qclass */
+    for (int i = 0; i < rrs; i++) {
+        if (off > len || !skip_name(pkt, len, &off)) return;
+        if (off + 10 > len) return;
+        pkt[off + 4] = (uint8_t)(ttl_s >> 24);
+        pkt[off + 5] = (uint8_t)(ttl_s >> 16);
+        pkt[off + 6] = (uint8_t)(ttl_s >> 8);
+        pkt[off + 7] = (uint8_t)(ttl_s);
+        uint16_t rdlen = ((uint16_t)pkt[off + 8] << 8) | pkt[off + 9];
+        off += 10 + rdlen;
+    }
 }
 
 /* L2 fast-path cache read (called from the eth-RX task). Seqlock-protected.
@@ -280,6 +332,7 @@ struct UpstreamEntry {
     uint16_t         qtype;
     bool             in_use;
     bool             via_tcp;        /* reply goes to the TCP conn, not client_addr */
+    bool             refresh_only;   /* stale-refresh (#68): cache the reply, deliver to no one */
     uint32_t         tcp_gen;        /* s_tcp.gen at forward time — stale-conn detector */
 };
 static UpstreamEntry s_upstream[UPSTREAM_TABLE_SIZE];
@@ -334,9 +387,10 @@ static UpstreamEntry *upstream_alloc(uint16_t *our_txid_out)
              * collision with another in-flight query. */
             uint16_t t;
             do { t = (uint16_t)(esp_random() & 0xFFFFu); } while (t == 0 || txid_in_use(t));
-            s_upstream[i].in_use   = true;
-            s_upstream[i].our_txid = t;
-            s_upstream[i].via_tcp  = false;
+            s_upstream[i].in_use       = true;
+            s_upstream[i].our_txid     = t;
+            s_upstream[i].via_tcp      = false;
+            s_upstream[i].refresh_only = false;
             *our_txid_out = t;
             return &s_upstream[i];
         }
@@ -687,27 +741,33 @@ void DnsSinkServer::run_loop()
                  * over TCP, and skip caching this incomplete response (#36). */
                 bool truncated = (rlen == (int)sizeof(rx));
                 if (truncated) rx[2] |= 0x02;  /* TC bit in flags high byte */
-                if (ue->via_tcp) {
-                    /* Deliver over the TCP conn that asked — if it's still the
-                     * same connection (gen match) and still waiting. A closed
-                     * conn just means we cache the answer for the retry. */
-                    if (s_tcp.fd != -1 && s_tcp.awaiting && ue->tcp_gen == s_tcp.gen) {
-                        if (truncated)
-                            ESP_LOGW(TAG, "upstream reply exceeded %d B — relayed TC over TCP",
-                                     (int)sizeof(rx));
-                        tcp_send_dns(s_tcp.fd, rx, rlen);
-                        tcp_conn_close();
-                    }
+                if (ue->refresh_only) {
+                    /* Stale-refresh (#68): nobody is waiting — just cache below.
+                     * Only the upstream RTT is a real latency measurement here. */
+                    hist_record(&s_h_fwd_rtt, t_ureply - ue->upstream_us);
                 } else {
-                    sendto(csock, rx, rlen, 0,
-                           (sockaddr *)&ue->client_addr, sizeof(ue->client_addr));
+                    if (ue->via_tcp) {
+                        /* Deliver over the TCP conn that asked — if it's still the
+                         * same connection (gen match) and still waiting. A closed
+                         * conn just means we cache the answer for the retry. */
+                        if (s_tcp.fd != -1 && s_tcp.awaiting && ue->tcp_gen == s_tcp.gen) {
+                            if (truncated)
+                                ESP_LOGW(TAG, "upstream reply exceeded %d B — relayed TC over TCP",
+                                         (int)sizeof(rx));
+                            tcp_send_dns(s_tcp.fd, rx, rlen);
+                            tcp_conn_close();
+                        }
+                    } else {
+                        sendto(csock, rx, rlen, 0,
+                               (sockaddr *)&ue->client_addr, sizeof(ue->client_addr));
+                    }
+                    int64_t t_csent = esp_timer_get_time();
+                    /* Latency split: (a) recv→upstream-send, (b) upstream RTT,
+                     * (c) upstream-recv→client-send. Parity overhead = (a)+(c). */
+                    hist_record(&s_h_fwd_rtt,    t_ureply - ue->upstream_us);
+                    hist_record(&s_h_fwd_ourovh, (ue->upstream_us - ue->recv_us) + (t_csent - t_ureply));
+                    hist_record(&s_h_fwd_total,  t_csent - ue->recv_us);
                 }
-                int64_t t_csent = esp_timer_get_time();
-                /* Latency split: (a) recv→upstream-send, (b) upstream RTT,
-                 * (c) upstream-recv→client-send. Parity overhead = (a)+(c). */
-                hist_record(&s_h_fwd_rtt,    t_ureply - ue->upstream_us);
-                hist_record(&s_h_fwd_ourovh, (ue->upstream_us - ue->recv_us) + (t_csent - t_ureply));
-                hist_record(&s_h_fwd_total,  t_csent - ue->recv_us);
 
                 /* Forward cache: stash the response so a repeat identical query
                  * is answered locally. Only NOERROR/NXDOMAIN; TTL from the RRs
@@ -768,6 +828,46 @@ void DnsSinkServer::run_loop()
                         goto forward;
                     }
                     continue;
+                }
+
+                /* ── serve-stale (#68): replay an expired allowed entry now,
+                 * refresh it upstream in the background. Skipped when DoT is
+                 * on: the refresh would either leak the qname to plaintext
+                 * UDP or block the task in TLS — the DoT worker (C2) unifies
+                 * this. Same reason the L2 path stays fresh-only: its miss
+                 * falls through to here at ~1.8 ms, still invisible. */
+                if (!dot_is_enabled()) {
+                    CacheEntry *se = cache_lookup_stale(h, qtype, now_ms);
+                    if (se && se->resp_len <= (int)sizeof(tx)) {
+                        memcpy(tx, se->resp, se->resp_len);
+                        tx[0] = rx[0]; tx[1] = rx[1];
+                        rewrite_answer_ttls(tx, se->resp_len, STALE_TTL_S);
+                        sendto(csock, tx, se->resp_len, 0, (sockaddr *)&client_addr, clen);
+                        s_cnt_stale++;
+                        hist_record(&s_h_cached, esp_timer_get_time() - t_recv);
+                        if (now_ms >= se->refresh_after_ms) {
+                            se->refresh_after_ms = now_ms + UPSTREAM_TIMEOUT_MS;
+                            uint16_t our_txid;
+                            UpstreamEntry *ue = upstream_alloc(&our_txid);
+                            if (ue) {
+                                ue->client_txid  = ntohs(hdr->id);   /* unused: no deliveree */
+                                ue->sent_ms      = (uint32_t)now_ms;
+                                ue->recv_us      = t_recv;
+                                ue->qhash        = h;
+                                ue->qtype        = qtype;
+                                ue->refresh_only = true;
+                                hdr->id = htons(our_txid);
+                                upstream_addr.sin_addr.s_addr =
+                                    _upstream_addr.load(std::memory_order_acquire);
+                                ue->upstream_us = esp_timer_get_time();
+                                sendto(usock, rx, rlen, 0,
+                                       (sockaddr *)&upstream_addr, sizeof(upstream_addr));
+                            } else {
+                                se->refresh_after_ms = 0;  /* table full — retry next hit */
+                            }
+                        }
+                        continue;
+                    }
                 }
 
                 /* ── DNS rewrite check (#12): local zone / domain→IP ── */
@@ -1019,7 +1119,7 @@ extern "C" uint32_t dns_sink_l2_cached(void);
 
 static void do_metrics_reset(void)
 {
-    s_cnt_total = s_cnt_blocked = s_cnt_forwarded = s_cnt_tcp = 0;
+    s_cnt_total = s_cnt_blocked = s_cnt_forwarded = s_cnt_tcp = s_cnt_stale = 0;
     s_cnt_drop_table = s_cnt_upstream_to = s_cnt_cache_probe = s_cnt_cache_hit = 0;
     memset(&s_h_blocked,    0, sizeof(s_h_blocked));
     memset(&s_h_cached,     0, sizeof(s_h_cached));
@@ -1053,6 +1153,7 @@ int dns_server_metrics_json(char *out, size_t cap)
         "\"tcp_queries\":%" PRIu32 ","
         "\"l2_blocked\":%" PRIu32 ",\"l2_cached\":%" PRIu32 ","
         "\"cache_probes\":%" PRIu32 ",\"cache_hits\":%" PRIu32 ",\"cache_hit_rate\":%.1f,"
+        "\"stale_served\":%" PRIu32 ","
         "\"dropped\":{\"table_full\":%" PRIu32 "},\"upstream_timeouts\":%" PRIu32 ","
         "\"upstream_inflight\":%d,\"upstream_max\":%d,"
         "\"blocklist_count\":%" PRIu32 ",\"blocklist_loading\":%s,"
@@ -1062,6 +1163,7 @@ int dns_server_metrics_json(char *out, size_t cap)
         s_cnt_tcp,
         dns_sink_l2_blocked(), dns_sink_l2_cached(),
         probes, hits, hitrate,
+        s_cnt_stale,
         s_cnt_drop_table, s_cnt_upstream_to,
         upstream_inflight(), UPSTREAM_TABLE_SIZE,
         blocklist_domain_count(), blocklist_is_loading() ? "true" : "false",
