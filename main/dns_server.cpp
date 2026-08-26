@@ -45,6 +45,12 @@ static uint32_t s_cnt_cache_hit    = 0;  /* result-cache hits */
 static uint32_t s_cnt_stale        = 0;  /* serve-stale replays (#68) */
 static uint32_t s_cnt_coalesced    = 0;  /* upstream queries avoided by single-flight (#76):
                                             waiters attached + refreshes suppressed */
+static uint32_t s_cnt_hedges_sent  = 0;  /* hedged retransmits fired (#69) */
+static uint32_t s_cnt_hedged_done  = 0;  /* flights completed after a hedge went out (#69).
+                                            NOT "hedge wins": both copies carry the same
+                                            txid, so which packet answered is unknowable
+                                            by construction — rescues and wasted hedges
+                                            count alike */
 static TaskHandle_t      s_dns_task_handle  = nullptr;
 
 static inline int hist_bucket(uint32_t us)
@@ -537,6 +543,11 @@ struct UpstreamEntry {
     bool             via_tcp;        /* reply goes to the TCP conn, not client_addr */
     bool             refresh_only;   /* stale-refresh (#68): cache the reply, deliver to no one */
     uint8_t          n_wait;         /* coalesced waiters (#76) */
+    bool             hedged;         /* (#69) retransmit already fired — at most one per flight */
+    uint16_t         hedge_qlen;     /* (#69) stashed wire bytes in s_hedge_q; 0 = not
+                                        hedge-eligible (refresh_only, DoT flight, oversize
+                                        query, or no stash RAM) */
+    uint32_t         hedge_deadline_ms; /* (#69) absolute esp_timer ms; compared wrap-safe */
     uint32_t         env_hash;       /* (#76) the forwarded query's reply-shaping envelope —
                                         see query_env_hash; unset on refresh_only entries */
     uint32_t         tcp_gen;        /* s_tcp.gen at forward time — stale-conn detector */
@@ -600,6 +611,12 @@ static UpstreamEntry *upstream_alloc(uint16_t *our_txid_out)
             s_upstream[i].refresh_only = false;
             s_upstream[i].n_wait       = 0;   /* (#76) a recycled slot must not
                                                  fan out to its predecessor's waiters */
+            s_upstream[i].hedged       = false; /* (#69) hedge state is per-flight: a stale
+                                                   flag would suppress this flight's hedge,
+                                                   a stale deadline+qlen would retransmit
+                                                   the predecessor's question */
+            s_upstream[i].hedge_qlen   = 0;
+            s_upstream[i].hedge_deadline_ms = 0;
             *our_txid_out = t;
             return &s_upstream[i];
         }
@@ -707,6 +724,78 @@ static int upstream_inflight(void)
     int n = 0;
     for (int i = 0; i < UPSTREAM_TABLE_SIZE; i++) if (s_upstream[i].in_use) n++;
     return n;
+}
+
+/* ── Hedged upstream retransmit (#69) ────────────────────────────── */
+/* A lost upstream UDP datagram used to cost the full 3 s eviction unless the
+ * client happened to retry — 104 such timeouts measured, every one masked by
+ * serve-stale (#68), which is why nobody noticed. Once a flight has outlived
+ * the observed p95 of upstream RTT, retransmit the same bytes once and keep
+ * waiting. The hedge goes to the SAME upstream by necessity, not preference:
+ * the #24 source-address filter in the reply drain rejects any datagram not
+ * from _upstream_addr, so a hedge aimed at a second resolver would have its
+ * reply silently discarded unless the anti-spoofing surface were widened —
+ * which is why true dual-WAN racing stays a stretch goal. A same-upstream
+ * hedge is a retransmit: the right medicine for packet loss (the observed
+ * failure), useless against a wedged resolver.
+ *
+ * The stash lives in PSRAM (64 x 512 B = 32 KB): #76 just spent 8 KB of
+ * internal .bss and left heap_free at ~35 KB, while psram_free sits at
+ * ~1.49 MB. Allocation failure disables hedging and nothing else. */
+static constexpr int HEDGE_QMAX = 512;   /* queries are question-sized (cf. DOT_REQ_MAX);
+                                            anything bigger simply is not hedged */
+static uint8_t *s_hedge_q = nullptr;     /* dns_task-private, like s_upstream — no lock */
+
+/* Delay calibration. hist_pctl returns a bucket's UPPER EDGE, a power of two
+ * in MICROSECONDS, while sent_ms and every deadline in this file are
+ * MILLISECONDS — the conversion happens exactly once, below, in a variable
+ * named for its unit. The result is quantized (…16, 32, 65, 131, 262 ms…),
+ * not precise; the clamps bound that coarseness.
+ *   - Floor: below the network's own jitter a hedge fires on healthy tail
+ *     traffic and doubles upstream load for no rescue; on an upstream fast
+ *     enough to hit the floor, anything slower than it is loss-shaped anyway.
+ *   - Ceiling: the sweep can fire up to one select() tick (100 ms) late and
+ *     eviction still measures its 3 s from the ORIGINAL sent_ms, so this cap
+ *     leaves the hedge reply at least 3000 - 1500 - 100 = 1400 ms to land.
+ *   - Sample gate: Hist carries a count field; below ~64 samples one straggler
+ *     moves p95 a whole bucket (and hist_pctl degenerates toward 0 at tiny
+ *     counts), so a fixed default holds until the histogram has substance.
+ *     250 ms sits well above any healthy p95 seen on this deployment while
+ *     still rescuing >90% of the 3 s budget. */
+static constexpr uint32_t HEDGE_DELAY_DEFAULT_MS = 250;
+static constexpr uint32_t HEDGE_DELAY_MIN_MS     = 25;
+static constexpr uint32_t HEDGE_DELAY_MAX_MS     = 1500;
+static constexpr uint32_t HEDGE_MIN_SAMPLES      = 64;
+/* Above 3/4 occupancy the table is already reporting systemic trouble — a
+ * query storm or a dead upstream — and doubling outbound packets can only
+ * amplify exactly then, so hedging stops before it can. */
+static constexpr int      HEDGE_INFLIGHT_MAX     = (UPSTREAM_TABLE_SIZE * 3) / 4;
+
+static uint32_t hedge_delay_ms(void)
+{
+    if (s_h_fwd_rtt.count < HEDGE_MIN_SAMPLES) return HEDGE_DELAY_DEFAULT_MS;
+    uint32_t p95_us   = hist_pctl(&s_h_fwd_rtt, 0.95);   /* MICROSECONDS */
+    uint32_t delay_ms = p95_us / 1000u;                  /* µs → ms, the one conversion */
+    if (delay_ms < HEDGE_DELAY_MIN_MS) delay_ms = HEDGE_DELAY_MIN_MS;
+    if (delay_ms > HEDGE_DELAY_MAX_MS) delay_ms = HEDGE_DELAY_MAX_MS;
+    return delay_ms;
+}
+
+/* Arm a flight for hedging. Called ONLY from the plain-UDP forward branches,
+ * AFTER the txid rewrite, so the retransmit is a byte-identical copy of what
+ * already went out — no new txid is minted. Both copies therefore resolve to
+ * the same table entry: if both come back, the first reply frees the slot and
+ * the second finds no entry via upstream_find() and is dropped (the `if (!ue)
+ * return` at the top of process_reply). refresh_only entries never get here —
+ * nobody is waiting on one, so rescuing it buys nothing and #68's refresh
+ * gate simply re-arms on the next stale hit. DoT flights never get here
+ * either (see the sweep in run_loop for why). */
+static void hedge_stash(UpstreamEntry *ue, const uint8_t *q, int qlen, uint32_t now_ms)
+{
+    if (!s_hedge_q || qlen <= 0 || qlen > HEDGE_QMAX) return;
+    memcpy(s_hedge_q + (size_t)(ue - s_upstream) * HEDGE_QMAX, q, (size_t)qlen);
+    ue->hedge_qlen        = (uint16_t)qlen;
+    ue->hedge_deadline_ms = now_ms + hedge_delay_ms();
 }
 
 /* ── DNS response builders ───────────────────────────────────────── */
@@ -902,6 +991,17 @@ void DnsSinkServer::run_loop()
              CACHE_SLOTS, (int)sizeof(CacheEntry),
              (unsigned)(CACHE_SLOTS * sizeof(CacheEntry) / 1024));
 
+    /* #69 hedge stash: same shape as the forward cache above — PSRAM, one
+     * boot-time allocation, dns_task-private. Failure is deliberately
+     * NON-fatal, unlike the cache: hedging quietly disables itself (every
+     * hedge_qlen stays 0) and every other path behaves exactly as before.
+     * Guarded so a task restart re-entering run_loop does not leak. */
+    if (!s_hedge_q)
+        s_hedge_q = (uint8_t *)heap_caps_calloc(UPSTREAM_TABLE_SIZE, HEDGE_QMAX,
+                                                MALLOC_CAP_SPIRAM);
+    if (!s_hedge_q)
+        ESP_LOGW(TAG, "hedge stash alloc failed — hedged retransmits disabled (#69)");
+
     cache_load_sd();   /* #79: restore the previous working set, all stale */
 
     /* ── Open client socket ─────────────────────────────────────── */
@@ -1070,6 +1170,7 @@ void DnsSinkServer::run_loop()
             if (!truncated && (rcode == 0 || rcode == 3))
                 cache_store_resp(ue->qhash, ue->qtype, pkt, plen,
                                  dns_resp_min_ttl(pkt, plen, 30), now_ms_);
+            if (ue->hedged) s_cnt_hedged_done++;   /* (#69) see the counter's caveat */
             ue->in_use = false;
         };
 
@@ -1133,6 +1234,45 @@ void DnsSinkServer::run_loop()
                                (sockaddr *)&upstream_addr, sizeof(upstream_addr));
                         ESP_LOGW(TAG, "DoT failed — query re-sent over plain UDP");
                     }
+                }
+            }
+
+            /* ── Hedged retransmits (#69): flights past their p95 deadline ──
+             * Deliberately AFTER the reply drains rather than literally beside
+             * upstream_evict_expired(): any reply that was already sitting in
+             * the socket buffer at wakeup has freed its slot by now, so a
+             * query whose answer is in hand can never trigger a retransmit.
+             * The deadline is still checked only once per select() wake, so a
+             * hedge fires 0-100 ms late; accepted, because the delay is
+             * already quantized to power-of-two bucket edges and shortening
+             * the tick would tax every idle wake to speed up only the rare
+             * loss path (the ceiling arithmetic at HEDGE_DELAY_MAX_MS budgets
+             * for the lateness). The dot_is_enabled() gate here, paired with
+             * the one at stash time, makes the plaintext story one sentence:
+             * a hedge is only ever sent while DoT is off, for a flight that
+             * was forwarded while DoT was off. Hedging via a second
+             * dot_enqueue would be pointless anyway: DoT rides TCP, where
+             * datagram loss — the failure hedging targets — does not exist,
+             * and the single worker session would serialize the copy behind
+             * the very request it is meant to rescue. sent_ms and upstream_us
+             * stay untouched: eviction keeps measuring its 3 s from the
+             * original send, and forwarded_rtt keeps measuring client-visible
+             * latency — a hedge-rescued query really did take that long,
+             * which is what keeps the p95 delay self-limiting. */
+            if (s_hedge_q && !dot_is_enabled() &&
+                upstream_inflight() < HEDGE_INFLIGHT_MAX) {
+                for (int i = 0; i < UPSTREAM_TABLE_SIZE; i++) {
+                    UpstreamEntry *he = &s_upstream[i];
+                    if (!he->in_use || he->hedged || he->hedge_qlen == 0) continue;
+                    if ((int32_t)((uint32_t)now_ms - he->hedge_deadline_ms) < 0)
+                        continue;   /* wrap-safe, like eviction's subtraction */
+                    upstream_addr.sin_addr.s_addr =
+                        _upstream_addr.load(std::memory_order_acquire);
+                    sendto(usock, s_hedge_q + (size_t)i * HEDGE_QMAX,
+                           he->hedge_qlen, 0,
+                           (sockaddr *)&upstream_addr, sizeof(upstream_addr));
+                    he->hedged = true;
+                    s_cnt_hedges_sent++;
                 }
             }
 
@@ -1322,6 +1462,14 @@ void DnsSinkServer::run_loop()
                         upstream_addr.sin_addr.s_addr = _upstream_addr.load(std::memory_order_acquire);
                         sendto(usock, rx, rlen, 0,
                                (sockaddr *)&upstream_addr, sizeof(upstream_addr));
+                        /* (#69) Arm the hedge only when DoT is OFF outright.
+                         * Reaching this branch with DoT on means its queue
+                         * overflowed and this flight fell back to plain UDP —
+                         * a system already under DoT pressure, where adding
+                         * retransmits is the wrong reflex, and skipping keeps
+                         * the no-plaintext-hedge-under-DoT proof one line. */
+                        if (!dot_is_enabled())
+                            hedge_stash(ue, rx, rlen, (uint32_t)now_ms);
                     }
                     s_cnt_forwarded++;
                 }
@@ -1453,6 +1601,14 @@ void DnsSinkServer::run_loop()
                                             _upstream_addr.load(std::memory_order_acquire);
                                         sendto(usock, q, mlen, 0,
                                                (sockaddr *)&upstream_addr, sizeof(upstream_addr));
+                                        /* (#69) same DoT gate as the UDP path;
+                                         * a TCP-origin flight still goes
+                                         * upstream over UDP, so it hedges the
+                                         * same way. mlen may exceed HEDGE_QMAX
+                                         * (TCP_QUERY_MAX is 768) — hedge_stash
+                                         * then leaves the flight un-hedged. */
+                                        if (!dot_is_enabled())
+                                            hedge_stash(ue, q, mlen, (uint32_t)now_ms);
                                     }
                                     s_cnt_forwarded++;
                                     s_tcp.awaiting = true;
@@ -1494,6 +1650,10 @@ static void do_metrics_reset(void)
     s_cnt_total = s_cnt_blocked = s_cnt_forwarded = s_cnt_tcp = s_cnt_stale = 0;
     s_cnt_drop_table = s_cnt_upstream_to = s_cnt_cache_probe = s_cnt_cache_hit = 0;
     s_cnt_coalesced = 0;
+    s_cnt_hedges_sent = s_cnt_hedged_done = 0;   /* (#69); note the reset also empties
+                                                    s_h_fwd_rtt, so the hedge delay falls
+                                                    back to HEDGE_DELAY_DEFAULT_MS until
+                                                    the p95 is re-learned — intended */
     memset(&s_h_blocked,    0, sizeof(s_h_blocked));
     memset(&s_h_cached,     0, sizeof(s_h_cached));
     memset(&s_h_fwd_total,  0, sizeof(s_h_fwd_total));
@@ -1538,6 +1698,7 @@ int dns_server_metrics_json(char *out, size_t cap)
         "\"cache_probes\":%" PRIu32 ",\"cache_hits\":%" PRIu32 ",\"cache_hit_rate\":%.1f,"
         "\"stale_served\":%" PRIu32 ","
         "\"coalesced\":%" PRIu32 ","
+        "\"hedges_sent\":%" PRIu32 ",\"hedged_completions\":%" PRIu32 ","
         "\"dropped\":{\"table_full\":%" PRIu32 "},\"upstream_timeouts\":%" PRIu32 ","
         "\"upstream_inflight\":%d,\"upstream_max\":%d,"
         "\"blocklist_count\":%" PRIu32 ",\"blocklist_loading\":%s,"
@@ -1550,6 +1711,7 @@ int dns_server_metrics_json(char *out, size_t cap)
         probes, hits, hitrate,
         s_cnt_stale,
         s_cnt_coalesced,
+        s_cnt_hedges_sent, s_cnt_hedged_done,
         s_cnt_drop_table, s_cnt_upstream_to,
         upstream_inflight(), UPSTREAM_TABLE_SIZE,
         blocklist_domain_count(), blocklist_is_loading() ? "true" : "false",
