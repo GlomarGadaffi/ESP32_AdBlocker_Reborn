@@ -1676,6 +1676,11 @@ int dns_server_metrics_json(char *out, size_t cap)
     float hitrate   = probes ? (100.0f * (float)hits / (float)probes) : 0.0f;
 
     size_t free_int  = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    /* Largest CONTIGUOUS internal block. heap_free alone hid a live failure:
+     * mbedtls_ssl_setup() wants one ~16.9 KB run for its in_buf, so a fetch can
+     * die with PSA_ERROR_INSUFFICIENT_MEMORY while heap_free still reads a
+     * comfortable ~38 KB. The total is not the number that decides. */
+    size_t big_int   = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
     size_t free_psr  = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
     UBaseType_t hwm  = s_dns_task_handle ? uxTaskGetStackHighWaterMark(s_dns_task_handle) : 0;
 
@@ -1702,7 +1707,7 @@ int dns_server_metrics_json(char *out, size_t cap)
         "\"dropped\":{\"table_full\":%" PRIu32 "},\"upstream_timeouts\":%" PRIu32 ","
         "\"upstream_inflight\":%d,\"upstream_max\":%d,"
         "\"blocklist_count\":%" PRIu32 ",\"blocklist_loading\":%s,"
-        "\"heap_free\":%u,\"psram_free\":%u,\"dns_task_stack_hwm\":%u,",
+        "\"heap_free\":%u,\"heap_largest\":%u,\"psram_free\":%u,\"dns_task_stack_hwm\":%u,",
         upstream_s,
         (long long)(esp_timer_get_time() / 1000000),
         s_cnt_total, s_cnt_blocked, s_cnt_forwarded,
@@ -1715,7 +1720,7 @@ int dns_server_metrics_json(char *out, size_t cap)
         s_cnt_drop_table, s_cnt_upstream_to,
         upstream_inflight(), UPSTREAM_TABLE_SIZE,
         blocklist_domain_count(), blocklist_is_loading() ? "true" : "false",
-        (unsigned)free_int, (unsigned)free_psr, (unsigned)hwm);
+        (unsigned)free_int, (unsigned)big_int, (unsigned)free_psr, (unsigned)hwm);
 
     struct { const char *name; const Hist *h; } cats[] = {
         {"blocked",          &s_h_blocked},
