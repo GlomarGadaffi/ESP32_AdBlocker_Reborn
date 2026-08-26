@@ -135,6 +135,13 @@ static CacheEntry *s_cache = nullptr; /* CACHE_SLOTS entries in PSRAM */
  * own cache_lookup() needs no seqlock — it never races itself. */
 static std::atomic<uint32_t> s_cache_seq{0};
 
+/* Live upstream address, published for /metrics (#80). The forwarding path
+ * reads DnsSinkServer::_upstream_addr; this mirrors it so the httpd task can
+ * report the value WITHOUT touching _upstream_ip, which set_upstream() writes
+ * from other tasks and would be a torn read. Updated at exactly the two sites
+ * that store _upstream_addr - keep them together. */
+static std::atomic<uint32_t> s_upstream_addr_pub{0};
+
 static inline void cache_write_begin(void)
 {
     s_cache_seq.store(s_cache_seq.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
@@ -742,6 +749,7 @@ void DnsSinkServer::set_upstream(const char *upstream_ip) {
     if (!inet_aton(upstream_ip, &a)) return;
     snprintf(_upstream_ip, sizeof(_upstream_ip), "%s", upstream_ip);
     _upstream_addr.store(a.s_addr, std::memory_order_release);
+    s_upstream_addr_pub.store(a.s_addr, std::memory_order_release);   /* #80 */
     ESP_LOGI(TAG, "Upstream re-pointed to %s", _upstream_ip);
 }
 
@@ -831,6 +839,7 @@ void DnsSinkServer::run_loop()
         upstream_addr.sin_port   = htons(UPSTREAM_PORT);
         inet_aton(_upstream_ip, &upstream_addr.sin_addr);
         _upstream_addr.store(upstream_addr.sin_addr.s_addr, std::memory_order_release);
+        s_upstream_addr_pub.store(upstream_addr.sin_addr.s_addr, std::memory_order_release); /* #80 */
 
         /* ── Open TCP/53 listener (RFC 7766) ────────────────────── */
         lsock = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
@@ -1325,8 +1334,18 @@ int dns_server_metrics_json(char *out, size_t cap)
     size_t free_psr  = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
     UBaseType_t hwm  = s_dns_task_handle ? uxTaskGetStackHighWaterMark(s_dns_task_handle) : 0;
 
+    /* #80: the resolver we are actually forwarding to. Previously unobservable
+     * anywhere - no metric, no UI - which is why a boot-time misselection went
+     * unnoticed. Network byte order, so the low byte is the first octet. */
+    uint32_t ua = s_upstream_addr_pub.load(std::memory_order_acquire);
+    char upstream_s[16];
+    snprintf(upstream_s, sizeof(upstream_s), "%u.%u.%u.%u",
+             (unsigned)(ua & 0xFFu), (unsigned)((ua >> 8) & 0xFFu),
+             (unsigned)((ua >> 16) & 0xFFu), (unsigned)((ua >> 24) & 0xFFu));
+
     int n = snprintf(out, cap,
         "{"
+        "\"upstream\":\"%s\","
         "\"uptime_s\":%lld,"
         "\"queries_total\":%" PRIu32 ",\"blocked\":%" PRIu32 ",\"forwarded\":%" PRIu32 ","
         "\"tcp_queries\":%" PRIu32 ","
@@ -1337,6 +1356,7 @@ int dns_server_metrics_json(char *out, size_t cap)
         "\"upstream_inflight\":%d,\"upstream_max\":%d,"
         "\"blocklist_count\":%" PRIu32 ",\"blocklist_loading\":%s,"
         "\"heap_free\":%u,\"psram_free\":%u,\"dns_task_stack_hwm\":%u,",
+        upstream_s,
         (long long)(esp_timer_get_time() / 1000000),
         s_cnt_total, s_cnt_blocked, s_cnt_forwarded,
         s_cnt_tcp,

@@ -113,6 +113,11 @@ extern "C" void dns_sink_trigger_reload(void)
 #define NVS_KEY_UPIF "up_if"
 static char s_upstream_iface[8] = "eth";   /* "eth" or "wifi" */
 
+/* #80: how long to let the SELECTED upstream interface finish DHCP before
+ * giving up and starting on the fallback resolver. Long enough for a normal
+ * lease, short enough that a cable-out boot is not visibly stalled. */
+#define UPSTREAM_IFACE_WAIT_MS 5000
+
 extern "C" bool dns_sink_wifi_built(void)
 {
 #if CONFIG_ADBLOCK_NET_WIFI
@@ -154,7 +159,10 @@ static const char *pick_upstream(const char *dns, const char *gw)
     return "1.1.1.1";
 }
 
-static void apply_upstream_iface(void)
+/* Returns the upstream it settled on, so a caller can log the value that is
+ * actually live rather than one it computed separately (#80). Existing callers
+ * ignore the return; nothing else changes for them. */
+static const char *apply_upstream_iface(void)
 {
     const char *upstream = pick_upstream(s_eth_dns, s_gw);
 #if CONFIG_ADBLOCK_NET_WIFI
@@ -162,6 +170,7 @@ static void apply_upstream_iface(void)
         upstream = pick_upstream(s_wifi_dns, s_wifi_gw);
 #endif
     s_dns.set_upstream(upstream);
+    return upstream;
 }
 
 /* Called from web_ui.cpp POST /net/upstream. Returns false on an invalid or
@@ -1077,6 +1086,31 @@ extern "C" void app_main(void)
 
     upstream_iface_init_nvs();
 
+#if CONFIG_ADBLOCK_NET_WIFI
+    /* #80: the wait above returns as soon as EITHER interface has an IP - that
+     * is deliberate, since a cable-out Wi-Fi-only boot is a supported mode, not
+     * just a transient. But it means a fast Wi-Fi lease can let us proceed
+     * while the interface we actually egress through is still waiting on DHCP,
+     * which made the banner below report a fallback resolver and advertise the
+     * wrong LAN IP. Give the SELECTED interface a bounded second chance; a
+     * genuinely absent link still boots, it just says so out loud. */
+    {
+        const EventBits_t want = (strcmp(s_upstream_iface, "wifi") == 0)
+                               ? WIFI_GOT_IP_BIT : ETH_GOT_IP_BIT;
+        if (!(xEventGroupGetBits(s_eth_eg) & want)) {
+            ESP_LOGI(TAG, "Upstream interface (%s) has no lease yet - waiting up to %d s",
+                     s_upstream_iface, UPSTREAM_IFACE_WAIT_MS / 1000);
+            EventBits_t got = xEventGroupWaitBits(s_eth_eg, want, pdFALSE, pdFALSE,
+                                                  pdMS_TO_TICKS(UPSTREAM_IFACE_WAIT_MS));
+            if (!(got & want))
+                ESP_LOGW(TAG, "Upstream interface (%s) still has no lease after %d s - "
+                              "starting on the fallback resolver; it re-points "
+                              "automatically when DHCP lands",
+                         s_upstream_iface, UPSTREAM_IFACE_WAIT_MS / 1000);
+        }
+    }
+#endif
+
     /* (raw W5500 TX floor measured at ~400us/frame, 2497fps — bus has ~5x
      *  headroom over our ~527qps; the gap is the lwIP per-query path.) */
 
@@ -1106,15 +1140,24 @@ extern "C" void app_main(void)
         ESP_LOGE(TAG, "DNS server start failed — halting");
         for (;;) vTaskDelay(portMAX_DELAY);
     }
+    /* #80: start() unconditionally overwrites _upstream_ip, so an IP event
+     * landing between the pick_upstream() read above and start() would have its
+     * set_upstream() silently discarded, with nothing left to re-fire it. The
+     * window is microseconds - not the failure we observed - but re-applying
+     * once here makes the final upstream derive from current interface state
+     * regardless of interleaving, and hands the banner the live value instead
+     * of one computed before the task existed. */
     {
-        const char *lan_ip = s_ip[0] ? s_ip :
+        const char *live = apply_upstream_iface();
+
+        const char *lan_ip = "(no IP yet)";
+        const char *lan_if = "";
+        if (s_ip[0]) { lan_ip = s_ip; lan_if = " (Ethernet)"; }
 #if CONFIG_ADBLOCK_NET_WIFI
-                              s_wifi_ip;
-#else
-                              "(no IP yet)";
+        else if (s_wifi_ip[0]) { lan_ip = s_wifi_ip; lan_if = " (Wi-Fi)"; }
 #endif
-        ESP_LOGI(TAG, "DNS sinkhole active (upstream via %s: %s). Point your router's DNS at %s",
-                 s_upstream_iface, upstream, lan_ip);
+        ESP_LOGI(TAG, "DNS sinkhole active (upstream via %s: %s). Point your router's DNS at %s%s",
+                 s_upstream_iface, live, lan_ip, lan_if);
     }
 
     /* Start web UI on port 80 */
