@@ -257,9 +257,20 @@ static esp_err_t handle_status(httpd_req_t *r)
             page_appendf(page, sizeof(page), &n,
                 "<p><small>Clock: <b>%s UTC</b> (NTP synced)</small></p>", tbuf);
         } else {
+            /* #75: not synced no longer means the clock reads 1970 — a floor
+             * from NVS or the build stamp is in place, which is what lets TLS
+             * certificate dates be checked at all this early. Say which,
+             * because "syncing…" alone gave no way to tell a floored box from
+             * one whose TLS is about to fail every handshake. */
+            time_t fl = time(NULL);
+            struct tm tmv; gmtime_r(&fl, &tmv);
+            char fbuf[16]; strftime(fbuf, sizeof(fbuf), "%Y-%m-%d", &tmv);
             page_appendf(page, sizeof(page), &n,
                 "<p><small>Clock: <span class=warn>syncing via NTP…</span> "
-                "(log shows uptime until synced)</small></p>");
+                "running on the <b>%s</b> clock (%s) — good enough for TLS "
+                "certificate dates, not for timestamps, so the log shows "
+                "uptime until synced.</small></p>",
+                timesync_source(), fbuf);
         }
     }
     page_appendf(page, sizeof(page), &n, "</div><div class='tab' id=tab-blocklist>");

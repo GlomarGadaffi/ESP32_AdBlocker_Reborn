@@ -67,6 +67,44 @@ CONFIG_ESP32S3_INSTRUCTION_CACHE_32KB=y
 # — QIO causes a TG0WDT watchdog boot-loop on this board. DIO@80MHz is the
 # hardware ceiling here. Confirmed empirically + in LilyGO's own examples.
 
+# ── TLS certificate validity dates (#75) ─────────────────────────────
+# OFF BY DEFAULT IN ESP-IDF, and that is not a size trade — it is a silent
+# security hole. With MBEDTLS_HAVE_TIME_DATE unset, mbedtls_x509_time_is_past()
+# and _is_future() are compiled as "return 0" (see mbedtls/library/x509.c), so
+# notBefore/notAfter are never read: an EXPIRED certificate verifies fine,
+# forever. The blocklist fetch and DoT both ride the cert bundle, so both were
+# affected.
+#
+# This REQUIRES the #75 clock floor to be in place first: date checking against
+# a clock reading 1970 makes every certificate not-yet-valid and breaks every
+# boot-time TLS handshake. timesync_floor_init() runs before the network does.
+CONFIG_MBEDTLS_HAVE_TIME_DATE=y
+#
+# ...and turning it on REQUIRES turning the cross-signed bundle path off. These
+# two IDF options are mutually exclusive in practice, which is not documented
+# anywhere and cost a full afternoon to find, so the mechanism is recorded here:
+#
+# With CROSS_SIGNED_VERIFY set, esp_crt_bundle installs esp_crt_ca_cb_callback
+# as mbedTLS's CA callback. That callback SYNTHESISES a trust anchor from the
+# bundle (esp_crt_bundle.c) and fills in only ca_istrue, version, subject_raw
+# and the public key - valid_from and valid_to are left as calloc() left them,
+# all zeroes. Zero dates read as 0000-00-00, so the moment date checking is on,
+# mbedtls_x509_time_is_past() flags the anchor MBEDTLS_X509_BADCERT_EXPIRED.
+# esp_crt_verify_callback then bails, because it only rescues a certificate
+# whose ONLY complaint is BADCERT_NOT_TRUSTED. Result: every handshake dies
+# with -0x2700 (X509_CERT_VERIFY_FAILED) no matter how correct the clock or the
+# server's chain. Measured: big.oisd.nl, a perfectly valid Let's Encrypt chain,
+# rejected outright; with the callback off, the same fetch pulls 266422
+# domains.
+#
+# What is lost: path-building around a chain that ends in an EXPIRED
+# cross-signed root (the DST Root CA X3 situation of 2021). That is a real, if
+# narrow, cost. It is worth it, because with dates unchecked the cross-signed
+# feature has nothing to do anyway - an expired cross-sign is invisible to a
+# build that never looks at dates. The two options only ever mattered together,
+# and together they do not work.
+# CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_CROSS_SIGNED_VERIFY is not set
+
 # ── TLS buffers out of internal RAM ──────────────────────────────────
 # Measured on this board: heap_free 35.8 KB but heap_largest only 15.4 KB,
 # while mbedtls_ssl_setup() needs ONE contiguous ~16.5 KB in_buf

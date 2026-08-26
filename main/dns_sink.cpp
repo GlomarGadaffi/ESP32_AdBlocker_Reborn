@@ -813,6 +813,20 @@ static void download_task(void *)
      * sort null-window. The daily-reload timer (or manual /reload) refreshes. */
     bool from_sd = blocklist_load_sd();
     if (!from_sd) {
+        /* #75: this is the first TLS client on a cold boot, and now that
+         * certificate dates are actually checked (CONFIG_MBEDTLS_HAVE_TIME_DATE)
+         * it wants real time, not the floor. The floor is a lower bound and can
+         * be stale — an image flashed months after it was built floors months
+         * back, and a certificate issued since then reads as not-yet-valid.
+         * Waiting a few seconds turns that corner from fail-then-retry into
+         * simply succeeding. Bounded, and NOT fatal: with no NTP reachable at
+         * all we go ahead on the floor, which is exactly what the floor is for.
+         * Only the no-SD-cache path pays this; an SD boot skips the fetch. */
+        if (!timesync_wait_synced(10000))
+            ESP_LOGW(TAG, "Clock still unsynced after 10s — fetching on the %s "
+                          "clock floor; a certificate issued since then will be "
+                          "rejected until NTP lands", timesync_source());
+
         ESP_LOGI(TAG, "No SD cache — downloading blocklist...");
         /* Retry with backoff (#57). blocklist_load() returns the domain count,
          * so 0 means the fetch failed; that used to be discarded, leaving the
@@ -860,6 +874,13 @@ static void download_task(void *)
     const int64_t save_period_us = 20LL * 60 * 1000000;
     int64_t next_save_us = esp_timer_get_time() + save_first_us;
     for (;;) {
+        /* #75: persist the clock as the next boot's floor. Self-rate-limiting
+         * (~10 min, plus once promptly after each sync) and a no-op until NTP
+         * has landed, so calling it every second costs a load and a compare.
+         * It lives here rather than in the SNTP callback because it writes
+         * flash and that callback runs in the tcpip task. */
+        timesync_persist_tick();
+
         int64_t now_us = esp_timer_get_time();
         if (now_us >= next_us) {
             if (timesync_is_synced()) {
@@ -1030,6 +1051,14 @@ extern "C" void app_main(void)
     }
     ESP_ERROR_CHECK(r);
 
+    /* #75: seed the clock from max(last-known-good NVS epoch, build stamp)
+     * BEFORE anything can open a TLS connection. Certificate not-before /
+     * not-after checks read the system clock, and until this ran that clock
+     * said 1970 — the earliest possible point after NVS is the only place this
+     * belongs. It is a floor, not a sync: timesync_is_synced() stays false, so
+     * the query log and web UI still refuse to date anything until NTP lands. */
+    timesync_floor_init();
+
     /* Event loop + netif */
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     ESP_ERROR_CHECK(esp_netif_init());
@@ -1114,6 +1143,16 @@ extern "C" void app_main(void)
     /* (raw W5500 TX floor measured at ~400us/frame, 2497fps — bus has ~5x
      *  headroom over our ~527qps; the gap is the lwIP per-query path.) */
 
+    /* SNTP: get real wall-clock time so the query log carries dated timestamps.
+     * Lightweight built-in lwIP SNTP (one UDP socket). Resolves via the board's
+     * own DHCP DNS, not our sinkhole, so it works even before the blocklist loads.
+     *
+     * #75 moved this up from after web_ui_start(): it only needs an IP and the
+     * DHCP resolver, both of which are true here, and starting it this early
+     * shortens the window in which TLS clients (DoT on the DNS task, the
+     * blocklist fetch) are running on the floor rather than on real time. */
+    timesync_start();
+
     /* Allocate PSRAM ping-pong buffers */
     if (!blocklist_init()) {
         ESP_LOGE(TAG, "PSRAM blocklist init failed — halting");
@@ -1162,11 +1201,6 @@ extern "C" void app_main(void)
 
     /* Start web UI on port 80 */
     web_ui_start(&s_dns);
-
-    /* SNTP: get real wall-clock time so the query log carries dated timestamps.
-     * Lightweight built-in lwIP SNTP (one UDP socket). Resolves via the board's
-     * own DHCP DNS, not our sinkhole, so it works even before the blocklist loads. */
-    timesync_start();
 
     /* mDNS: advertise as esp32adblock.local and expose the HTTP service (#20) */
     if (mdns_init() == ESP_OK) {

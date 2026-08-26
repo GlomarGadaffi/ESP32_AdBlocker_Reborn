@@ -5,6 +5,7 @@
 #include "acl.h"
 #include "dot.h"
 #include "query_log.h"
+#include "timesync.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
@@ -1696,6 +1697,11 @@ int dns_server_metrics_json(char *out, size_t cap)
     int n = snprintf(out, cap,
         "{"
         "\"upstream\":\"%s\","
+        /* #75: how the system clock got its value, and where it stands now.
+         * clock_src is LATCHED at boot - the floor decision is only visible
+         * for the 1-3 s before SNTP lands, which is too short to catch by
+         * polling, and it gates every TLS handshake on the box. */
+        "\"clock\":\"%s\",\"clock_src\":\"%s\","
         "\"uptime_s\":%lld,"
         "\"queries_total\":%" PRIu32 ",\"blocked\":%" PRIu32 ",\"forwarded\":%" PRIu32 ","
         "\"tcp_queries\":%" PRIu32 ","
@@ -1709,6 +1715,7 @@ int dns_server_metrics_json(char *out, size_t cap)
         "\"blocklist_count\":%" PRIu32 ",\"blocklist_loading\":%s,"
         "\"heap_free\":%u,\"heap_largest\":%u,\"psram_free\":%u,\"dns_task_stack_hwm\":%u,",
         upstream_s,
+        timesync_state(), timesync_source(),
         (long long)(esp_timer_get_time() / 1000000),
         s_cnt_total, s_cnt_blocked, s_cnt_forwarded,
         s_cnt_tcp,
