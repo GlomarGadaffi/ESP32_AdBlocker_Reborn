@@ -43,6 +43,8 @@ static uint32_t s_cnt_upstream_to  = 0;  /* upstream timeouts (evicted in_use) *
 static uint32_t s_cnt_cache_probe  = 0;  /* result-cache lookups */
 static uint32_t s_cnt_cache_hit    = 0;  /* result-cache hits */
 static uint32_t s_cnt_stale        = 0;  /* serve-stale replays (#68) */
+static uint32_t s_cnt_coalesced    = 0;  /* upstream queries avoided by single-flight (#76):
+                                            waiters attached + refreshes suppressed */
 static TaskHandle_t      s_dns_task_handle  = nullptr;
 
 static inline int hist_bucket(uint32_t us)
@@ -500,6 +502,28 @@ static uint32_t dns_resp_min_ttl(const uint8_t *pkt, int len, uint32_t deflt)
 }
 
 /* ── Upstream concurrent query table ─────────────────────────────── */
+/* Single-flight coalescing (#76): N identical in-flight misses used to burn N
+ * of the 64 slots, so a client retry loop or a LAN-wide burst on one cold name
+ * exhausted the table and dropped unrelated queries. A duplicate now attaches
+ * to the in-flight entry as a waiter and is answered from its one reply.
+ * Waiters stay in internal RAM (no PSRAM): dns_task walks them on the hot path.
+ * 4 rather than 6 keeps the added .bss at 8 KB. */
+static constexpr int UPSTREAM_WAITERS_MAX = 4;
+/* A join sends nothing upstream and inherits the entry's deadline, so only a
+ * genuinely simultaneous burst may ride one. A client retry IS the recovery
+ * path for a lost upstream datagram — one entry means one packet, and nothing
+ * here retransmits — so a retry (stubs re-ask at ~1s) must still re-probe
+ * upstream on its own slot the way it did before #76, rather than attach to a
+ * flight that is already most of the way to its 3s eviction. */
+static constexpr uint32_t UPSTREAM_JOIN_MAX_AGE_MS = 250;
+struct UpstreamWaiter {
+    struct sockaddr_in client_addr;
+    int64_t          recv_us;        /* this waiter's own arrival — its own latency */
+    uint32_t         tcp_gen;        /* s_tcp.gen when THIS waiter joined, not when
+                                        the entry forwarded — see upstream_join */
+    uint16_t         client_txid;
+    bool             via_tcp;
+};
 struct UpstreamEntry {
     uint16_t         our_txid;
     uint16_t         client_txid;
@@ -512,7 +536,11 @@ struct UpstreamEntry {
     bool             in_use;
     bool             via_tcp;        /* reply goes to the TCP conn, not client_addr */
     bool             refresh_only;   /* stale-refresh (#68): cache the reply, deliver to no one */
+    uint8_t          n_wait;         /* coalesced waiters (#76) */
+    uint32_t         env_hash;       /* (#76) the forwarded query's reply-shaping envelope —
+                                        see query_env_hash; unset on refresh_only entries */
     uint32_t         tcp_gen;        /* s_tcp.gen at forward time — stale-conn detector */
+    UpstreamWaiter   waiters[UPSTREAM_WAITERS_MAX];
 };
 static UpstreamEntry s_upstream[UPSTREAM_TABLE_SIZE];
 
@@ -570,6 +598,8 @@ static UpstreamEntry *upstream_alloc(uint16_t *our_txid_out)
             s_upstream[i].our_txid     = t;
             s_upstream[i].via_tcp      = false;
             s_upstream[i].refresh_only = false;
+            s_upstream[i].n_wait       = 0;   /* (#76) a recycled slot must not
+                                                 fan out to its predecessor's waiters */
             *our_txid_out = t;
             return &s_upstream[i];
         }
@@ -582,6 +612,87 @@ static UpstreamEntry *upstream_find(uint16_t our_txid)
         if (s_upstream[i].in_use && s_upstream[i].our_txid == our_txid)
             return &s_upstream[i];
     return nullptr;
+}
+/* Is a real query for this question already in flight? Used only by #68's
+ * stale-refresh suppression, which asks nothing more than that: any live entry
+ * repopulates the cache slot, so the refresh has nothing left to do. The key is
+ * (qhash, qtype) — identical to the forward cache's key, so a hash collision
+ * mixes answers exactly as it already can there: no new failure class.
+ * refresh_only entries stay excluded — refresh-vs-refresh is already
+ * rate-limited by the caller's own refresh_after_ms gate. A requester looking
+ * for an entry to RIDE wants upstream_find_joinable() below instead: riding
+ * carries obligations to the joiner that mere suppression does not. */
+static UpstreamEntry *upstream_find_inflight(uint32_t qhash, uint16_t qtype)
+{
+    for (int i = 0; i < UPSTREAM_TABLE_SIZE; i++)
+        if (s_upstream[i].in_use && !s_upstream[i].refresh_only &&
+            s_upstream[i].qhash == qhash && s_upstream[i].qtype == qtype)
+            return &s_upstream[i];
+    return nullptr;
+}
+/* (#76) Everything in a query that shapes the reply but is absent from the
+ * (qhash, qtype) key: the header flags (RD/AD/CD) and the additional section
+ * verbatim — the EDNS0 OPT RR with its advertised UDP payload size, the DO
+ * bit, and any options (cookie, ECS). Upstream sizes and shapes its answer
+ * against the query WE forwarded, and the fan-out hands that one packet to
+ * every waiter with only the txid restamped, so two queries may share a flight
+ * only when these bytes match. Without the check a >512 B reply built for an
+ * EDNS0 primary reaches a waiter that advertised nothing above the RFC 1035
+ * 512 B default (RFC 6891 §6.2.5) — a delivery the forward cache could never
+ * make, since cache_store_resp rejects anything over FWD_RESP_MAX. */
+static inline uint32_t query_env_hash(const uint8_t *q, int qlen, int qend)
+{
+    uint32_t seed = DOMAIN_HASH_SEED ^ (((uint32_t)q[2] << 8) | q[3]);
+    return murmur3_32(q + qend, (size_t)(qlen - qend), seed);
+}
+/* The entry a duplicate may actually ride (#76). Three conditions beyond
+ * upstream_find_inflight's, all of which matter only to a requester about to
+ * attach itself — which is why #68's "is anything already in flight" question
+ * keeps using the plainer helper above: a full, old or differently-enveloped
+ * entry still repopulates the cache entry, so the refresh is still redundant.
+ *   - Room in the waiter array. Returning a FULL entry let it shadow every
+ *     joinable one for the same question: both scans start at index 0, so the
+ *     first entry keeps the lowest index for its whole life and every further
+ *     duplicate re-found it, failed to join, and burned a fresh slot — the
+ *     table exhaustion #76 exists to stop, arriving four queries later.
+ *   - Age, so a retry re-probes upstream instead of inheriting a nearly
+ *     expired flight's silence (see UPSTREAM_JOIN_MAX_AGE_MS).
+ *   - A matching reply-shaping envelope (see query_env_hash).
+ * A miss is never a drop: the caller allocates its own slot exactly as it did
+ * before the patch. */
+static UpstreamEntry *upstream_find_joinable(uint32_t qhash, uint16_t qtype,
+                                             uint32_t env_hash, uint32_t now_ms)
+{
+    for (int i = 0; i < UPSTREAM_TABLE_SIZE; i++)
+        if (s_upstream[i].in_use && !s_upstream[i].refresh_only &&
+            s_upstream[i].qhash == qhash && s_upstream[i].qtype == qtype &&
+            s_upstream[i].env_hash == env_hash &&
+            s_upstream[i].n_wait < UPSTREAM_WAITERS_MAX &&
+            (now_ms - s_upstream[i].sent_ms) < UPSTREAM_JOIN_MAX_AGE_MS)
+            return &s_upstream[i];
+    return nullptr;
+}
+/* Attach a requester to an in-flight entry, to be served by the fan-out in
+ * process_reply. False when the waiter array is full — the caller then
+ * allocates a fresh slot exactly as before, so a full array degrades to
+ * today's behaviour and never turns into a drop. tcp_gen is snapshotted here,
+ * at the moment this requester is recorded, so a waiter that joined on a later
+ * connection than the entry's own can never be delivered to the wrong one. */
+static bool upstream_join(UpstreamEntry *ue, uint16_t client_txid,
+                          const struct sockaddr_in *client_addr, int64_t recv_us,
+                          bool via_tcp, uint32_t tcp_gen)
+{
+    if (ue->n_wait >= UPSTREAM_WAITERS_MAX) return false;
+    UpstreamWaiter *w = &ue->waiters[ue->n_wait];
+    if (client_addr) w->client_addr = *client_addr;
+    else             memset(&w->client_addr, 0, sizeof(w->client_addr));
+    w->recv_us     = recv_us;
+    w->tcp_gen     = tcp_gen;
+    w->client_txid = client_txid;
+    w->via_tcp     = via_tcp;
+    ue->n_wait++;
+    s_cnt_coalesced++;
+    return true;
 }
 static void upstream_evict_expired(uint32_t now_ms)
 {
@@ -900,27 +1011,56 @@ void DnsSinkServer::run_loop()
                  * Only the upstream RTT is a real latency measurement here. */
                 hist_record(&s_h_fwd_rtt, t_ureply - ue->upstream_us);
             } else {
-                if (ue->via_tcp) {
-                    /* Deliver over the TCP conn that asked — if it's still the
-                     * same connection (gen match) and still waiting. A closed
-                     * conn just means we cache the answer for the retry. */
-                    if (s_tcp.fd != -1 && s_tcp.awaiting && ue->tcp_gen == s_tcp.gen) {
-                        if (truncated)
-                            ESP_LOGW(TAG, "upstream reply exceeded %d B — relayed TC over TCP",
-                                     (int)sizeof(rx));
-                        tcp_send_dns(s_tcp.fd, pkt, plen);
-                        tcp_conn_close();
+                /* Single-flight fan-out (#76): the requester that caused the
+                 * forward (w == -1) plus every coalesced waiter, all served by
+                 * this one upstream round trip. The txid is stamped per
+                 * deliveree because pkt is the shared rx buffer — one stamp for
+                 * everyone would hand N-1 clients a reply whose ID matches no
+                 * query of theirs, which a conforming resolver discards as
+                 * unsolicited and the failure would look like packet loss. */
+                for (int w = -1; w < (int)ue->n_wait; w++) {
+                    const UpstreamWaiter *wt = (w < 0) ? nullptr : &ue->waiters[w];
+                    uint16_t w_txid = wt ? wt->client_txid : ue->client_txid;
+                    bool     w_tcp  = wt ? wt->via_tcp     : ue->via_tcp;
+                    uint32_t w_gen  = wt ? wt->tcp_gen     : ue->tcp_gen;
+                    int64_t  w_recv = wt ? wt->recv_us     : ue->recv_us;
+                    const struct sockaddr_in *w_addr = wt ? &wt->client_addr
+                                                          : &ue->client_addr;
+                    reinterpret_cast<DnsHeader *>(pkt)->id = htons(w_txid);
+                    if (w_tcp) {
+                        /* Deliver over the TCP conn that asked — if it's still the
+                         * same connection (gen match) and still waiting. A closed
+                         * conn just means we cache the answer for the retry.
+                         * The guard is re-evaluated per deliveree and the close
+                         * lives inside it, which is what makes at most one TCP
+                         * delivery possible: the send clears awaiting and bumps
+                         * gen, so every later TCP deliveree fails the guard. A
+                         * second close would bump gen out from under the NEXT
+                         * connection's in-flight entry and strand its answer. */
+                        if (s_tcp.fd != -1 && s_tcp.awaiting && w_gen == s_tcp.gen) {
+                            if (truncated)
+                                ESP_LOGW(TAG, "upstream reply exceeded %d B — relayed TC over TCP",
+                                         (int)sizeof(rx));
+                            tcp_send_dns(s_tcp.fd, pkt, plen);
+                            tcp_conn_close();
+                        }
+                    } else {
+                        sendto(csock, pkt, plen, 0,
+                               (sockaddr *)w_addr, sizeof(*w_addr));
                     }
-                } else {
-                    sendto(csock, pkt, plen, 0,
-                           (sockaddr *)&ue->client_addr, sizeof(ue->client_addr));
+                    int64_t t_csent = esp_timer_get_time();
+                    /* Latency split: (a) recv→upstream-send, (b) upstream RTT,
+                     * (c) upstream-recv→client-send. Parity overhead = (a)+(c).
+                     * (a) only exists for the requester that caused the forward:
+                     * a waiter arrived after it, so its (a) is negative and would
+                     * only pile up in the ourovh floor bucket (#76). */
+                    if (!wt)
+                        hist_record(&s_h_fwd_ourovh,
+                                    (ue->upstream_us - w_recv) + (t_csent - t_ureply));
+                    hist_record(&s_h_fwd_total, t_csent - w_recv);
                 }
-                int64_t t_csent = esp_timer_get_time();
-                /* Latency split: (a) recv→upstream-send, (b) upstream RTT,
-                 * (c) upstream-recv→client-send. Parity overhead = (a)+(c). */
-                hist_record(&s_h_fwd_rtt,    t_ureply - ue->upstream_us);
-                hist_record(&s_h_fwd_ourovh, (ue->upstream_us - ue->recv_us) + (t_csent - t_ureply));
-                hist_record(&s_h_fwd_total,  t_csent - ue->recv_us);
+                /* One upstream round trip, whatever the number of deliverees. */
+                hist_record(&s_h_fwd_rtt, t_ureply - ue->upstream_us);
             }
 
             /* Forward cache: stash the response so a repeat identical query
@@ -1063,6 +1203,18 @@ void DnsSinkServer::run_loop()
                         hist_record(&s_h_cached, esp_timer_get_time() - t_recv);
                         if (now_ms >= se->refresh_after_ms) {
                             se->refresh_after_ms = now_ms + UPSTREAM_TIMEOUT_MS;
+                            /* Single-flight (#76): a real query for the same
+                             * question is already in flight and its reply
+                             * repopulates this entry, so the refresh has nothing
+                             * left to do — suppress it outright, no slot and no
+                             * packet. The gate above stays armed on purpose:
+                             * unlike the table-full case below there is nothing
+                             * to retry. A refresh has no deliveree, so it never
+                             * becomes a waiter either. */
+                            if (upstream_find_inflight(h, qtype)) {
+                                s_cnt_coalesced++;
+                                continue;
+                            }
                             uint16_t our_txid;
                             UpstreamEntry *ue = upstream_alloc(&our_txid);
                             if (ue) {
@@ -1072,6 +1224,9 @@ void DnsSinkServer::run_loop()
                                 ue->qhash        = h;
                                 ue->qtype        = qtype;
                                 ue->refresh_only = true;
+                                /* env_hash deliberately left unset: a
+                                 * refresh_only entry is never a coalescing
+                                 * target, so nobody can ride its envelope. */
                                 hdr->id = htons(our_txid);
                                 ue->upstream_us = esp_timer_get_time();
                                 if (!(dot_is_enabled() && dot_enqueue(rx, rlen))) {
@@ -1133,6 +1288,17 @@ void DnsSinkServer::run_loop()
                 /* ── forward to upstream: DoT worker if enabled, else UDP ── */
                 forward: {
                     uint16_t our_txid;
+                    /* Single-flight (#76): this exact question may already be in
+                     * flight — ride that reply instead of burning a second slot.
+                     * The simultaneous burst that used to exhaust the table and
+                     * drop unrelated queries now costs one waiter. No joinable
+                     * entry: fall through and allocate normally. */
+                    uint32_t eh = query_env_hash(rx, rlen, qend);
+                    UpstreamEntry *fl = upstream_find_joinable(h, qtype, eh,
+                                                               (uint32_t)now_ms);
+                    if (fl && upstream_join(fl, ntohs(hdr->id), &client_addr,
+                                            t_recv, false, 0))
+                        continue;
                     UpstreamEntry *ue = upstream_alloc(&our_txid);
                     if (!ue) {
                         /* table full — drop this query; client will retry */
@@ -1146,6 +1312,7 @@ void DnsSinkServer::run_loop()
                     ue->recv_us     = t_recv;
                     ue->qhash       = h;
                     ue->qtype       = qtype;
+                    ue->env_hash    = eh;
 
                     /* rewrite txid and forward — read the live upstream address
                      * so an in-flight query batch can straddle a set_upstream() */
@@ -1241,8 +1408,24 @@ void DnsSinkServer::run_loop()
                             } else {
                                 query_log_record(name, qtype, s_tcp.peer_ip, false, false);
                                 uint16_t our_txid;
-                                UpstreamEntry *ue = upstream_alloc(&our_txid);
-                                if (!ue) {
+                                UpstreamEntry *ue = nullptr;
+                                /* Single-flight (#76): ride an identical query
+                                 * already in flight. The waiter snapshots gen
+                                 * now, so it can only ever be delivered to the
+                                 * conn it joined on; awaiting holds that conn
+                                 * open for the fan-out exactly as a real forward
+                                 * does, and the fan-out closes it. If the reply
+                                 * never comes the idle reaper frees the conn,
+                                 * same as an entry that times out today — and
+                                 * the age gate keeps that wait from outliving
+                                 * the entry by more than a fraction of it. */
+                                uint32_t eh = query_env_hash(q, mlen, qend);
+                                UpstreamEntry *fl = upstream_find_joinable(h, qtype, eh,
+                                                                           (uint32_t)now_ms);
+                                if (fl && upstream_join(fl, ntohs(qh->id), nullptr,
+                                                        t_recv, true, s_tcp.gen)) {
+                                    s_tcp.awaiting = true;
+                                } else if (!(ue = upstream_alloc(&our_txid))) {
                                     s_cnt_drop_table++;
                                     /* SERVFAIL: fail fast instead of hanging the conn */
                                     memcpy(tx, q, qend);
@@ -1260,6 +1443,7 @@ void DnsSinkServer::run_loop()
                                     ue->recv_us  = t_recv;
                                     ue->qhash    = h;
                                     ue->qtype    = qtype;
+                                    ue->env_hash = eh;
                                     ue->via_tcp  = true;
                                     ue->tcp_gen  = s_tcp.gen;
                                     qh->id = htons(our_txid);
@@ -1309,6 +1493,7 @@ static void do_metrics_reset(void)
 {
     s_cnt_total = s_cnt_blocked = s_cnt_forwarded = s_cnt_tcp = s_cnt_stale = 0;
     s_cnt_drop_table = s_cnt_upstream_to = s_cnt_cache_probe = s_cnt_cache_hit = 0;
+    s_cnt_coalesced = 0;
     memset(&s_h_blocked,    0, sizeof(s_h_blocked));
     memset(&s_h_cached,     0, sizeof(s_h_cached));
     memset(&s_h_fwd_total,  0, sizeof(s_h_fwd_total));
@@ -1352,6 +1537,7 @@ int dns_server_metrics_json(char *out, size_t cap)
         "\"l2_blocked\":%" PRIu32 ",\"l2_cached\":%" PRIu32 ","
         "\"cache_probes\":%" PRIu32 ",\"cache_hits\":%" PRIu32 ",\"cache_hit_rate\":%.1f,"
         "\"stale_served\":%" PRIu32 ","
+        "\"coalesced\":%" PRIu32 ","
         "\"dropped\":{\"table_full\":%" PRIu32 "},\"upstream_timeouts\":%" PRIu32 ","
         "\"upstream_inflight\":%d,\"upstream_max\":%d,"
         "\"blocklist_count\":%" PRIu32 ",\"blocklist_loading\":%s,"
@@ -1363,6 +1549,7 @@ int dns_server_metrics_json(char *out, size_t cap)
         dns_sink_l2_blocked(), dns_sink_l2_cached(),
         probes, hits, hitrate,
         s_cnt_stale,
+        s_cnt_coalesced,
         s_cnt_drop_table, s_cnt_upstream_to,
         upstream_inflight(), UPSTREAM_TABLE_SIZE,
         blocklist_domain_count(), blocklist_is_loading() ? "true" : "false",
