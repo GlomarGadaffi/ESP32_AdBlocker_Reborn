@@ -32,6 +32,11 @@ void dns_server_metrics_reset(void);
 extern "C" {
 #endif
 int dns_cache_l2_get(uint32_t qhash, uint16_t qtype, uint8_t *out, int out_cap);
+
+/* Persist the forward cache to /sdcard/fwdcache.bin so a reboot keeps its
+ * learned working set (#79). Blocking SD I/O - call from download_task,
+ * never from dns_task. Not re-entrant (uses a static snapshot buffer). */
+void dns_server_cache_save(void);
 #ifdef __cplusplus
 }
 #endif

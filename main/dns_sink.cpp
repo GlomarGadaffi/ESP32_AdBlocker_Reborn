@@ -840,6 +840,16 @@ static void download_task(void *)
      * schedule later. A manual /reload fires immediately without shifting it. */
     const int64_t interval_us = 4LL * 60 * 60 * 1000000;  /* 4h */
     int64_t next_us = esp_timer_get_time() + interval_us;
+
+    /* Forward-cache warm-boot snapshots (#79). First save at +2min so a
+     * reboot-after-power-blip keeps the working set the box just rebuilt,
+     * then every 20min. Deliberately "now + period" rather than an advancing
+     * absolute deadline: blocklist_load() can block this task for minutes,
+     * and a missed save should simply resume the cadence, not fire the moment
+     * the download returns. */
+    const int64_t save_first_us  =  2LL * 60 * 1000000;
+    const int64_t save_period_us = 20LL * 60 * 1000000;
+    int64_t next_save_us = esp_timer_get_time() + save_first_us;
     for (;;) {
         int64_t now_us = esp_timer_get_time();
         if (now_us >= next_us) {
@@ -861,6 +871,11 @@ static void download_task(void *)
             s_reload_requested = false;
             ESP_LOGI(TAG, "Manual reload...");
             blocklist_load();   /* does not shift the daily deadline */
+            continue;
+        }
+        if (now_us >= next_save_us) {
+            dns_server_cache_save();                                  /* #79 */
+            next_save_us = esp_timer_get_time() + save_period_us;
             continue;
         }
         vTaskDelay(pdMS_TO_TICKS(1000));

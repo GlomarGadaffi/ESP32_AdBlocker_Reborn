@@ -247,6 +247,178 @@ extern "C" int dns_cache_l2_get(uint32_t qhash, uint16_t qtype, uint8_t *out, in
     return len;
 }
 
+/* --- SD warm-boot for the forward cache (#79) -------------------------
+ * TTL deadlines are esp_timer monotonic milliseconds and are meaningless
+ * across a reset, so they are deliberately NOT persisted. Restored entries
+ * come back marked expired-but-inside-the-stale-window, which hands the
+ * whole job to the serve-stale machinery (#68): the first touch of a
+ * remembered domain answers in ~2ms with TTLs clamped to STALE_TTL_S and
+ * fires the normal background refresh. No new delivery path, and the worst
+ * case is exactly what RFC 8767 already permits. */
+#define FWDCACHE_PATH   "/sdcard/fwdcache.bin"
+#define FWDCACHE_TMP    "/sdcard/fwdcache.tmp"
+#define FWDCACHE_MAGIC  0xFDCACE01u
+#define FWDCACHE_HDR_SZ 12   /* magic u32 | count u32 | entry_max u16 | rsv u16 */
+#define FWDCACHE_REC_SZ 8    /* key_hash u32 | qtype u16 | resp_len u16 | resp[] */
+
+/* Explicit little-endian field IO. The struct layouts happen to be
+ * padding-free on ILP32 Xtensa, but an on-disk format should not lean on it. */
+static inline void fc_put_u16(uint8_t *p, uint16_t v)
+{
+    p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8);
+}
+static inline void fc_put_u32(uint8_t *p, uint32_t v)
+{
+    p[0] = (uint8_t)v;         p[1] = (uint8_t)(v >> 8);
+    p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24);
+}
+static inline uint16_t fc_get_u16(const uint8_t *p)
+{
+    return (uint16_t)(p[0] | (p[1] << 8));
+}
+static inline uint32_t fc_get_u32(const uint8_t *p)
+{
+    return (uint32_t)p[0]         | ((uint32_t)p[1] << 8)
+         | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+/* Restore the snapshot. Called from run_loop() immediately after cache_init(),
+ * by which point sd_mount() has already run (dns_sink.cpp mounts the card
+ * before starting this task). A missing file is the normal cold-boot path. */
+static void cache_load_sd(void)
+{
+    FILE *f = fopen(FWDCACHE_PATH, "rb");
+    if (!f) return;
+
+    uint8_t hdr[FWDCACHE_HDR_SZ];
+    if (fread(hdr, 1, sizeof(hdr), f) != sizeof(hdr)) { fclose(f); return; }
+
+    uint32_t magic = fc_get_u32(hdr);
+    uint32_t count = fc_get_u32(hdr + 4);
+    uint16_t emax  = fc_get_u16(hdr + 8);
+    /* count > CACHE_SLOTS is impossible from a good save (at most one record
+     * per slot), so it means corruption or a format change. */
+    if (magic != FWDCACHE_MAGIC || emax != FWD_RESP_MAX || count > CACHE_SLOTS) {
+        ESP_LOGW(TAG, "warm boot: snapshot rejected (magic %08" PRIx32 ", count %" PRIu32
+                      ", entry_max %u)", magic, count, (unsigned)emax);
+        fclose(f);
+        return;
+    }
+
+    /* One seqlock bracket for the entire load. Safe ONLY because this runs at
+     * boot against a freshly calloc-ed cache: an L2 reader seeing the odd
+     * counter bails to lwIP, and there is nothing servable to bail out of yet.
+     * Do NOT reuse this shape for a mid-life reload. */
+    cache_write_begin();
+    uint32_t loaded = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        uint8_t rec[FWDCACHE_REC_SZ];
+        if (fread(rec, 1, sizeof(rec), f) != sizeof(rec)) break;   /* truncated */
+
+        uint32_t h        = fc_get_u32(rec);
+        uint16_t qtype    = fc_get_u16(rec + 4);
+        uint16_t resp_len = fc_get_u16(rec + 6);
+        if (resp_len == 0 || resp_len > FWD_RESP_MAX) break;       /* corrupt */
+
+        CacheEntry *e = &s_cache[(h ^ ((uint32_t)qtype << 1)) & (CACHE_SLOTS - 1)];
+        if (fread(e->resp, 1, resp_len, f) != resp_len) {
+            e->valid = false;      /* partial read - do not leave a torn slot live */
+            break;
+        }
+        e->key_hash         = h;
+        e->qtype            = qtype;
+        e->resp_len         = resp_len;
+        e->blocked          = false;
+        e->valid            = true;
+        e->ttl_deadline_ms  = 1;   /* expired, but inside the STALE_MAX_S window */
+        e->refresh_after_ms = 0;   /* first touch is free to refresh at once */
+        loaded++;
+    }
+    cache_write_end();
+    fclose(f);
+
+    ESP_LOGI(TAG, "warm boot: %" PRIu32 " cached responses loaded stale from SD", loaded);
+}
+
+extern "C" void dns_server_cache_save(void)
+{
+    if (!s_cache) return;
+
+    FILE *f = fopen(FWDCACHE_TMP, "wb");
+    if (!f) { ESP_LOGW(TAG, "cache save: open %s failed (%d)", FWDCACHE_TMP, errno); return; }
+
+    uint8_t hdr[FWDCACHE_HDR_SZ];
+    fc_put_u32(hdr, FWDCACHE_MAGIC);
+    fc_put_u32(hdr + 4, 0);                  /* count patched in at the end */
+    fc_put_u16(hdr + 8, FWD_RESP_MAX);
+    fc_put_u16(hdr + 10, 0);
+    if (fwrite(hdr, 1, sizeof(hdr), f) != sizeof(hdr)) {
+        fclose(f); remove(FWDCACHE_TMP); return;
+    }
+
+    /* This runs in download_task while dns_task may be writing, so each entry
+     * is copied under the same seqlock protocol as dns_cache_l2_get() and
+     * written to SD OUTSIDE the window - an fwrite inside it would race on
+     * essentially every entry. Static buffer: single caller, not re-entrant. */
+    static uint8_t s_snap[FWD_RESP_MAX];
+    const uint64_t now_ms = (uint64_t)(esp_timer_get_time() / 1000);
+    uint32_t saved = 0;
+
+    for (int i = 0; i < CACHE_SLOTS; i++) {
+        CacheEntry *e = &s_cache[i];
+
+        uint32_t s1 = s_cache_seq.load(std::memory_order_relaxed);
+        if (s1 & 1u) continue;                        /* writer mid-update */
+        std::atomic_thread_fence(std::memory_order_acquire);
+
+        if (!e->valid || e->blocked) continue;
+        uint32_t h        = e->key_hash;
+        uint16_t qtype    = e->qtype;
+        uint16_t resp_len = e->resp_len;
+        uint64_t deadline = e->ttl_deadline_ms;
+        if (resp_len == 0 || resp_len > FWD_RESP_MAX) continue;
+        memcpy(s_snap, e->resp, resp_len);
+
+        std::atomic_thread_fence(std::memory_order_acquire);
+        if (s_cache_seq.load(std::memory_order_relaxed) != s1) continue;   /* raced */
+
+        /* Drop entries already past their stale window: restoring one would
+         * serve data older than the STALE_MAX_S contract the runtime enforces
+         * everywhere else. (Not in the written #79 design - added here.) */
+        if (deadline + (uint64_t)STALE_MAX_S * 1000u <= now_ms) continue;
+
+        uint8_t rec[FWDCACHE_REC_SZ];
+        fc_put_u32(rec, h);
+        fc_put_u16(rec + 4, qtype);
+        fc_put_u16(rec + 6, resp_len);
+        if (fwrite(rec, 1, sizeof(rec), f) != sizeof(rec)) break;
+        if (fwrite(s_snap, 1, resp_len, f) != resp_len)     break;
+        saved++;
+    }
+
+    /* Patch the real count in last, so a crash mid-write leaves a tmp file
+     * that either never gets renamed or still reads as count 0. */
+    if (fseek(f, 4, SEEK_SET) == 0) {
+        uint8_t cnt[4];
+        fc_put_u32(cnt, saved);
+        fwrite(cnt, 1, sizeof(cnt), f);
+    }
+    fclose(f);
+
+    /* FatFs f_rename() returns FR_EXIST when the destination exists - unlike
+     * POSIX rename(), and the ESP-IDF vfs_fat_rename() wrapper passes that
+     * straight through. Without this remove(), the FIRST save succeeds and
+     * every save after it fails. Losing the old snapshot in the gap costs one
+     * cold boot, which is exactly the pre-#79 status quo. */
+    remove(FWDCACHE_PATH);
+    if (rename(FWDCACHE_TMP, FWDCACHE_PATH) != 0) {
+        ESP_LOGW(TAG, "cache save: rename failed (%d) - snapshot dropped", errno);
+        remove(FWDCACHE_TMP);
+        return;
+    }
+    ESP_LOGI(TAG, "cache saved: %" PRIu32 " responses to SD", saved);
+}
+
 /* Skip a DNS name (label walk + compression pointer) at *off; advance *off past it.
  * Returns false if the packet is malformed. */
 static bool skip_name(const uint8_t *pkt, int len, int *off)
@@ -610,6 +782,8 @@ void DnsSinkServer::run_loop()
     ESP_LOGI(TAG, "Result cache: %d slots x %d B in PSRAM (%u KB)",
              CACHE_SLOTS, (int)sizeof(CacheEntry),
              (unsigned)(CACHE_SLOTS * sizeof(CacheEntry) / 1024));
+
+    cache_load_sd();   /* #79: restore the previous working set, all stale */
 
     /* ── Open client socket ─────────────────────────────────────── */
     int lsock = -1;   /* TCP/53 listener; created below, -1 = UDP-only */
