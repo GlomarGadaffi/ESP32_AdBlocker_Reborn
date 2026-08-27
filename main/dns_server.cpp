@@ -1714,6 +1714,7 @@ int dns_server_metrics_json(char *out, size_t cap)
         "\"upstream_inflight\":%d,\"upstream_max\":%d,"
         "\"blocklist_count\":%" PRIu32 ",\"blocklist_loading\":%s,"
         "\"blocklist_dropped\":%" PRIu32 ","
+        "\"blocklist_feed_failures\":%" PRIu32 ","
         "\"heap_free\":%u,\"heap_largest\":%u,\"psram_free\":%u,\"dns_task_stack_hwm\":%u,",
         upstream_s,
         timesync_state(), timesync_source(),
@@ -1729,6 +1730,7 @@ int dns_server_metrics_json(char *out, size_t cap)
         upstream_inflight(), UPSTREAM_TABLE_SIZE,
         blocklist_domain_count(), blocklist_is_loading() ? "true" : "false",
         blocklist_dropped_count(),
+        blocklist_feed_failures(),
         (unsigned)free_int, (unsigned)big_int, (unsigned)free_psr, (unsigned)hwm);
 
     struct { const char *name; const Hist *h; } cats[] = {
@@ -1750,5 +1752,15 @@ int dns_server_metrics_json(char *out, size_t cap)
             cats[i].h->max_us, cats[i].h->count);
     }
     if ((size_t)n < cap) n += snprintf(out + n, cap - (size_t)n, "}}");
+    /* F15: n accumulates snprintf's WOULD-BE length, not bytes actually
+     * written. Every append above is guarded (`if ((size_t)n < cap) ...`) so
+     * none of them overflow `out`, but that guard only stops FURTHER growth —
+     * it never pulls n back under cap once an earlier call has already pushed
+     * it there (or past it, from the very first unguarded snprintf() above).
+     * handle_metrics() then does httpd_resp_send(r, json, n) against a fixed
+     * 2048 B buffer, so an unclamped n ships whatever .bss sits after json[]
+     * to an unauthenticated client as unterminated JSON. Unreachable today
+     * (worst case ~1,323 B) but one line of insurance against future growth. */
+    if (n > (int)cap - 1) n = (int)cap - 1;
     return n;
 }

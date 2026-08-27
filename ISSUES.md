@@ -388,9 +388,15 @@ Fix, three parts:
    (`blocklist_dropped`).
 3. **Capacity 780k → 820k** — margin over the measured peak; the +320 KB PSRAM
    came from a measured 1.45 MB free (mbedTLS also allocs there since the TLS
-   fix), leaving ~1.04 MB.
+   fix), leaving ~1.13 MB.
 
 Also removed the UI's suggested `domains/tif.txt` feed: ~2.1M lines, could
-never fit, and would have exercised exactly this silent truncation. The
-`wildcard/` variants (tif.medium ≈ 326k) are 2–8x smaller for identical
-coverage under suffix-walk matching and are what the new presets use.
+never fit, and would have exercised exactly this silent truncation. Two
+different things were previously conflated here (fixed, F12): the
+`domains/` → `wildcard/` switch is a lossless FORMAT change — identical
+coverage under suffix-walk matching, just a smaller encoding of the same
+list — while `tif` → `tif.medium` is a deliberately REDUCED TIER of hagezi's
+TIF feed, not full TIF in a cheaper encoding. The new presets use the
+`wildcard/` variants throughout, and `tif.medium` (≈326k) specifically for
+the threat-intel preset, labeled as "TIF medium" so the distinction is
+visible in the UI.

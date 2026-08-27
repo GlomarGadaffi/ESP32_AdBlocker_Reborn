@@ -51,7 +51,9 @@ appliance — these are all live and verified on hardware:
 * **Multiple blocklist sources** — the built-in OISD primary plus up to four
   extra URL feeds, each NVS-persisted, with one-click presets for the
   [hagezi](https://github.com/hagezi/dns-blocklists) wildcard lists (ad tiers
-  Light through Ultimate, plus the TIF threat-intelligence feed). Extra-list
+  Light through Ultimate, the TIF-medium threat-intelligence tier — a
+  deliberately reduced tier of hagezi's TIF feed, not full TIF, which is too
+  large to fit — and OISD's NSFW adult-content list). Extra-list
   entries are deduplicated against the sorted primary at load time, so
   capacity binds on the *union*, not the sum; entries dropped at capacity are
   counted and surfaced in the UI and `/metrics` (`blocklist_dropped`) instead

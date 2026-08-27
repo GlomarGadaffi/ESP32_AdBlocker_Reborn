@@ -138,6 +138,18 @@ static void page_appendf(char *buf, size_t cap, int *pos, const char *fmt, ...)
     else                    *pos += w;
 }
 
+/* F11: last-resort visible marker for a section skipped because the page
+ * buffer's running low, instead of letting page_appendf's silent clamp (H1)
+ * truncate mid-markup — that presents as dead tabs with no indication why
+ * (#60). Reserves TRUNC_CLOSE_RESERVE so printing the marker itself can never
+ * be the thing that eats the room the final closing markup needs. */
+static constexpr int TRUNC_CLOSE_RESERVE = 128;
+static void page_mark_truncated(char *page, size_t cap, int *n)
+{
+    if (*n < (int)cap - TRUNC_CLOSE_RESERVE)
+        page_appendf(page, cap, n, "<p class=warn>[page truncated — too much config to render]</p>");
+}
+
 static void send_html(httpd_req_t *r, const char *body)
 {
     httpd_resp_set_type(r, "text/html; charset=utf-8");
@@ -153,6 +165,11 @@ static esp_err_t handle_status(httpd_req_t *r)
     uint32_t domains = blocklist_domain_count();
     bool     loading = blocklist_is_loading();
     uint32_t wl_n    = blocklist_whitelist_count();
+    /* F9: hoisted so the Dashboard chip below can reflect degradation, not
+     * just loading state — these were previously only read down in the
+     * Blocklist tab, which the auto-refreshing Dashboard never shows. */
+    uint32_t bl_dropped   = blocklist_dropped_count();
+    uint32_t bl_feed_fail = blocklist_feed_failures();
 
     /* static: avoids stack overflow in httpd task. Sized with headroom for a
      * fully-populated device (whitelist + ACL + rewrites + extra sources all
@@ -221,17 +238,26 @@ static esp_err_t handle_status(httpd_req_t *r)
         "</div>"
         "<div class='tab' id=tab-dashboard>");
     float pct = total > 0 ? 100.0f * (float)blocked / (float)total : 0.0f;
+    /* F9: this chip had a DUPLICATE class attribute (class=val class='%s') —
+     * HTML keeps only the first, so the ok/warn class never actually applied.
+     * Merged into one. It also only ever said "Active": overflow/feed-failure
+     * warnings lived solely on the hidden, never-auto-refreshing Blocklist
+     * tab, so this auto-refreshing Dashboard could show "Active" indefinitely
+     * on a degraded box. Reloading still wins over Degraded — it's the more
+     * urgent, and more likely transient, state. */
+    bool degraded = (bl_dropped > 0) || (bl_feed_fail > 0);
+    const char *status_cls = loading ? "warn" : (degraded ? "warn" : "ok");
+    const char *status_txt = loading ? "Reloading" : (degraded ? "Degraded" : "Active");
     page_appendf(page, sizeof(page), &n,
         "<div class=stats>"
         "<div class=stat><div class=val>%" PRIu32 "</div><div class=lbl>Domains</div></div>"
         "<div class=stat><div class=val>%" PRIu32 "</div><div class=lbl>Queries</div></div>"
         "<div class=stat><div class=val>%" PRIu32 "</div><div class=lbl>Blocked</div></div>"
         "<div class=stat><div class=val>%.1f%%</div><div class=lbl>Block rate</div></div>"
-        "<div class=stat><div class=val class='%s'>%s</div><div class=lbl>Status</div></div>"
+        "<div class=stat><div class='val %s'>%s</div><div class=lbl>Status</div></div>"
         "</div>",
         domains, total, blocked, pct,
-        loading ? "warn" : "ok",
-        loading ? "Reloading" : "Active");
+        status_cls, status_txt);
 
     page_appendf(page, sizeof(page), &n,
         "<h3>Actions</h3>"
@@ -373,46 +399,113 @@ static esp_err_t handle_status(httpd_req_t *r)
     }
     page_appendf(page, sizeof(page), &n, "</table>");
 
-    /* hagezi one-click presets (#4 follow-on): wildcard/ variants ONLY — they
-     * are 2-8x smaller than the domains/ versions for identical coverage under
-     * our suffix-walk matching (full domains/tif.txt is ~2.1M lines and can
-     * never fit BLOCKLIST_CAPACITY). Counts are 2026-08 snapshots, shown so
-     * the user can do the capacity math against the note below. */
-    if (free_slot >= 0 && n < (int)sizeof(page) - 2048) {
-        static const struct { const char *file, *label; } presets[] = {
-            { "tif.medium.txt", "TIF threat intel — malware/phishing (~326k)" },
-            { "light.txt",      "Light (~42k)" },
-            { "multi.txt",      "Normal (~190k)" },
-            { "pro.txt",        "Pro (~226k)" },
-            { "pro.plus.txt",   "Pro++ (~250k)" },
-            { "ultimate.txt",   "Ultimate (~269k)" },
+    /* F11: this one gate has to cover everything from here to the closing
+     * markup — presets below, the overflow banner, the feed-failure line, the
+     * capacity note, and the whole Access/Network/Upstream tabs — measured
+     * 4.9-6.9 KB post-preset on a fully populated device. The old 2048 B
+     * reserve badly under-counted that and was reachable at ~8% of max config:
+     * page_appendf clamps silently (H1) on overflow, which with this tabbed
+     * layout truncates mid-markup and presents as dead tabs (#60) rather than
+     * a visible error. The banner/note gates further down are a second,
+     * tighter layer of the same guard: best-effort, not a proof nothing past
+     * them can ever clamp, but they turn "silent" into "visible" wherever they
+     * do catch it. */
+    if (n < (int)sizeof(page) - 7168) {
+        /* F12: everything below except tif.medium is the lossless domains/ ->
+         * wildcard/ FORMAT change — identical coverage under our suffix-walk
+         * matching, just a smaller encoding of the same list. tif.medium is
+         * different in kind: hagezi's deliberately REDUCED TIER of TIF, not
+         * full TIF in a cheaper encoding (full domains/tif.txt is ~2.1M lines
+         * and can never fit BLOCKLIST_CAPACITY) — labeled explicitly so that
+         * distinction doesn't get lost again. Counts are 2026-08 snapshots. */
+        static const char *HAGEZI_BASE =
+            "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/";
+        /* F13: adult-content filtering had no discoverable UI entry after the
+         * domains/ cleanup dropped nsfw.oisd.nl with no replacement. No entry
+         * count shown — oisd.nl doesn't publish one for this list. */
+        static const char *NSFW_URL = "https://nsfw.oisd.nl/domainswild2";
+        static const struct { const char *ref, *label; bool full_url; } presets[] = {
+            { "tif.medium.txt", "TIF medium — threat intel (~326k)", false },
+            { "light.txt",      "Light (~42k)",                       false },
+            { "multi.txt",      "Normal (~190k)",                     false },
+            { "pro.txt",        "Pro (~226k)",                        false },
+            { "pro.plus.txt",   "Pro++ (~250k)",                      false },
+            { "ultimate.txt",   "Ultimate (~269k)",                   false },
+            { NSFW_URL,         "OISD NSFW (adult)",                  true  },
         };
-        page_appendf(page, sizeof(page), &n,
-            "<form method=post action=/blocklist/url/set>"
-            "<input type=hidden name=idx value=%d>"
-            "<select name=url><option value=''>hagezi preset&hellip;</option>", free_slot);
-        for (size_t i = 0; i < sizeof(presets)/sizeof(presets[0]); i++)
+        if (free_slot >= 0) {
             page_appendf(page, sizeof(page), &n,
-                "<option value='https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/%s'>%s</option>",
-                presets[i].file, presets[i].label);
-        page_appendf(page, sizeof(page), &n, "</select> <button>Add preset</button></form>");
+                "<form method=post action=/blocklist/url/set>"
+                "<input type=hidden name=idx value=%d>"
+                "<select name=url><option value=''>hagezi preset&hellip;</option>", free_slot);
+            for (size_t i = 0; i < sizeof(presets)/sizeof(presets[0]); i++) {
+                if (presets[i].full_url)
+                    page_appendf(page, sizeof(page), &n,
+                        "<option value='%s'>%s</option>", presets[i].ref, presets[i].label);
+                else
+                    page_appendf(page, sizeof(page), &n,
+                        "<option value='%s%s'>%s</option>",
+                        HAGEZI_BASE, presets[i].ref, presets[i].label);
+            }
+            page_appendf(page, sizeof(page), &n, "</select> <button>Add preset</button></form>");
+        } else {
+            /* F14: this dropdown is the only place any hagezi (or nsfw) URL
+             * appears in the UI, and it used to vanish entirely once all extra
+             * slots filled — exactly when the overflow banner just below is
+             * telling the user to "remove a source or pick smaller lists"
+             * with nowhere left to paste a replacement. Give the copyable
+             * base URL + file names so removing a feed (table above) and
+             * adding a smaller one doesn't need the README or GitHub open. */
+            page_appendf(page, sizeof(page), &n,
+                "<p><small>All %d extra source slots are full — remove one above, "
+                "then paste a preset URL: base <code>%s</code> + one of ",
+                BLOCKLIST_EXTRA_MAX, HAGEZI_BASE);
+            bool first = true;
+            for (size_t i = 0; i < sizeof(presets)/sizeof(presets[0]); i++) {
+                if (presets[i].full_url) continue;
+                page_appendf(page, sizeof(page), &n, "%s<code>%s</code>",
+                    first ? "" : ", ", presets[i].ref);
+                first = false;
+            }
+            page_appendf(page, sizeof(page), &n,
+                ". Adult filtering: <code>%s</code>.</small></p>", NSFW_URL);
+        }
+    } else {
+        page_mark_truncated(page, sizeof(page), &n);
     }
 
-    {
-        uint32_t bl_dropped = blocklist_dropped_count();
+    /* F11: second layer — banner + the new feed-failure line, guarded on
+     * their own so a squeeze here degrades to a visible marker rather than a
+     * silent clamp even if the outer 7168 reserve above ever proves optimistic. */
+    if (n < (int)sizeof(page) - 7168) {
         if (bl_dropped > 0)
             page_appendf(page, sizeof(page), &n,
                 "<p class=warn><b>&#9888; Last reload overflowed the %uk-entry buffer: "
                 "%" PRIu32 " entries dropped — blocking is incomplete.</b> "
                 "Remove a source or pick smaller lists.</p>",
                 (unsigned)(BLOCKLIST_CAPACITY / 1000), bl_dropped);
+        /* blocklist_feed_failures(): a feed that hard-failed to download is a
+         * different failure than capacity overflow above — entries it never
+         * got to attempt, not entries it fetched and then discarded. */
+        if (bl_feed_fail > 0)
+            page_appendf(page, sizeof(page), &n,
+                "<p class=warn>&#9888; %" PRIu32 " source feed(s) failed to download on "
+                "the last reload — the live list is missing their entries.</p>",
+                bl_feed_fail);
+    } else {
+        page_mark_truncated(page, sizeof(page), &n);
     }
-    page_appendf(page, sizeof(page), &n,
-        "<p><small>After adding/removing a source, click <b>Reload blocklist</b> above. "
-        "Any http(s) list in plain, hosts, adblock or *.wildcard format works. All sources "
-        "combined are capped at %uk entries after dedup vs primary; OISD uses ~270k of that. "
-        "For hagezi use the <code>wildcard/</code> files, never <code>domains/</code>.</small></p>",
-        (unsigned)(BLOCKLIST_CAPACITY / 1000));
+
+    if (n < (int)sizeof(page) - 6144) {
+        page_appendf(page, sizeof(page), &n,
+            "<p><small>After adding/removing a source, click <b>Reload blocklist</b> above. "
+            "Any http(s) list in plain, hosts, adblock or *.wildcard format works. All sources "
+            "combined are capped at %uk entries after dedup vs primary; OISD uses ~270k of that. "
+            "For hagezi use the <code>wildcard/</code> files, never <code>domains/</code>.</small></p>",
+            (unsigned)(BLOCKLIST_CAPACITY / 1000));
+    } else {
+        page_mark_truncated(page, sizeof(page), &n);
+    }
 
     page_appendf(page, sizeof(page), &n, "</div><div class='tab' id=tab-access>");
 
@@ -1024,6 +1117,17 @@ static esp_err_t handle_bl_url_set(httpd_req_t *r)
     size_t ulen = strlen(purl);
     while (ulen && (purl[ulen-1] == '\r' || purl[ulen-1] == '\n')) ulen--;
     char decoded[BLOCKLIST_URL_CAP]; url_decode(decoded, sizeof(decoded), purl, ulen);
+    /* F10: the preset <select>'s placeholder option has value=''. A stale page
+     * (render-time free_slot baked into the form's hidden idx) submitted with
+     * the placeholder still selected posts idx=N&url= — which used to call
+     * blocklist_extra_url_set(N, "") and silently delete a configured slot
+     * behind a success-looking 303. Clearing a slot is a deliberate action
+     * that must go through /blocklist/url/clear; reject an empty url here. */
+    if (decoded[0] == '\0') {
+        httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST,
+            "empty url — use /blocklist/url/clear to remove a source");
+        return ESP_FAIL;
+    }
     blocklist_extra_url_set(idx, decoded);
     httpd_resp_set_status(r, "303 See Other");
     httpd_resp_set_hdr(r, "Location", "/");

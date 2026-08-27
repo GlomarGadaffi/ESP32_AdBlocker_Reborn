@@ -21,6 +21,12 @@
 typedef struct {
     uint32_t magic;
     uint32_t count;
+    /* [0] = entries dropped to capacity when this snapshot was written. Without
+     * it a truncated list comes back from a warm boot looking healthy
+     * (dropped=0, no banner) and serves silently incomplete until the next
+     * successful reload. Snapshots written before this field existed read 0,
+     * which is exactly the "not truncated" value — no format bump needed.
+     * [1] unused. Header stays 16B: old and new files are interchangeable. */
     uint32_t reserved[2];
 } bl_sd_header_t;
 
@@ -33,11 +39,17 @@ static uint32_t *s_buf[2];          /* s_buf[0] and s_buf[1] in PSRAM */
 static int       s_active_buf = 0;  /* which buffer is currently live  */
 
 /* Atomic pointer accessed from dns_task (Core 1) and download_task (Core 0).
- * NULL during reload — dns_task forwards all queries upstream. */
+ * NULL means dns_task forwards all queries upstream — only ever set during the
+ * one publish path that must sort THROUGH this buffer (see blocklist_load). */
 static _Atomic(uint32_t *) s_live    = NULL;
 static _Atomic uint32_t    s_count   = 0;
 static _Atomic bool        s_loading = false;
 static _Atomic uint32_t    s_dropped = 0;   /* entries lost to capacity on last reload */
+/* Extra feeds that hard-failed (404 / timeout / mid-stream death) on the last
+ * reload that actually published a list. Non-zero means the live list is
+ * missing whole sources — surfaced in /metrics and the UI banner, and it also
+ * vetoes the SD snapshot so a degraded list can't become the warm-boot list. */
+static _Atomic uint32_t    s_feed_failures = 0;
 
 /* Mutex guarding the whitelist AND custom-rules arrays. Created first thing in
  * blocklist_init(), before any NVS loader runs, so every writer/reader below can
@@ -208,15 +220,16 @@ typedef struct {
     uint32_t  n;
     uint32_t  rejected;
     uint32_t  dropped;        /* lost to capacity (surfaced after load) */
-    uint32_t  sorted_prefix;  /* buf[0..sorted_prefix) is sorted+deduped; extras
-                               * binary-search it so duplicates cost no capacity */
+    uint32_t  sorted_prefix;  /* buf[0..sorted_prefix) is sorted+deduped — every
+                               * feed folded in so far, not just the primary;
+                               * extras binary-search it, so a repeat from ANY
+                               * earlier feed costs no capacity */
     uint32_t  deduped;        /* extra-list entries skipped as already present */
 } load_ctx_t;
 
 static bool on_domain_line(const char *line, size_t len, void *ctx)
 {
     load_ctx_t *lc = (load_ctx_t *)ctx;
-    if (lc->n >= lc->cap) { lc->dropped++; return true; }  /* over capacity — counted, surfaced after load */
 
     /* Hosts-format prefixes and adblock ||anchors^ must be peeled off, or the
      * whole raw line hashes as one junk entry: the feed then reports a healthy
@@ -231,9 +244,10 @@ static bool on_domain_line(const char *line, size_t len, void *ctx)
 
     uint32_t h = domain_hash(norm, nlen);
     if (lc->sorted_prefix) {
-        /* Extra-list entry: binary-search the sorted primary prefix so a
-         * duplicate costs no capacity. Capacity binds near the DEDUPED union
-         * instead of the raw one — what makes OISD + Ultimate + TIF fit. */
+        /* Extra-list entry: binary-search everything already folded into the
+         * sorted prefix so a duplicate costs no capacity. Capacity binds near
+         * the DEDUPED union instead of the raw one — what makes OISD +
+         * Ultimate + TIF fit. */
         uint32_t lo = 0, hi = lc->sorted_prefix;
         while (lo < hi) {
             uint32_t mid = lo + (hi - lo) / 2;
@@ -242,6 +256,12 @@ static bool on_domain_line(const char *line, size_t len, void *ctx)
             else { lc->deduped++; return true; }
         }
     }
+    /* Capacity check belongs HERE, not at entry: everything above can still
+     * decide this line stores nothing (junk, bare TLD, already present), and
+     * counting those as drops inflated the figure severalfold — a feed of
+     * comments read as thousands of "lost domains". Only a genuinely storable
+     * new hash that has nowhere to go is a drop. */
+    if (lc->n >= lc->cap) { lc->dropped++; return true; }  /* surfaced after load, never silent */
     lc->buf[lc->n++] = h;
     return true;
 }
@@ -250,6 +270,34 @@ static int cmp_u32(const void *x, const void *y)
 {
     uint32_t a = *(const uint32_t *)x, b = *(const uint32_t *)y;
     return (a > b) - (a < b);
+}
+
+/* Sort a[0..n) ascending without ever touching the OTHER ping-pong buffer —
+ * that one is live and must keep answering queries. radix_sort needs n words of
+ * scratch, not CAPACITY: when 2n <= CAPACITY the array's own free tail
+ * (a+n .. a+2n) is valid, disjoint scratch, and the 4 passes (even) land the
+ * result back in a. qsort is only the fallback for n > CAPACITY/2, where no
+ * tail is left — it sorts in place but pays an indirect comparator per compare
+ * over PSRAM, 2-4x slower than the radix path.
+ * PRECONDITION: 'a' is the base of a full BLOCKLIST_CAPACITY buffer. Passing a
+ * sub-array would make the tail-scratch bound a lie and corrupt what follows. */
+static void sort_hashes(uint32_t *a, uint32_t n)
+{
+    if (n < 2) return;
+    if (n <= BLOCKLIST_CAPACITY / 2) radix_sort(a, a + n, n);
+    else                             qsort(a, n, sizeof(uint32_t), cmp_u32);
+}
+
+/* Sort + drop equal neighbours in place; returns the surviving count. Equal
+ * hashes are either the same domain from two feeds or a genuine hash collision
+ * — both resolve to one slot, which is the whole point of the 32-bit encoding. */
+static uint32_t sort_dedup(uint32_t *a, uint32_t n)
+{
+    sort_hashes(a, n);
+    uint32_t u = 0;
+    for (uint32_t i = 0; i < n; i++)
+        if (u == 0 || a[i] != a[u - 1]) a[u++] = a[i];
+    return u;
 }
 
 /* ── NVS whitelist persistence ───────────────────────────────────── */
@@ -350,6 +398,12 @@ uint32_t blocklist_load(void)
     int new_buf = 1 - s_active_buf;
     load_ctx_t lc = { .buf = s_buf[new_buf], .cap = BLOCKLIST_CAPACITY, .n = 0, .rejected = 0 };
 
+    /* Accumulated locally and published only where s_dropped is: until then the
+     * OLD list is still the live one, and the count that describes it must not
+     * be cleared by a reload that may yet bail out (a primary fetch that dies
+     * returns below without publishing anything). */
+    uint32_t feed_failures = 0;
+
     ESP_LOGI(TAG, "Downloading primary blocklist (old list stays live)...");
     bool ok = http_fetch_lines(BLOCKLIST_URL, on_domain_line, &lc);
     if (!ok || lc.n == 0) {
@@ -364,57 +418,136 @@ uint32_t blocklist_load(void)
     for (int i = 0; i < BLOCKLIST_EXTRA_MAX; i++)
         if (s_extra_urls[i][0] != '\0') { have_extras = true; break; }
 
-    /* Dedup-aware extras: sort+dedup the primary IN PLACE first (qsort — no
-     * O(n) scratch, because the only scratch-sized buffer is the LIVE one and
-     * it must keep serving during the fetch). Extra-list entries then
-     * binary-search this prefix in on_domain_line and duplicates are skipped,
-     * so capacity binds near the deduped union rather than the raw one.
+    /* Dedup-aware extras: sort+dedup the primary IN PLACE first, using its own
+     * free tail as scratch — never the other buffer, which is live and must
+     * keep serving during the fetch. Extra-list entries then binary-search this
+     * prefix in on_domain_line and duplicates are skipped, so capacity binds
+     * near the deduped union rather than the raw one.
      * Runs in the download task (Core 0), cold path only. */
     if (have_extras) {
-        qsort(lc.buf, lc.n, sizeof(uint32_t), cmp_u32);
-        uint32_t u = 0;
-        for (uint32_t i = 0; i < lc.n; i++)
-            if (u == 0 || lc.buf[i] != lc.buf[u - 1]) lc.buf[u++] = lc.buf[i];
+        uint32_t u = sort_dedup(lc.buf, lc.n);
         ESP_LOGI(TAG, "Primary sorted+deduped in place: %" PRIu32 " -> %" PRIu32, lc.n, u);
         lc.n = u;
         lc.sorted_prefix = u;
     }
 
-    /* Fetch extra blocklists and append (deduped vs primary) to the same buffer */
+    /* Fetch extra blocklists and append (deduped vs everything already loaded) */
     for (int i = 0; i < BLOCKLIST_EXTRA_MAX; i++) {
         if (s_extra_urls[i][0] == '\0') continue;
-        uint32_t before = lc.n, rej_before = lc.rejected, dup_before = lc.deduped;
+
+        /* Full: every remaining feed would be downloaded, TLS-decrypted and
+         * parsed only for on_domain_line to drop it. Stop and name what is
+         * missing instead of burning minutes to store nothing. */
+        if (lc.n >= lc.cap) {
+            char skipped[32] = "";     /* indices only — BLOCKLIST_EXTRA_MAX is single-digit */
+            size_t sl = 0;
+            for (int j = i; j < BLOCKLIST_EXTRA_MAX && sl + 3 < sizeof(skipped); j++) {
+                if (s_extra_urls[j][0] == '\0') continue;
+                if (sl) skipped[sl++] = ',';
+                skipped[sl++] = (char)('0' + j);
+                skipped[sl] = '\0';
+            }
+            ESP_LOGE(TAG, "Capacity full at %" PRIu32 " — extra list(s) %s NOT fetched at all; "
+                     "dropped=%" PRIu32 " is a LOWER BOUND (a feed never fetched contributes "
+                     "nothing to it)", lc.n, skipped, lc.dropped);
+            break;
+        }
+
+        uint32_t before = lc.n, rej_before = lc.rejected;
+        uint32_t dup_before = lc.deduped, drop_before = lc.dropped;
         ESP_LOGI(TAG, "Downloading extra list %d: %s", i, s_extra_urls[i]);
-        http_fetch_lines(s_extra_urls[i], on_domain_line, &lc);
-        ESP_LOGI(TAG, "Extra list %d: %" PRIu32 " new domains, %" PRIu32 " already in primary, %" PRIu32 " lines rejected",
-                 i, lc.n - before, lc.deduped - dup_before, lc.rejected - rej_before);
-        if (lc.n == before && lc.deduped == dup_before && lc.rejected > rej_before)
+        bool feed_ok = http_fetch_lines(s_extra_urls[i], on_domain_line, &lc);
+        if (!feed_ok) {
+            /* 404, TLS/DNS failure or a stream that died mid-body. Whatever
+             * arrived stays (a partial feed still blocks what it named), but the
+             * reload is degraded and must not be snapshotted over a good one. */
+            feed_failures++;
+            ESP_LOGE(TAG, "Extra list %d FAILED (%s) — kept %" PRIu32 " entries from the partial "
+                     "stream; this reload is DEGRADED", i, s_extra_urls[i], lc.n - before);
+        }
+
+        /* Fold this feed into the sorted prefix so the NEXT one binary-searches
+         * against it too. Without this the prefix stays at the primary and
+         * extras-vs-extras overlap costs a slot each — 66,789 of them on the
+         * measured 4-feed mix. Skipped when nothing was appended: the prefix
+         * already covers [0,n) and a re-sort would be a full pass for nothing. */
+        uint32_t appended = lc.n - before, self_dupes = 0;
+        if (appended > 0) {
+            uint32_t merged = sort_dedup(lc.buf, lc.n);
+            self_dupes = lc.n - merged;   /* only intra-feed repeats reach here —
+                                           * anything the prefix held was already
+                                           * caught by the binary search */
+            lc.n = merged;
+        }
+        lc.sorted_prefix = lc.n;
+
+        ESP_LOGI(TAG, "Extra list %d: +%" PRIu32 " new (%" PRIu32 " intra-feed dupes), %" PRIu32
+                 " already present, %" PRIu32 " rejected, %" PRIu32 " dropped (full) — total %" PRIu32,
+                 i, lc.n - before, self_dupes, lc.deduped - dup_before,
+                 lc.rejected - rej_before, lc.dropped - drop_before, lc.n);
+
+        /* Only a feed we actually received, that stored nothing for any reason
+         * OTHER than capacity, is a format problem. At capacity every feed
+         * reads as "0 new, 0 deduped", which used to fire this warning at the
+         * wrong target — or, with rejects at 0, silence it entirely. */
+        if (feed_ok && appended == 0 && lc.deduped == dup_before &&
+            lc.dropped == drop_before && lc.rejected > rej_before)
             ESP_LOGW(TAG, "Extra list %d contributed nothing usable — wrong format?", i);
     }
     atomic_store(&s_dropped, lc.dropped);
+    atomic_store(&s_feed_failures, feed_failures);
+    if (feed_failures > 0)
+        ESP_LOGE(TAG, "%" PRIu32 " extra feed(s) failed — the live list is missing whole sources",
+                 feed_failures);
     if (lc.dropped > 0)
         ESP_LOGW(TAG, "CAPACITY EXCEEDED: %" PRIu32 " entries dropped (cap %u) — the live "
                  "list is incomplete. Remove a source or switch to smaller lists "
                  "(hagezi wildcard/ variants, not domains/).",
                  lc.dropped, (unsigned)BLOCKLIST_CAPACITY);
-    ESP_LOGI(TAG, "Total %" PRIu32 " domains before dedup; sorting...", lc.n);
+    /* Which publish path is legal turns on ONE question: was the new buffer
+     * sorted THROUGH the live buffer? If it never was, the old array is intact,
+     * no reader can observe a torn read of it, and the degraded window buys
+     * nothing — the release-store alone orders every write to the new buffer
+     * ahead of the pointer the reader acquires.
+     * (A Core 1 reader that latched the old pointer microseconds earlier can
+     * pair it with the new count. Both counts are <= CAPACITY and both buffers
+     * are CAPACITY-sized and permanently allocated, so the worst case is one
+     * query answered against a stale tail — bounded, never an OOB read. That
+     * race predates this change; the null window never closed it either.) */
+    uint32_t unique;
+    if (lc.sorted_prefix == lc.n) {
+        /* Every feed was folded in as it completed: already sorted and deduped. */
+        unique = lc.n;
+        ESP_LOGI(TAG, "Total %" PRIu32 " domains, already sorted by the per-feed passes "
+                 "— publishing with no degraded window", unique);
+    } else if (lc.n <= BLOCKLIST_CAPACITY / 2) {
+        /* No extras configured, but the array's own free tail is scratch enough
+         * for radix — still no reason to touch the live buffer. */
+        ESP_LOGI(TAG, "Total %" PRIu32 " domains before dedup; sorting on tail scratch "
+                 "(no degraded window)...", lc.n);
+        unique = sort_dedup(lc.buf, lc.n);
+        ESP_LOGI(TAG, "%" PRIu32 " dupes removed", lc.n - unique);
+    } else {
+        /* Over half of capacity with no sorted prefix: the only scratch large
+         * enough IS the live buffer, so we must drop to degraded mode for the
+         * ~1-2s sort (not the whole fetch). After nulling s_live, yield for 2ms
+         * so any Core 1 reader that already latched the old arr pointer
+         * completes its binary search before we overwrite that buffer
+         * (#45 — RCU quiescence window). */
+        ESP_LOGI(TAG, "Total %" PRIu32 " domains before dedup; sorting via the live buffer "
+                 "(degraded window)...", lc.n);
+        atomic_store_explicit(&s_live, NULL, memory_order_release);
+        vTaskDelay(pdMS_TO_TICKS(2));
+        uint32_t *a = s_buf[new_buf];
+        uint32_t *b = s_buf[s_active_buf];  /* scratch during sort; live ptr is NULL */
+        radix_sort(a, b, lc.n);
 
-    /* The sort needs the other buffer as scratch — that's the live one, so we
-     * must drop to degraded mode for the ~1-2s sort only (not the whole fetch).
-     * After nulling s_live, yield for 2ms so any Core 1 reader that already
-     * latched the old arr pointer completes its binary search before we overwrite
-     * that buffer (#45 — RCU quiescence window). */
-    atomic_store_explicit(&s_live, NULL, memory_order_release);
-    vTaskDelay(pdMS_TO_TICKS(2));
-    uint32_t *a = s_buf[new_buf];
-    uint32_t *b = s_buf[s_active_buf];  /* scratch during sort; live ptr is NULL */
-    radix_sort(a, b, lc.n);
-
-    /* Remove duplicates (hash collisions from different domains) */
-    uint32_t unique = 0;
-    for (uint32_t i = 0; i < lc.n; i++) {
-        if (unique == 0 || a[i] != a[unique - 1])
-            a[unique++] = a[i];
+        /* Remove duplicates (hash collisions from different domains) */
+        unique = 0;
+        for (uint32_t i = 0; i < lc.n; i++) {
+            if (unique == 0 || a[i] != a[unique - 1])
+                a[unique++] = a[i];
+        }
     }
 
     /* Atomic swap: publish new array */
@@ -422,10 +555,21 @@ uint32_t blocklist_load(void)
     s_active_buf = new_buf;
     atomic_store_explicit(&s_live, s_buf[new_buf], memory_order_release);
 
-    ESP_LOGI(TAG, "Blocklist live: %" PRIu32 " domains (%" PRIu32 " dupes removed)", unique, lc.n - unique);
+    ESP_LOGI(TAG, "Blocklist live: %" PRIu32 " domains", unique);
     atomic_store(&s_loading, false);
     reload_diff_vs_sd(s_buf[new_buf], unique);   /* before the snapshot is overwritten */
-    blocklist_save_sd();
+
+    /* A snapshot from a reload with a dead feed would come back at the next warm
+     * boot as the list, with no record that a source was missing. Keep the last
+     * good one — a slightly stale complete list beats a fresh incomplete one.
+     * (Capacity drops DO get saved: those are recorded in the header and
+     * restored by blocklist_load_sd, so they stay visible.) */
+    if (feed_failures == 0) {
+        blocklist_save_sd();
+    } else {
+        ESP_LOGW(TAG, "SD snapshot SKIPPED: %" PRIu32 " feed(s) failed this reload — keeping "
+                 "the previous good snapshot", feed_failures);
+    }
     return unique;
 }
 
@@ -595,9 +739,20 @@ bool blocklist_load_sd(void)
         return false;
     }
 
+    /* Restore the truncation state with the data, before the release-store that
+     * makes the array visible: a reader that sees this list must also see how
+     * incomplete it is. Without this a truncated snapshot came back from a warm
+     * boot reading dropped=0 and served silently short until the next reload.
+     * s_feed_failures stays 0 by construction — blocklist_load refuses to write
+     * a snapshot from a reload where any feed hard-failed. */
     atomic_store_explicit(&s_count, hdr.count, memory_order_relaxed);
+    atomic_store(&s_dropped, hdr.reserved[0]);
     atomic_store_explicit(&s_live, s_buf[s_active_buf], memory_order_release);
     ESP_LOGI(TAG, "SD blocklist loaded: %" PRIu32 " domains (instant)", hdr.count);
+    if (hdr.reserved[0] > 0)
+        ESP_LOGW(TAG, "Snapshot was TRUNCATED when written: %" PRIu32 " entries had been "
+                 "dropped — this warm-boot list is INCOMPLETE until the next reload",
+                 hdr.reserved[0]);
     return true;
 }
 
@@ -611,7 +766,11 @@ void blocklist_save_sd(void)
     FILE *f = fopen(SD_BL_PATH, "wb");
     if (!f) { ESP_LOGW(TAG, "SD blocklist: can't open for write (errno=%d)", errno); return; }
 
-    bl_sd_header_t hdr = { .magic = SD_MAGIC, .count = n, .reserved = {0, 0} };
+    /* Carry the drop count into the file: the array alone cannot say whether it
+     * is the whole list, and the next warm boot serves this file before any
+     * download runs (see blocklist_load_sd). */
+    uint32_t dropped = atomic_load(&s_dropped);
+    bl_sd_header_t hdr = { .magic = SD_MAGIC, .count = n, .reserved = {dropped, 0} };
     fwrite(&hdr, sizeof(hdr), 1, f);
 
     /* Write in chunks from a small DRAM bounce buffer — avoids handing the
@@ -630,8 +789,8 @@ void blocklist_save_sd(void)
     fclose(f);
 
     if (written == n)
-        ESP_LOGI(TAG, "SD blocklist saved: %" PRIu32 " domains (%" PRIu32 " KB)",
-                 n, (uint32_t)((n * 4 + 16) / 1024));
+        ESP_LOGI(TAG, "SD blocklist saved: %" PRIu32 " domains (%" PRIu32 " KB, %" PRIu32
+                 " dropped)", n, (uint32_t)((n * 4 + 16) / 1024), dropped);
     else
         ESP_LOGW(TAG, "SD blocklist: short write %" PRIu32 "/%" PRIu32, (uint32_t)written, n);
 }
@@ -639,3 +798,4 @@ void blocklist_save_sd(void)
 uint32_t blocklist_domain_count(void)  { return atomic_load(&s_count); }
 bool     blocklist_is_loading(void)    { return atomic_load(&s_loading); }
 uint32_t blocklist_dropped_count(void) { return atomic_load(&s_dropped); }
+uint32_t blocklist_feed_failures(void) { return atomic_load(&s_feed_failures); }
