@@ -365,3 +365,32 @@ Based on an external review of the audit findings, the architectural approach al
 * **L2 Fast-Path Seqlock:** The seqlock is an advanced and correct primitive here, protecting high-frequency lock-free reads without thrashing cache lines with atomic writes.
 * **Blocking DoT (C2):** The 1.5s timeout prevents a total DoS, but blocking the main `dns_task` for a TLS handshake remains an anti-pattern. The documented follow-up (moving it to a dedicated worker task fed by a queue) is the correct architectural fix.
 
+
+---
+
+## 2026-08-26 — silent capacity truncation (fixed, `c85bdcc`)
+
+`on_domain_line` skipped every entry past `BLOCKLIST_CAPACITY` with no
+counter, no log, no metric — a feed mix over capacity reported a healthy
+domain count while silently not loading the tail (the same failure shape as
+the wave-1 silent-corruption bug: the number looks fine, the blocking isn't).
+With OISD + AdGuard + hagezi Ultimate + TIF-medium the raw union is ~1.04M
+against a 780k buffer, so ~260k entries were being dropped invisibly.
+
+Fix, three parts:
+1. **Dedup-aware loading** — after the primary's fetch it is qsort'd + deduped
+   in place (no O(n) scratch; the live buffer must keep serving during the
+   fetch), and each extra-list entry binary-searches that prefix before being
+   appended. Capacity now binds on the union, not the sum: the four-source mix
+   peaked at 778,569 and went live as 711,780 domains, dropped = 0.
+2. **Dropped counter** — anything past capacity increments a counter surfaced
+   in the UI (warning banner), the log (`CAPACITY EXCEEDED`), and `/metrics`
+   (`blocklist_dropped`).
+3. **Capacity 780k → 820k** — margin over the measured peak; the +320 KB PSRAM
+   came from a measured 1.45 MB free (mbedTLS also allocs there since the TLS
+   fix), leaving ~1.04 MB.
+
+Also removed the UI's suggested `domains/tif.txt` feed: ~2.1M lines, could
+never fit, and would have exercised exactly this silent truncation. The
+`wildcard/` variants (tif.medium ≈ 326k) are 2–8x smaller for identical
+coverage under suffix-walk matching and are what the new presets use.

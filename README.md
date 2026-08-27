@@ -1,9 +1,11 @@
 # ESP32_AdBlocker_Reborn
 
 A native ESP-IDF DNS sinkhole for the LilyGO T-ETH-Elite (ESP32-S3 + W5500 SPI
-Ethernet). It hosts the full OISD "big" wildcard blocklist, sinkholes ad and
-tracker domains at the network layer, and forwards and caches everything else.
-Pure ESP-IDF 6.0.1, no Arduino.
+Ethernet). It hosts the full OISD "big" wildcard blocklist plus up to four
+extra feeds (hagezi ad tiers and threat-intelligence presets built in — 700k+
+domains total), sinkholes ad, tracker, and malware domains at the network
+layer, and forwards and caches everything else. Pure ESP-IDF 6.0.1, no
+Arduino.
 
 The name is a nod to s60sc/ESP32_AdBlocker, which inspired it. This is a
 ground-up rewrite: hash-based blocklist storage so the whole list fits in PSRAM,
@@ -12,9 +14,11 @@ L2 fast path that answers blocked queries without going through lwIP.
 
 ## What it does
 
-* Full OISD big list (domainswild2, ~333k wildcard domains) stored as 32-bit
-  MurmurHash3 in two PSRAM buffers, radix-sorted and binary-searched, with full
-  subdomain suffix-walk matching.
+* Full OISD big list (domainswild2, ~266k wildcard domains) plus extra feeds,
+  stored as 32-bit MurmurHash3 in two 820k-entry PSRAM buffers, radix-sorted
+  and binary-searched, with full subdomain suffix-walk matching. Extra-list
+  entries are deduplicated against the sorted primary as they stream in, so
+  buffer capacity binds on the union of all sources, not their sum.
 * SD instant boot. The sorted hash table is written to the MicroSD card and
   reloaded in about a second on reboot, instead of a multi-minute HTTPS
   download. The daily refresh runs in the background with the old list still
@@ -146,10 +150,10 @@ Remaining open items:
   back to UDP, but the proper fix is a worker task / persistent session. DoT is
   opt-in and off by default. (ISSUES.md C2)
 * **The "about a second" SD reload is not independently re-measured.** (#38)
-* **Some headline ad roots aren't in the loaded list.** e.g. `doubleclick.net`
-  resolves while `analytics.tiktok.com` is blocked — a blocklist-content/cache
-  freshness question (the matching engine works on 333k domains), not a code
-  bug. Try a fresh `/reload` and re-check.
+* ~~Some headline ad roots aren't in the loaded list.~~ Resolved by the
+  multi-source setup: with hagezi Ultimate + TIF loaded (711k domains),
+  `doubleclick.net`, `ad.doubleclick.net`, and `analytics.tiktok.com` all
+  sinkhole (verified 2026-08-26). It was blocklist content, not a code bug.
 
 See the issue tracker and `ISSUES.md` for the full, code-grounded analysis.
 
