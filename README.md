@@ -29,11 +29,15 @@ L2 fast path that answers blocked queries without going through lwIP.
   socket layer. Only cold (uncached, non-blocked) queries fall through to lwIP
   for upstream forwarding. A cross-task seqlock lets the RX hook read the cache
   safely while the DNS task writes it.
-* Forward cache. Allowed responses are cached as raw bytes in PSRAM (1024 slots,
-  qtype folded into the key so A and AAAA never evict each other) with TTLs
-  parsed from the answer records, then replayed on repeat — from the L2 fast
-  path. CNAME chains and non-A records are preserved. A ~40 ms gateway round
-  trip becomes a ~1.8 ms local hit at ~2,100 qps.
+* Forward cache. Allowed responses are cached as raw bytes in PSRAM (4-way
+  set-associative, 512 sets = 2048 entries; qtype folded into the key so A and
+  AAAA never evict each other, and two hot domains hashing together no longer
+  evict each other either) with TTLs parsed from the answer records, then
+  replayed on repeat — from the L2 fast path. CNAME chains and non-A records
+  are preserved. A ~40 ms gateway round trip becomes a ~1.8 ms local hit at
+  ~2,100 qps. `/metrics` reports `cache_evictions` (live entries displaced by
+  collisions — the sizing gauge) and `cache_too_big` (responses over the 512 B
+  entry cap that were never cached).
 * HTTP telemetry and control. GET /metrics returns JSON counters and
   per-category microsecond latency histograms. GET / is a status page with live
   stat boxes and a clock-sync indicator. GET /log shows the recent query log
@@ -126,12 +130,13 @@ Two full-codebase reviews (June 2026) audited the firmware. The first round's
 findings have since been fixed and verified on hardware; see `ISSUES.md` for the
 per-item record. Resolved since the original audit:
 
-* **Forward cache now isolates A and AAAA.** The slot index folds the query type
-  in (`(h ^ (qtype<<1)) & (CACHE_SLOTS-1)`) and a hit requires a matching
-  `qtype`, so the A and AAAA records for a name occupy separate slots and both
+* **Forward cache now isolates A and AAAA.** The set index folds the query type
+  in (`(h ^ (qtype<<1)) & (CACHE_SETS-1)`) and a hit requires a matching
+  `qtype`, so the A and AAAA records for a name occupy separate sets and both
   cache-hit on repeat — verified live (a repeat A+AAAA pair scores two cache
-  hits). The cache is 1024 slots (~545 KB PSRAM); a warm pass over 100 distinct
-  domains scored 92/100 hits. (#43)
+  hits). Originally 1024 direct-mapped slots (a warm pass over 100 distinct
+  domains scored 92/100 hits); now 4-way × 512 sets (~1.1 MB PSRAM), so a
+  colliding pair of hot domains costs a way, not the slot. (#43)
 * **L2 fast path no longer stalls on whitelist edits.** The RX hook uses a
   non-blocking mutex take and the blocking path a bounded 2 ms take, and NVS
   commits run outside the lock. (#37)

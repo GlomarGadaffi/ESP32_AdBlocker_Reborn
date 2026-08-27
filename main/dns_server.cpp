@@ -43,6 +43,11 @@ static uint32_t s_cnt_drop_table   = 0;  /* upstream table full */
 static uint32_t s_cnt_upstream_to  = 0;  /* upstream timeouts (evicted in_use) */
 static uint32_t s_cnt_cache_probe  = 0;  /* result-cache lookups */
 static uint32_t s_cnt_cache_hit    = 0;  /* result-cache hits */
+static uint32_t s_cnt_cache_evict  = 0;  /* still-useful entries evicted by a colliding
+                                            store — the set-associativity pressure gauge:
+                                            near zero means WAYS×SETS is big enough */
+static uint32_t s_cnt_cache_toobig = 0;  /* responses skipped: len > FWD_RESP_MAX. The
+                                            evidence for (or against) a bigger resp[] */
 static uint32_t s_cnt_stale        = 0;  /* serve-stale replays (#68) */
 static uint32_t s_cnt_coalesced    = 0;  /* upstream queries avoided by single-flight (#76):
                                             waiters attached + refreshes suppressed */
@@ -108,11 +113,23 @@ static constexpr uint32_t TCP_CONN_IDLE_MS = 3000;
 static constexpr int      TCP_QUERY_MAX    = 768;
 
 /* ── Result cache (PSRAM): blocked verdicts + full forwarded responses ─
- * Direct-mapped, 256 slots. Blocked entries regenerate 0.0.0.0/::; allowed
+ * 4-way set-associative. Blocked entries regenerate 0.0.0.0/::; allowed
  * entries store the raw upstream response and replay it (txid rewritten) so
- * repeat allowed queries are served locally instead of re-forwarding. */
-#define CACHE_SLOTS    1024   /* PSRAM is plentiful (4MB free); 256 gave ~4% hit
-                                 rate on diverse home traffic. 1024 slots ≈ 545KB. */
+ * repeat allowed queries are served locally instead of re-forwarding.
+ *
+ * Why associative: direct-mapped meant two hot domains landing on one slot
+ * evicted each other forever — a hit-rate ceiling no slot count fixes for the
+ * colliding pair. Four ways per set ends that, and 512 sets doubles capacity
+ * on top (256 direct slots gave ~4% on diverse home traffic; 1024 was better).
+ * Budget: 2048 × 544 B leaves ~490 KB PSRAM free measured post-boot — the old
+ * "4 MB free" note here was stale. Every other PSRAM consumer allocates at
+ * boot, so that headroom is steady-state; don't grow WAYS/SETS/FWD_RESP_MAX
+ * without re-measuring. Storing raw wire bytes per entry — rather than parsed
+ * records — is the layout Cloudflare's 1.1.1.1 cache rework converged on
+ * (56% smaller, faster inserts/lookups), so the entry format stays as is. */
+#define CACHE_WAYS     4
+#define CACHE_SETS     512    /* power of two; 4×512 = 2048 entries ≈ 1.1MB PSRAM */
+#define CACHE_ENTRIES  (CACHE_WAYS * CACHE_SETS)
 #define FWD_RESP_MAX   512
 #define FWD_TTL_MIN_S  10u
 #define FWD_TTL_MAX_S  3600u
@@ -135,7 +152,7 @@ struct CacheEntry {
                                          read by the L2 path so no seqlock needed */
     uint8_t    resp[FWD_RESP_MAX];    /* allowed: raw upstream response */
 };
-static CacheEntry *s_cache = nullptr; /* CACHE_SLOTS entries in PSRAM */
+static CacheEntry *s_cache = nullptr; /* CACHE_ENTRIES entries in PSRAM */
 
 /* Seqlock for cross-task cache reads. The dns_task is the only writer; the L2
  * eth-RX task reads the cache from dns_cache_l2_get() (a different task/core).
@@ -164,19 +181,55 @@ static inline void cache_write_end(void)
 
 static bool cache_init(void)
 {
-    s_cache = (CacheEntry *)heap_caps_calloc(CACHE_SLOTS, sizeof(CacheEntry), MALLOC_CAP_SPIRAM);
+    s_cache = (CacheEntry *)heap_caps_calloc(CACHE_ENTRIES, sizeof(CacheEntry), MALLOC_CAP_SPIRAM);
     return s_cache != nullptr;
+}
+/* First entry of the set that (h, qtype) maps to; its CACHE_WAYS ways are
+ * contiguous. qtype folded in as before, so A and AAAA live in separate sets. */
+static inline CacheEntry *cache_set(uint32_t h, uint16_t qtype)
+{
+    return &s_cache[((h ^ ((uint32_t)qtype << 1)) & (CACHE_SETS - 1)) * CACHE_WAYS];
 }
 static CacheEntry *cache_lookup(uint32_t h, uint16_t qtype, uint64_t now_ms)
 {
-    CacheEntry *e = &s_cache[(h ^ ((uint32_t)qtype << 1)) & (CACHE_SLOTS - 1)];
-    if (e->valid && e->key_hash == h && e->qtype == qtype && e->ttl_deadline_ms > now_ms)
-        return e;
+    CacheEntry *set = cache_set(h, qtype);
+    for (int w = 0; w < CACHE_WAYS; w++) {
+        CacheEntry *e = &set[w];
+        if (e->valid && e->key_hash == h && e->qtype == qtype && e->ttl_deadline_ms > now_ms)
+            return e;
+    }
     return nullptr;
+}
+/* The way a store for (h, qtype) must write. Priority: the key's OWN way if it
+ * already has one — writing anywhere else would leave two live entries for one
+ * key, and lookups could keep returning the outdated twin — then an invalid
+ * way, then the way whose usefulness ends soonest. "Usefulness" is not the TTL
+ * deadline alone: an expired BLOCKED entry is already worthless (re-blocking
+ * is microseconds; cache_lookup_stale never serves them) while an expired
+ * allowed entry still answers through the serve-stale window (#68), so blocked
+ * entries compare at their deadline and allowed ones at deadline + STALE_MAX_S.
+ * Evicting a still-useful entry bumps s_cnt_cache_evict — the gauge that says
+ * whether WAYS×SETS is actually big enough for the traffic. */
+static CacheEntry *cache_victim(uint32_t h, uint16_t qtype, uint64_t now_ms)
+{
+    CacheEntry *set = cache_set(h, qtype);
+    CacheEntry *victim = &set[0];
+    uint64_t victim_end = UINT64_MAX;
+    for (int w = 0; w < CACHE_WAYS; w++) {
+        CacheEntry *e = &set[w];
+        if (e->valid && e->key_hash == h && e->qtype == qtype)
+            return e;                          /* overwrite in place */
+        uint64_t end = !e->valid ? 0
+            : e->ttl_deadline_ms + (e->blocked ? 0 : (uint64_t)STALE_MAX_S * 1000u);
+        if (end < victim_end) { victim = e; victim_end = end; }
+    }
+    if (victim->valid && victim_end > now_ms)
+        s_cnt_cache_evict++;
+    return victim;
 }
 static void cache_store_blocked(uint32_t h, uint16_t qtype, uint32_t ttl_s, uint64_t now_ms)
 {
-    CacheEntry *e = &s_cache[(h ^ ((uint32_t)qtype << 1)) & (CACHE_SLOTS - 1)];
+    CacheEntry *e = cache_victim(h, qtype, now_ms);
     cache_write_begin();
     e->key_hash = h; e->qtype = qtype; e->blocked = true; e->valid = true;
     e->resp_len = 0;
@@ -186,8 +239,9 @@ static void cache_store_blocked(uint32_t h, uint16_t qtype, uint32_t ttl_s, uint
 static void cache_store_resp(uint32_t h, uint16_t qtype, const uint8_t *resp, int len,
                              uint32_t ttl_s, uint64_t now_ms)
 {
-    if (len <= 0 || len > FWD_RESP_MAX) return;
-    CacheEntry *e = &s_cache[(h ^ ((uint32_t)qtype << 1)) & (CACHE_SLOTS - 1)];
+    if (len <= 0) return;
+    if (len > FWD_RESP_MAX) { s_cnt_cache_toobig++; return; }
+    CacheEntry *e = cache_victim(h, qtype, now_ms);
     cache_write_begin();
     e->key_hash = h; e->qtype = qtype; e->blocked = false; e->valid = true;
     e->resp_len = (uint16_t)len;
@@ -202,12 +256,15 @@ static void cache_store_resp(uint32_t h, uint16_t qtype, const uint8_t *resp, in
  * (re-blocking via the blocklist is microseconds — no staleness needed). */
 static CacheEntry *cache_lookup_stale(uint32_t h, uint16_t qtype, uint64_t now_ms)
 {
-    CacheEntry *e = &s_cache[(h ^ ((uint32_t)qtype << 1)) & (CACHE_SLOTS - 1)];
-    if (e->valid && !e->blocked && e->resp_len > 0 &&
-        e->key_hash == h && e->qtype == qtype &&
-        e->ttl_deadline_ms <= now_ms &&
-        e->ttl_deadline_ms + (uint64_t)STALE_MAX_S * 1000u > now_ms)
-        return e;
+    CacheEntry *set = cache_set(h, qtype);
+    for (int w = 0; w < CACHE_WAYS; w++) {
+        CacheEntry *e = &set[w];
+        if (e->valid && !e->blocked && e->resp_len > 0 &&
+            e->key_hash == h && e->qtype == qtype &&
+            e->ttl_deadline_ms <= now_ms &&
+            e->ttl_deadline_ms + (uint64_t)STALE_MAX_S * 1000u > now_ms)
+            return e;
+    }
     return nullptr;
 }
 
@@ -246,17 +303,26 @@ extern "C" int dns_cache_l2_get(uint32_t qhash, uint16_t qtype, uint8_t *out, in
 {
     if (!s_cache || !out) return -1;
     uint64_t now_ms = (uint64_t)(esp_timer_get_time() / 1000);
-    CacheEntry *e = &s_cache[(qhash ^ ((uint32_t)qtype << 1)) & (CACHE_SLOTS - 1)];
+    CacheEntry *set = cache_set(qhash, qtype);
 
     uint32_t s1 = s_cache_seq.load(std::memory_order_relaxed);
     if (s1 & 1u) return -1;                       /* writer mid-update */
     std::atomic_thread_fence(std::memory_order_acquire);
 
-    if (!e->valid || e->blocked || e->key_hash != qhash || e->qtype != qtype) return -1;
-    if (e->ttl_deadline_ms <= now_ms) return -1;  /* expired */
-    int len = e->resp_len;
-    if (len <= 0 || len > out_cap || len > FWD_RESP_MAX) return -1;
-    memcpy(out, e->resp, (size_t)len);
+    /* Scan the whole set inside ONE seqlock window: a mid-scan write would
+     * invalidate any way we matched, and the single end check catches it. */
+    int len = -1;
+    for (int w = 0; w < CACHE_WAYS; w++) {
+        CacheEntry *e = &set[w];
+        if (!e->valid || e->blocked || e->key_hash != qhash || e->qtype != qtype) continue;
+        if (e->ttl_deadline_ms <= now_ms) continue;  /* expired */
+        int l = e->resp_len;
+        if (l <= 0 || l > out_cap || l > FWD_RESP_MAX) continue;
+        memcpy(out, e->resp, (size_t)l);
+        len = l;
+        break;
+    }
+    if (len < 0) return -1;
 
     std::atomic_thread_fence(std::memory_order_acquire);
     if (s_cache_seq.load(std::memory_order_relaxed) != s1) return -1; /* raced */
@@ -312,9 +378,11 @@ static void cache_load_sd(void)
     uint32_t magic = fc_get_u32(hdr);
     uint32_t count = fc_get_u32(hdr + 4);
     uint16_t emax  = fc_get_u16(hdr + 8);
-    /* count > CACHE_SLOTS is impossible from a good save (at most one record
-     * per slot), so it means corruption or a format change. */
-    if (magic != FWDCACHE_MAGIC || emax != FWD_RESP_MAX || count > CACHE_SLOTS) {
+    /* count > CACHE_ENTRIES is impossible from a good save (at most one record
+     * per entry), so it means corruption or a format change. A pre-associative
+     * snapshot (≤1024 records, same entry_max) still loads fine: records carry
+     * their own key_hash and are re-inserted through cache_victim below. */
+    if (magic != FWDCACHE_MAGIC || emax != FWD_RESP_MAX || count > CACHE_ENTRIES) {
         ESP_LOGW(TAG, "warm boot: snapshot rejected (magic %08" PRIx32 ", count %" PRIu32
                       ", entry_max %u)", magic, count, (unsigned)emax);
         fclose(f);
@@ -327,6 +395,7 @@ static void cache_load_sd(void)
      * Do NOT reuse this shape for a mid-life reload. */
     cache_write_begin();
     uint32_t loaded = 0;
+    const uint64_t now_ms = (uint64_t)(esp_timer_get_time() / 1000);
     for (uint32_t i = 0; i < count; i++) {
         uint8_t rec[FWDCACHE_REC_SZ];
         if (fread(rec, 1, sizeof(rec), f) != sizeof(rec)) break;   /* truncated */
@@ -336,7 +405,10 @@ static void cache_load_sd(void)
         uint16_t resp_len = fc_get_u16(rec + 6);
         if (resp_len == 0 || resp_len > FWD_RESP_MAX) break;       /* corrupt */
 
-        CacheEntry *e = &s_cache[(h ^ ((uint32_t)qtype << 1)) & (CACHE_SLOTS - 1)];
+        /* Freshly calloc-ed cache → this lands on an invalid way (a good save
+         * has at most CACHE_WAYS records per set; an old direct-mapped one at
+         * most 2). Only a corrupt file can force a real eviction here. */
+        CacheEntry *e = cache_victim(h, qtype, now_ms);
         if (fread(e->resp, 1, resp_len, f) != resp_len) {
             e->valid = false;      /* partial read - do not leave a torn slot live */
             break;
@@ -380,7 +452,7 @@ extern "C" void dns_server_cache_save(void)
     const uint64_t now_ms = (uint64_t)(esp_timer_get_time() / 1000);
     uint32_t saved = 0;
 
-    for (int i = 0; i < CACHE_SLOTS; i++) {
+    for (int i = 0; i < CACHE_ENTRIES; i++) {
         CacheEntry *e = &s_cache[i];
 
         uint32_t s1 = s_cache_seq.load(std::memory_order_relaxed);
@@ -988,9 +1060,9 @@ void DnsSinkServer::run_loop()
         vTaskDelete(nullptr);
         return;
     }
-    ESP_LOGI(TAG, "Result cache: %d slots x %d B in PSRAM (%u KB)",
-             CACHE_SLOTS, (int)sizeof(CacheEntry),
-             (unsigned)(CACHE_SLOTS * sizeof(CacheEntry) / 1024));
+    ESP_LOGI(TAG, "Result cache: %d-way x %d sets x %d B in PSRAM (%u KB)",
+             CACHE_WAYS, CACHE_SETS, (int)sizeof(CacheEntry),
+             (unsigned)(CACHE_ENTRIES * sizeof(CacheEntry) / 1024));
 
     /* #69 hedge stash: same shape as the forward cache above — PSRAM, one
      * boot-time allocation, dns_task-private. Failure is deliberately
@@ -1650,6 +1722,7 @@ static void do_metrics_reset(void)
 {
     s_cnt_total = s_cnt_blocked = s_cnt_forwarded = s_cnt_tcp = s_cnt_stale = 0;
     s_cnt_drop_table = s_cnt_upstream_to = s_cnt_cache_probe = s_cnt_cache_hit = 0;
+    s_cnt_cache_evict = s_cnt_cache_toobig = 0;
     s_cnt_coalesced = 0;
     s_cnt_hedges_sent = s_cnt_hedged_done = 0;   /* (#69); note the reset also empties
                                                     s_h_fwd_rtt, so the hedge delay falls
@@ -1707,6 +1780,7 @@ int dns_server_metrics_json(char *out, size_t cap)
         "\"tcp_queries\":%" PRIu32 ","
         "\"l2_blocked\":%" PRIu32 ",\"l2_cached\":%" PRIu32 ","
         "\"cache_probes\":%" PRIu32 ",\"cache_hits\":%" PRIu32 ",\"cache_hit_rate\":%.1f,"
+        "\"cache_evictions\":%" PRIu32 ",\"cache_too_big\":%" PRIu32 ","
         "\"stale_served\":%" PRIu32 ","
         "\"coalesced\":%" PRIu32 ","
         "\"hedges_sent\":%" PRIu32 ",\"hedged_completions\":%" PRIu32 ","
@@ -1723,6 +1797,7 @@ int dns_server_metrics_json(char *out, size_t cap)
         s_cnt_tcp,
         dns_sink_l2_blocked(), dns_sink_l2_cached(),
         probes, hits, hitrate,
+        s_cnt_cache_evict, s_cnt_cache_toobig,
         s_cnt_stale,
         s_cnt_coalesced,
         s_cnt_hedges_sent, s_cnt_hedged_done,
