@@ -45,7 +45,13 @@ appliance — these are all live and verified on hardware:
 
 * **mDNS** — reachable at `esp32adblock.local`, no IP needed.
 * **Multiple blocklist sources** — the built-in OISD primary plus up to four
-  extra URL feeds (malware/phishing, adult, etc.), each NVS-persisted.
+  extra URL feeds, each NVS-persisted, with one-click presets for the
+  [hagezi](https://github.com/hagezi/dns-blocklists) wildcard lists (ad tiers
+  Light through Ultimate, plus the TIF threat-intelligence feed). Extra-list
+  entries are deduplicated against the sorted primary at load time, so
+  capacity binds on the *union*, not the sum; entries dropped at capacity are
+  counted and surfaced in the UI and `/metrics` (`blocklist_dropped`) instead
+  of vanishing silently.
 * **Custom block rules** — an inline textarea (hosts format or bare domains,
   `#` comments), wildcard-style suffix matching, NVS-backed.
 * **Whitelist** — exempt domains from blocking, NVS-backed.

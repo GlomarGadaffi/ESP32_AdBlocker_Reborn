@@ -349,6 +349,7 @@ static esp_err_t handle_status(httpd_req_t *r)
         "<table><tr><th>#</th><th>URL</th><th>Action</th></tr>"
         "<tr><td>0 (primary)</td><td>%s</td><td>built-in</td></tr>",
         BLOCKLIST_URL);
+    int free_slot = -1;
     for (int i = 0; i < BLOCKLIST_EXTRA_MAX && n < (int)sizeof(page) - 512; i++) {
         char url[BLOCKLIST_URL_CAP]; blocklist_extra_url_get(i, url, sizeof(url));
         if (url[0]) {
@@ -360,6 +361,7 @@ static esp_err_t handle_status(httpd_req_t *r)
                 "<button>Remove</button></form></td></tr>",
                 i + 1, safe_url, i);
         } else {
+            if (free_slot < 0) free_slot = i;
             page_appendf(page, sizeof(page), &n,
                 "<tr><td>%d (empty)</td><td>"
                 "<form method=post action=/blocklist/url/set style='display:inline'>"
@@ -369,11 +371,48 @@ static esp_err_t handle_status(httpd_req_t *r)
                 i + 1, i);
         }
     }
-    page_appendf(page, sizeof(page), &n, "</table>"
-        "<p><small>After adding/removing a source, click <b>Reload blocklist</b> above.</small></p>"
-        "<p><small>Suggested security feeds: "
-        "<code>https://raw.githubusercontent.com/hagezi/dns-blocklists/main/domains/tif.txt</code> (malware/phishing) &nbsp; "
-        "<code>https://nsfw.oisd.nl/domainswild2</code> (adult content)</small></p>");
+    page_appendf(page, sizeof(page), &n, "</table>");
+
+    /* hagezi one-click presets (#4 follow-on): wildcard/ variants ONLY — they
+     * are 2-8x smaller than the domains/ versions for identical coverage under
+     * our suffix-walk matching (full domains/tif.txt is ~2.1M lines and can
+     * never fit BLOCKLIST_CAPACITY). Counts are 2026-08 snapshots, shown so
+     * the user can do the capacity math against the note below. */
+    if (free_slot >= 0 && n < (int)sizeof(page) - 2048) {
+        static const struct { const char *file, *label; } presets[] = {
+            { "tif.medium.txt", "TIF threat intel — malware/phishing (~326k)" },
+            { "light.txt",      "Light (~42k)" },
+            { "multi.txt",      "Normal (~190k)" },
+            { "pro.txt",        "Pro (~226k)" },
+            { "pro.plus.txt",   "Pro++ (~250k)" },
+            { "ultimate.txt",   "Ultimate (~269k)" },
+        };
+        page_appendf(page, sizeof(page), &n,
+            "<form method=post action=/blocklist/url/set>"
+            "<input type=hidden name=idx value=%d>"
+            "<select name=url><option value=''>hagezi preset&hellip;</option>", free_slot);
+        for (size_t i = 0; i < sizeof(presets)/sizeof(presets[0]); i++)
+            page_appendf(page, sizeof(page), &n,
+                "<option value='https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/%s'>%s</option>",
+                presets[i].file, presets[i].label);
+        page_appendf(page, sizeof(page), &n, "</select> <button>Add preset</button></form>");
+    }
+
+    {
+        uint32_t bl_dropped = blocklist_dropped_count();
+        if (bl_dropped > 0)
+            page_appendf(page, sizeof(page), &n,
+                "<p class=warn><b>&#9888; Last reload overflowed the %uk-entry buffer: "
+                "%" PRIu32 " entries dropped — blocking is incomplete.</b> "
+                "Remove a source or pick smaller lists.</p>",
+                (unsigned)(BLOCKLIST_CAPACITY / 1000), bl_dropped);
+    }
+    page_appendf(page, sizeof(page), &n,
+        "<p><small>After adding/removing a source, click <b>Reload blocklist</b> above. "
+        "Any http(s) list in plain, hosts, adblock or *.wildcard format works. All sources "
+        "combined are capped at %uk entries after dedup vs primary; OISD uses ~270k of that. "
+        "For hagezi use the <code>wildcard/</code> files, never <code>domains/</code>.</small></p>",
+        (unsigned)(BLOCKLIST_CAPACITY / 1000));
 
     page_appendf(page, sizeof(page), &n, "</div><div class='tab' id=tab-access>");
 

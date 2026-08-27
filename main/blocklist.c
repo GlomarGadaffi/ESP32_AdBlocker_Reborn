@@ -37,6 +37,7 @@ static int       s_active_buf = 0;  /* which buffer is currently live  */
 static _Atomic(uint32_t *) s_live    = NULL;
 static _Atomic uint32_t    s_count   = 0;
 static _Atomic bool        s_loading = false;
+static _Atomic uint32_t    s_dropped = 0;   /* entries lost to capacity on last reload */
 
 /* Mutex guarding the whitelist AND custom-rules arrays. Created first thing in
  * blocklist_init(), before any NVS loader runs, so every writer/reader below can
@@ -201,12 +202,21 @@ static void radix_sort(uint32_t *a, uint32_t *b, uint32_t n)
 }
 
 /* ── Download callback ───────────────────────────────────────────── */
-typedef struct { uint32_t *buf; uint32_t cap; uint32_t n; uint32_t rejected; } load_ctx_t;
+typedef struct {
+    uint32_t *buf;
+    uint32_t  cap;
+    uint32_t  n;
+    uint32_t  rejected;
+    uint32_t  dropped;        /* lost to capacity (surfaced after load) */
+    uint32_t  sorted_prefix;  /* buf[0..sorted_prefix) is sorted+deduped; extras
+                               * binary-search it so duplicates cost no capacity */
+    uint32_t  deduped;        /* extra-list entries skipped as already present */
+} load_ctx_t;
 
 static bool on_domain_line(const char *line, size_t len, void *ctx)
 {
     load_ctx_t *lc = (load_ctx_t *)ctx;
-    if (lc->n >= lc->cap) return true;  /* silently skip if over capacity */
+    if (lc->n >= lc->cap) { lc->dropped++; return true; }  /* over capacity — counted, surfaced after load */
 
     /* Hosts-format prefixes and adblock ||anchors^ must be peeled off, or the
      * whole raw line hashes as one junk entry: the feed then reports a healthy
@@ -219,8 +229,27 @@ static bool on_domain_line(const char *line, size_t len, void *ctx)
     size_t nlen = domain_normalize(norm, sizeof(norm), tok, tlen);
     if (nlen == 0 || domain_is_bare_tld(norm, nlen)) return true;
 
-    lc->buf[lc->n++] = domain_hash(norm, nlen);
+    uint32_t h = domain_hash(norm, nlen);
+    if (lc->sorted_prefix) {
+        /* Extra-list entry: binary-search the sorted primary prefix so a
+         * duplicate costs no capacity. Capacity binds near the DEDUPED union
+         * instead of the raw one — what makes OISD + Ultimate + TIF fit. */
+        uint32_t lo = 0, hi = lc->sorted_prefix;
+        while (lo < hi) {
+            uint32_t mid = lo + (hi - lo) / 2;
+            if      (lc->buf[mid] < h) lo = mid + 1;
+            else if (lc->buf[mid] > h) hi = mid;
+            else { lc->deduped++; return true; }
+        }
+    }
+    lc->buf[lc->n++] = h;
     return true;
+}
+
+static int cmp_u32(const void *x, const void *y)
+{
+    uint32_t a = *(const uint32_t *)x, b = *(const uint32_t *)y;
+    return (a > b) - (a < b);
 }
 
 /* ── NVS whitelist persistence ───────────────────────────────────── */
@@ -331,17 +360,43 @@ uint32_t blocklist_load(void)
     ESP_LOGI(TAG, "Primary: %" PRIu32 " domains (%" PRIu32 " lines rejected)",
              lc.n, lc.rejected);
 
-    /* Fetch extra blocklists and append to the same buffer */
+    bool have_extras = false;
+    for (int i = 0; i < BLOCKLIST_EXTRA_MAX; i++)
+        if (s_extra_urls[i][0] != '\0') { have_extras = true; break; }
+
+    /* Dedup-aware extras: sort+dedup the primary IN PLACE first (qsort — no
+     * O(n) scratch, because the only scratch-sized buffer is the LIVE one and
+     * it must keep serving during the fetch). Extra-list entries then
+     * binary-search this prefix in on_domain_line and duplicates are skipped,
+     * so capacity binds near the deduped union rather than the raw one.
+     * Runs in the download task (Core 0), cold path only. */
+    if (have_extras) {
+        qsort(lc.buf, lc.n, sizeof(uint32_t), cmp_u32);
+        uint32_t u = 0;
+        for (uint32_t i = 0; i < lc.n; i++)
+            if (u == 0 || lc.buf[i] != lc.buf[u - 1]) lc.buf[u++] = lc.buf[i];
+        ESP_LOGI(TAG, "Primary sorted+deduped in place: %" PRIu32 " -> %" PRIu32, lc.n, u);
+        lc.n = u;
+        lc.sorted_prefix = u;
+    }
+
+    /* Fetch extra blocklists and append (deduped vs primary) to the same buffer */
     for (int i = 0; i < BLOCKLIST_EXTRA_MAX; i++) {
         if (s_extra_urls[i][0] == '\0') continue;
-        uint32_t before = lc.n, rej_before = lc.rejected;
+        uint32_t before = lc.n, rej_before = lc.rejected, dup_before = lc.deduped;
         ESP_LOGI(TAG, "Downloading extra list %d: %s", i, s_extra_urls[i]);
         http_fetch_lines(s_extra_urls[i], on_domain_line, &lc);
-        ESP_LOGI(TAG, "Extra list %d: %" PRIu32 " domains added, %" PRIu32 " lines rejected",
-                 i, lc.n - before, lc.rejected - rej_before);
-        if (lc.n == before && lc.rejected > rej_before)
+        ESP_LOGI(TAG, "Extra list %d: %" PRIu32 " new domains, %" PRIu32 " already in primary, %" PRIu32 " lines rejected",
+                 i, lc.n - before, lc.deduped - dup_before, lc.rejected - rej_before);
+        if (lc.n == before && lc.deduped == dup_before && lc.rejected > rej_before)
             ESP_LOGW(TAG, "Extra list %d contributed nothing usable — wrong format?", i);
     }
+    atomic_store(&s_dropped, lc.dropped);
+    if (lc.dropped > 0)
+        ESP_LOGW(TAG, "CAPACITY EXCEEDED: %" PRIu32 " entries dropped (cap %u) — the live "
+                 "list is incomplete. Remove a source or switch to smaller lists "
+                 "(hagezi wildcard/ variants, not domains/).",
+                 lc.dropped, (unsigned)BLOCKLIST_CAPACITY);
     ESP_LOGI(TAG, "Total %" PRIu32 " domains before dedup; sorting...", lc.n);
 
     /* The sort needs the other buffer as scratch — that's the live one, so we
@@ -581,5 +636,6 @@ void blocklist_save_sd(void)
         ESP_LOGW(TAG, "SD blocklist: short write %" PRIu32 "/%" PRIu32, (uint32_t)written, n);
 }
 
-uint32_t blocklist_domain_count(void) { return atomic_load(&s_count); }
-bool     blocklist_is_loading(void)   { return atomic_load(&s_loading); }
+uint32_t blocklist_domain_count(void)  { return atomic_load(&s_count); }
+bool     blocklist_is_loading(void)    { return atomic_load(&s_loading); }
+uint32_t blocklist_dropped_count(void) { return atomic_load(&s_dropped); }

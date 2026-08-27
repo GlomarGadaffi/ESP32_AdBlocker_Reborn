@@ -10,11 +10,20 @@ extern "C" {
 /* OISD big list URL (domainswild2 format) */
 #define BLOCKLIST_URL  "https://big.oisd.nl/domainswild2"
 
-/* Capacity must hold the UNION of all sources before dedup. OISD big (~333k) +
- * hagezi Pro (~497k) dedupes to ~735k; 780k leaves headroom for list growth.
- * Cost: 2 ping-pong buffers x CAPACITY x 4B in PSRAM (780k -> 6.24MB of ~8MB).
- * Entries past capacity are silently dropped at load, so keep this >= union. */
-#define BLOCKLIST_CAPACITY  780000u
+/* Capacity must hold the deduped primary plus each extra list's NEW entries
+ * (extras are binary-searched against the sorted primary at load, so a
+ * duplicate costs nothing; only extras-vs-extras overlap still counts twice).
+ * Sized against hagezi's wildcard/ variants (Pro ~226k, Ultimate ~269k,
+ * TIF-medium ~326k as of 2026-08) — never the domains/ versions, which are
+ * 2-8x larger for identical coverage under our suffix-walk matching (full TIF
+ * is ~2.1M alone and can never fit). OISD big (~333k) + AdGuard + Ultimate +
+ * TIF-medium peaked at 778,569 deduped (2026-08-26) — the raw union (~1.04M)
+ * would not fit at all. 820k restores real margin over that measured peak;
+ * the extra 320KB came out of a measured 1.45MB psram_free, leaving ~1.1MB
+ * for mbedTLS (which allocs its TLS buffers from PSRAM since 2e03f2d).
+ * Overflow is counted and surfaced via blocklist_dropped_count(), not silent.
+ * Cost: 2 ping-pong buffers x CAPACITY x 4B in PSRAM (820k -> 6.56MB of ~8MB). */
+#define BLOCKLIST_CAPACITY  820000u
 
 /* NVS whitelist — domains that always bypass blocklist (up to 64) */
 #define WHITELIST_MAX  64
@@ -79,6 +88,9 @@ bool   blocklist_custom_is_blocked(const char *domain, size_t len);
 /* Stats */
 uint32_t blocklist_domain_count(void);
 bool     blocklist_is_loading(void);
+/* Entries discarded on the last reload because the union of all sources
+ * exceeded BLOCKLIST_CAPACITY. Non-zero means the live list is INCOMPLETE. */
+uint32_t blocklist_dropped_count(void);
 
 #ifdef __cplusplus
 }
