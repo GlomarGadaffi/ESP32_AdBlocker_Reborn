@@ -300,6 +300,57 @@ static uint32_t sort_dedup(uint32_t *a, uint32_t n)
     return u;
 }
 
+/* Fold the raw chunk a[p..n) into the sorted, deduped prefix a[0..p) and
+ * return the new total. Replaces re-sorting the whole array per feed, whose
+ * qsort fallback (n > CAPACITY/2) cost an indirect comparator per compare over
+ * PSRAM — on the measured 4-feed mix that was two whole-array qsorts per
+ * reload. Here only the m-word chunk is sorted, then merged in O(p+m').
+ *
+ * The chunk arrived through the prefix binary search in on_domain_line, so
+ * chunk ∩ prefix = ∅; equals can only be intra-chunk and die in the chunk
+ * dedup. The merge is written to tolerate an equal pair anyway (both copies
+ * survive, adjacent — one wasted slot, never a corrupt order).
+ *
+ * A zero-scratch backward merge of ADJACENT runs is not safe: with the chunk
+ * at [p, p+m'), the first write at p+m'-1 lands on the chunk's own unread
+ * top. So the deduped chunk is first moved to the buffer's far end,
+ * b = a+CAPACITY-m', making destination and chunk disjoint: the highest write
+ * is p+m'-1 < CAPACITY-m' exactly when p + 2m' <= CAPACITY. On the prefix
+ * side, while chunk elements remain w = i+j > i, so a[--w] never touches an
+ * unread a[i-1]; once the chunk is exhausted the remaining prefix is already
+ * in place. The one geometry that fails the gate — free space smaller than
+ * the chunk, only reachable within a whisker of capacity — falls back to the
+ * whole-array sort_dedup. */
+static uint32_t fold_sorted_chunk(uint32_t *a, uint32_t p, uint32_t n)
+{
+    uint32_t m = n - p;
+    if (m == 0) return p;
+    if (p == 0) return sort_dedup(a, n);
+
+    /* Sort the chunk alone: its own tail a[n..n+m) is valid radix scratch
+     * whenever it fits under CAPACITY; otherwise qsort just the m words. */
+    if (n + m <= BLOCKLIST_CAPACITY) radix_sort(a + p, a + n, m);
+    else if (m > 1)                  qsort(a + p, m, sizeof(uint32_t), cmp_u32);
+
+    /* Dedup the chunk in place (intra-feed repeats only). */
+    uint32_t mp = 0;
+    for (uint32_t i = 0; i < m; i++)
+        if (mp == 0 || a[p + i] != a[p + mp - 1]) a[p + mp++] = a[p + i];
+
+    if (p + 2u * mp > BLOCKLIST_CAPACITY)
+        return sort_dedup(a, p + mp);   /* near-capacity fallback, see above */
+
+    uint32_t *b = a + BLOCKLIST_CAPACITY - mp;
+    memmove(b, a + p, (size_t)mp * sizeof(uint32_t));
+
+    uint32_t i = p, j = mp, w = p + mp;
+    while (i > 0 && j > 0)
+        a[--w] = (a[i - 1] > b[j - 1]) ? a[--i] : b[--j];
+    while (j > 0) a[--w] = b[--j];
+    /* i > 0 remainder: already in place (w == i here). */
+    return p + mp;
+}
+
 /* ── NVS whitelist persistence ───────────────────────────────────── */
 static void wl_load_nvs(void)
 {
@@ -473,7 +524,7 @@ uint32_t blocklist_load(void)
          * already covers [0,n) and a re-sort would be a full pass for nothing. */
         uint32_t appended = lc.n - before, self_dupes = 0;
         if (appended > 0) {
-            uint32_t merged = sort_dedup(lc.buf, lc.n);
+            uint32_t merged = fold_sorted_chunk(lc.buf, lc.sorted_prefix, lc.n);
             self_dupes = lc.n - merged;   /* only intra-feed repeats reach here —
                                            * anything the prefix held was already
                                            * caught by the binary search */
