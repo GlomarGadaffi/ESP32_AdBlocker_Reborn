@@ -161,6 +161,10 @@ struct CacheEntry {
     uint16_t   resp_len;              /* allowed: cached raw response length (0 = blocked) */
     uint64_t   refresh_after_ms;      /* stale-refresh rate gate; dns_task only, not
                                          read by the L2 path so no seqlock needed */
+    uint32_t   load_gen;              /* blocklist_generation() at store time (#85) — a
+                                         lookup under a newer generation treats this entry
+                                         as a miss instead of trusting a verdict made
+                                         under a blocklist that's no longer current */
     uint8_t    resp[FWD_RESP_MAX];    /* allowed: raw upstream response */
 };
 static CacheEntry *s_cache = nullptr; /* CACHE_ENTRIES entries in PSRAM */
@@ -204,9 +208,11 @@ static inline CacheEntry *cache_set(uint32_t h, uint16_t qtype)
 static CacheEntry *cache_lookup(uint32_t h, uint16_t qtype, uint64_t now_ms)
 {
     CacheEntry *set = cache_set(h, qtype);
+    uint32_t gen = blocklist_generation();  /* (#85) one load, reused across all WAYS */
     for (int w = 0; w < CACHE_WAYS; w++) {
         CacheEntry *e = &set[w];
-        if (e->valid && e->key_hash == h && e->qtype == qtype && e->ttl_deadline_ms > now_ms)
+        if (e->valid && e->key_hash == h && e->qtype == qtype && e->ttl_deadline_ms > now_ms
+            && e->load_gen == gen)
             return e;
     }
     return nullptr;
@@ -245,6 +251,7 @@ static void cache_store_blocked(uint32_t h, uint16_t qtype, uint32_t ttl_s, uint
     e->key_hash = h; e->qtype = qtype; e->blocked = true; e->valid = true;
     e->resp_len = 0;
     e->ttl_deadline_ms = now_ms + (uint64_t)ttl_s * 1000u;
+    e->load_gen = blocklist_generation();  /* (#85) */
     cache_write_end();
 }
 static void cache_store_resp(uint32_t h, uint16_t qtype, const uint8_t *resp, int len,
@@ -259,6 +266,7 @@ static void cache_store_resp(uint32_t h, uint16_t qtype, const uint8_t *resp, in
     memcpy(e->resp, resp, len);
     e->ttl_deadline_ms   = now_ms + (uint64_t)ttl_s * 1000u;
     e->refresh_after_ms  = 0;
+    e->load_gen           = blocklist_generation();  /* (#85) */
     cache_write_end();
 }
 
@@ -268,12 +276,14 @@ static void cache_store_resp(uint32_t h, uint16_t qtype, const uint8_t *resp, in
 static CacheEntry *cache_lookup_stale(uint32_t h, uint16_t qtype, uint64_t now_ms)
 {
     CacheEntry *set = cache_set(h, qtype);
+    uint32_t gen = blocklist_generation();  /* (#85) */
     for (int w = 0; w < CACHE_WAYS; w++) {
         CacheEntry *e = &set[w];
         if (e->valid && !e->blocked && e->resp_len > 0 &&
             e->key_hash == h && e->qtype == qtype &&
             e->ttl_deadline_ms <= now_ms &&
-            e->ttl_deadline_ms + (uint64_t)STALE_MAX_S * 1000u > now_ms)
+            e->ttl_deadline_ms + (uint64_t)STALE_MAX_S * 1000u > now_ms &&
+            e->load_gen == gen)
             return e;
     }
     return nullptr;
@@ -315,6 +325,10 @@ extern "C" int IRAM_ATTR dns_cache_l2_get(uint32_t qhash, uint16_t qtype, uint8_
     if (!s_cache || !out) return -1;
     uint64_t now_ms = (uint64_t)(esp_timer_get_time() / 1000);
     CacheEntry *set = cache_set(qhash, qtype);
+    uint32_t gen = blocklist_generation();  /* (#85) — this path only ever serves
+                                                ALLOWED entries, so it's exactly as
+                                                exposed to a stale cached ALLOW as
+                                                the dns_task path is */
 
     uint32_t s1 = s_cache_seq.load(std::memory_order_relaxed);
     if (s1 & 1u) return -1;                       /* writer mid-update */
@@ -327,6 +341,7 @@ extern "C" int IRAM_ATTR dns_cache_l2_get(uint32_t qhash, uint16_t qtype, uint8_
         CacheEntry *e = &set[w];
         if (!e->valid || e->blocked || e->key_hash != qhash || e->qtype != qtype) continue;
         if (e->ttl_deadline_ms <= now_ms) continue;  /* expired */
+        if (e->load_gen != gen) continue;            /* (#85) stale verdict */
         int l = e->resp_len;
         if (l <= 0 || l > out_cap || l > FWD_RESP_MAX) continue;
         memcpy(out, e->resp, (size_t)l);

@@ -111,6 +111,13 @@ bool   blocklist_custom_is_blocked(const char *domain, size_t len);
 void blocklist_set_paused(bool paused);
 bool blocklist_is_paused(void);
 
+/* Bumped on every reload that swaps in a new live list (#85). The forward
+ * cache in dns_server.cpp stamps each stored entry with this value and
+ * treats a stale generation as a miss on lookup, rather than serving a
+ * verdict made under a blocklist that's no longer current. Cheap to call —
+ * IRAM_ATTR-tagged, no lock, single atomic load. */
+uint32_t blocklist_generation(void);
+
 /* Abort an in-progress blocklist download/reload (#1, mirrors upstream's
  * xStop). No-op (logged, not silently dropped) if nothing is loading yet —
  * see blocklist_stop_load()'s own comment for why that guard exists. The

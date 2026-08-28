@@ -45,6 +45,14 @@ static int       s_active_buf = 0;  /* which buffer is currently live  */
 static _Atomic(uint32_t *) s_live    = NULL;
 static _Atomic uint32_t    s_count   = 0;
 static _Atomic bool        s_loading = false;
+/* Bumped every time a reload swaps in a new live list (#85). The forward
+ * cache stamps each entry with the generation live when it was stored;
+ * a lookup against a stale generation is treated as a miss instead of
+ * trusting a verdict made under a blocklist that's no longer current —
+ * closes the window where a domain queried while the list was still
+ * loading (or under the previous one) stays wrongly cached ALLOW for up
+ * to an hour after a reload that would have blocked it. */
+static _Atomic uint32_t    s_blocklist_gen = 0;
 static _Atomic bool        s_paused  = false;  /* global block/allow-all switch */
 static _Atomic bool        s_stop_requested = false;  /* #1: mirrors upstream's xStop */
 static _Atomic uint32_t    s_dropped = 0;   /* entries lost to capacity on last reload */
@@ -666,6 +674,7 @@ uint32_t blocklist_load(void)
     atomic_store_explicit(&s_count, unique, memory_order_relaxed);
     s_active_buf = new_buf;
     atomic_store_explicit(&s_live, s_buf[new_buf], memory_order_release);
+    atomic_fetch_add_explicit(&s_blocklist_gen, 1, memory_order_release);  /* (#85) */
 
     ESP_LOGI(TAG, "Blocklist live: %" PRIu32 " domains", unique);
     atomic_store(&s_loading, false);
@@ -739,6 +748,14 @@ bool blocklist_is_blocked_nb(const char *domain, size_t len)
 bool blocklist_is_paused(void)
 {
     return atomic_load_explicit(&s_paused, memory_order_relaxed);
+}
+
+/* IRAM_ATTR (#78 in spirit): read from the L2/dns_task hot path's cache
+ * lookup on every query (#85), so it needs the same "never touch flash"
+ * treatment as the functions #78 named. */
+uint32_t IRAM_ATTR blocklist_generation(void)
+{
+    return atomic_load_explicit(&s_blocklist_gen, memory_order_acquire);
 }
 
 void blocklist_set_paused(bool paused)
