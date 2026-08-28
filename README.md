@@ -1,7 +1,8 @@
 # ESP32_AdBlocker_Reborn
 
-A native ESP-IDF DNS sinkhole for the LilyGO T-ETH-Elite (ESP32-S3 + W5500 SPI
-Ethernet). It hosts the full OISD "big" wildcard blocklist plus up to four
+A native ESP-IDF DNS sinkhole for ESP32-S3 + W5500 SPI Ethernet boards — the
+LilyGO T-ETH-Elite and the Waveshare ESP32-S3-ETH (see Hardware for the
+per-board pin maps). It hosts the full OISD "big" wildcard blocklist plus up to four
 extra feeds (hagezi ad tiers and threat-intelligence presets built in — 700k+
 domains total), sinkholes ad, tracker, and malware domains at the network
 layer, and forwards and caches everything else. Pure ESP-IDF 6.0.1, no
@@ -80,6 +81,51 @@ appliance — these are all live and verified on hardware:
   UDP on failure.
 * **Cache-poisoning hardening** — randomized transaction IDs plus question
   (qname + qtype) validation on every upstream reply before it is cached.
+* **Pause blocking** — a one-click Dashboard toggle (mirroring upstream
+  s60sc/ESP32_AdBlocker's "Enable AdBlocker" switch) that allows every query
+  through without touching the loaded blocklist, whitelist, custom rules, or
+  ACL. NVS-persisted, survives reboot. `/metrics` reports `blocklist_paused`.
+* **Stop an in-progress reload** (mirrors upstream's Stop Load button) — abort
+  the current blocklist download/reload; the previously-loaded list keeps
+  serving throughout, same as any other reload.
+* **Optional web UI login** (mirrors upstream's Auth_Name/Auth_Pass) — HTTP
+  Basic Auth gating every page and endpoint, off by default (empty username).
+  NVS-persisted. No recovery path short of an NVS erase if forgotten — same
+  as upstream, which has none either.
+* **Setup AP for zero-touch first-boot Wi-Fi config** (mirrors upstream's
+  AP-mode bootstrap) — if neither Ethernet nor Wi-Fi comes up within 30s of
+  boot, an open SoftAP ("ESP32AdBlock-Setup") comes up at 192.168.4.1 serving
+  the same web UI, so a phone can join it and enter real Wi-Fi credentials
+  with no serial cable. Shuts off automatically once any interface gets an
+  IP. It's unauthenticated by design (nothing is configured yet to
+  authenticate against) and can appear during any boot-time link outage
+  longer than 30s, not just a true first boot — same trusted-LAN threat
+  model as upstream's own AP mode.
+* **Browser-driven firmware update** (mirrors upstream's OTA Upload tab) —
+  upload a merged `.bin` from the Network tab, no toolchain or serial cable
+  needed. Dual OTA partitions with automatic rollback
+  (`CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE`): if a new image fails to bring up
+  DNS serving and the web UI, the next boot reverts to the previous slot
+  automatically — the load-bearing safety net for a device with no display.
+
+## Feature parity with upstream s60sc/ESP32_AdBlocker
+
+| upstream feature | Reborn | notes |
+| --- | --- | --- |
+| DNS sinkhole, external DNS forward | ✅ | ground-up rewrite — hash-based blocklist, forward cache, L2 fast path, TXID hardening; see Measured performance |
+| Enable AdBlocker (on/off) | ✅ | Pause blocking, above |
+| Stop Blocklist Load | ✅ | Stop an in-progress reload, above |
+| Add/Del/Check domain | ✅ | Whitelist + Custom block rules + `/check`, all NVS-backed |
+| Clear custom blocklist | ✅ | Custom Block Rules textarea, save empty to clear |
+| Single blocklist URL, daily reload | ✅ (exceeded) | up to 4 extra sources with dedup-aware capacity, hagezi presets, 4h reload |
+| Auth_Name / Auth_Pass (optional login) | ✅ | Optional web UI login, above |
+| AP-mode first-boot Wi-Fi setup | ✅ | Setup AP, above |
+| OTA Upload tab | ✅ | Browser-driven firmware update, above, plus auto-rollback upstream doesn't have |
+| Verbose per-query logging | ✅ (superseded) | `/log` query-log ring with real timestamps + `/top` analytics, more structured than a verbose toggle |
+| Eth+AP / Ethernet-only / Wi-Fi network modes | ✅ (different model) | Ethernet always up, Wi-Fi optionally alongside (`CONFIG_ADBLOCK_NET_WIFI`) rather than one replacing the other — a deliberate design choice, not a gap |
+| maxDomains / minMemory / maxDomLen tuning | N/A by design | fixed PSRAM ping-pong buffers sized to fit full modern lists (`BLOCKLIST_CAPACITY`); this is a from-scratch storage design, not the same knobs upstream needs for its linear array |
+| WebDAV `/data` sync | N/A | upstream needs this because its web UI lives on a separate SD `/data` filesystem; Reborn's UI is compiled into firmware, so there's no equivalent filesystem to sync |
+| Static-IP / router-IP config | ✅ (different UI) | per-interface DHCP/static in the Network tab, not a single global router-IP field |
 
 ## Measured performance
 
@@ -149,13 +195,13 @@ per-item record. Resolved since the original audit:
   internet. (#22, #23, #24, #28, #35, #44)
 * **Concurrency races fixed.** The custom-rules, ACL, and rewrite tables are now
   synchronized between the httpd writer and the dns_task reader.
+* **DoT no longer runs synchronously in the DNS task.** A dedicated worker
+  task owns one persistent RFC 7858 session; dns_task enqueues and drains it
+  without blocking, so a slow DoT handshake can no longer stall other
+  queries. DoT is still opt-in and off by default. (closes C2, #5)
 
 Remaining open items:
 
-* **DoT runs synchronously in the DNS task.** With DoT enabled, a slow query can
-  briefly stall other queries; the inline timeout is capped (1.5 s) and falls
-  back to UDP, but the proper fix is a worker task / persistent session. DoT is
-  opt-in and off by default. (ISSUES.md C2)
 * **The "about a second" SD reload is not independently re-measured.** (#38)
 * ~~Some headline ad roots aren't in the loaded list.~~ Resolved by the
   multi-source setup: with hagezi Ultimate + TIF loaded (711k domains),
@@ -166,22 +212,60 @@ See the issue tracker and `ISSUES.md` for the full, code-grounded analysis.
 
 ## Hardware
 
-LilyGO T-ETH-Elite: ESP32-S3-WROOM-1 (16 MB flash, 8 MB OPI PSRAM) plus a W5500.
+Two boards are supported, selected by the `ADBLOCK_BOARD` Kconfig choice.
+Both are ESP32-S3 with 16 MB flash and 8 MB octal PSRAM plus a W5500, so the
+whole feature set is identical; only the pin maps and the mDNS hostname
+differ. (Don't OTA-upload one board's image to the other — Ethernet comes up
+dead and the rollback watchdog has to revert it.)
+
+**LilyGO T-ETH-Elite** (default) — ESP32-S3-WROOM-1 N16R8, `esp32adblock.local`:
 
 | function | pins |
 | --- | --- |
 | W5500 (SPI2) | SCLK 48, MISO 47, MOSI 21, CS 45, INT 14, 40 MHz |
 | MicroSD (SPI3) | SCLK 10, MISO 9, MOSI 11, CS 12 |
 
+**Waveshare ESP32-S3-ETH** — ESP32-S3R8, `esp32adblock2.local`:
+
+| function | pins |
+| --- | --- |
+| W5500 (SPI2) | SCLK 13, MISO 12, MOSI 11, CS 14, INT 10, RST 9, 40 MHz |
+| TF slot (SPI3) | SCLK 7, MISO 5, MOSI 6, CS 4 |
+
+The SD card is optional on both boards: with no card, boot falls back to the
+HTTPS blocklist download every time instead of the ~1 s SD cache reload.
+
 ## Build and flash
 
-Built for the **LilyGO T-ETH-Elite (ESP32-S3 + W5500)**. Prebuilt images are on
-the [releases page](../../releases) — flash the single merged image with esptool
-(no toolchain needed):
+The default build (`sdkconfig`, `build/`) targets the **LilyGO T-ETH-Elite**.
+The **Waveshare ESP32-S3-ETH** builds into its own directory with its own
+sdkconfig, so the two builds never fight over the board choice:
 
 ```sh
-esptool.py --chip esp32s3 -p PORT -b 460800 write_flash 0x0 dns-sink-merged.bin
+idf.py -B build-waveshare "-DSDKCONFIG=sdkconfig.waveshare" \
+  "-DSDKCONFIG_DEFAULTS=sdkconfig.defaults;sdkconfig.board.waveshare-s3-eth" build
+idf.py -B build-waveshare -p PORT flash
 ```
+
+(The `-D` values are cached in the build dir after the first configure, so
+later runs only need `-B build-waveshare`.)
+
+Dual OTA partitions
+(`ota_0`/`ota_1`, 1700K each) — a first flash needs all four regions from the
+build's own `flash_args` (never hand-type offsets):
+
+```sh
+esptool.py --chip esp32s3 -p PORT -b 460800 write-flash \
+  --flash-mode dio --flash-freq 80m --flash-size 16MB \
+  0x0     bootloader.bin \
+  0x8000  partition-table.bin \
+  0xf000  ota_data_initial.bin \
+  0x20000 dns-sink.bin
+```
+
+After that first flash, updates don't need a toolchain or serial cable at
+all — use the web UI's **Network → Firmware Update** upload (see Feature set
+above); it auto-reverts if the new image doesn't come up cleanly.
 
 Or build from source (ESP-IDF v6.0.x):
 
@@ -197,8 +281,9 @@ address.
 
 ## Networking
 
-Reachable at **`esp32adblock.local`** (mDNS) from boot, so you don't need to
-hunt for the DHCP lease.
+Reachable via mDNS from boot, so you don't need to hunt for the DHCP lease:
+**`esp32adblock.local`** on the T-ETH-Elite, **`esp32adblock2.local`** on the
+Waveshare (distinct names so both boards can share a LAN).
 
 Ethernet (W5500) is always brought up. Wi-Fi STA can run **alongside** it by
 enabling `CONFIG_ADBLOCK_NET_WIFI` — both stay up together, and either link
@@ -235,15 +320,18 @@ main/
 
 ## Roadmap
 
-* **Generic ESP32-S3 build (Wi-Fi only) — partly done.** Wi-Fi STA bring-up now
-  exists and runs *alongside* the W5500 rather than replacing it
-  (`CONFIG_ADBLOCK_NET_WIFI`, see Networking above), so the radio half of this
-  is built and proven. What's left for a truly generic board is dropping the
-  hard W5500 + SD-card dependencies so it builds with no LilyGO hardware at
-  all. Note the L2 Ethernet fast-path has no Wi-Fi equivalent (no esp_eth RX
+* **Generic ESP32-S3 build (Wi-Fi only) — mostly done.** Wi-Fi STA bring-up
+  runs *alongside* the W5500 (`CONFIG_ADBLOCK_NET_WIFI`, see Networking above),
+  a second board is now supported via the `ADBLOCK_BOARD` pin-map choice (see
+  Hardware — the Waveshare ESP32-S3-ETH port is verified on hardware, including
+  a browser-OTA cutover with no serial cable attached), and the SD card is
+  proven optional at runtime (a cardless Waveshare unit runs in production off
+  the HTTPS download path). What's left for a truly *generic* board is making
+  the W5500 itself optional so it builds with no Ethernet hardware at all.
+  Note the L2 Ethernet fast-path has no Wi-Fi equivalent (no esp_eth RX
   hook), so Wi-Fi-served queries take the ~1.8 ms lwIP socket path rather than
   the L2 bypass, and blocklist storage may shrink on quad (vs octal) PSRAM.
   Tracked in #49.
-* DoT upstream as a worker task / persistent session (off the DNS hot path).
 * DoH/DoT *server* (serve secure DNS to clients).
-* Per-list enable/disable toggle + temporary "pause blocking" control (#48).
+* Per-list enable/disable toggle (#48 — the whole-device "pause blocking"
+  half of this is now done; see Feature set above).

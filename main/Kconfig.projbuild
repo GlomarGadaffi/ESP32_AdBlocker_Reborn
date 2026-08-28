@@ -1,5 +1,24 @@
 menu "ESP32 AdBlocker Reborn"
 
+    choice ADBLOCK_BOARD
+        prompt "Target board"
+        default ADBLOCK_BOARD_T_ETH_ELITE
+        help
+            Selects the W5500 + SD-card pin map compiled into the firmware,
+            and the mDNS hostname (esp32adblock.local for the Elite,
+            esp32adblock2.local for the Waveshare, so two units can share a
+            LAN). Both boards are ESP32-S3 with 16MB flash + 8MB octal
+            PSRAM, so everything else is identical. NOTE: a web-UI OTA
+            upload of the wrong board's image leaves Ethernet dead until
+            the rollback watchdog reverts it — flash the matching build.
+
+        config ADBLOCK_BOARD_T_ETH_ELITE
+            bool "LilyGO T-ETH-Elite (W5500 on 48/47/21/45)"
+
+        config ADBLOCK_BOARD_WAVESHARE_S3_ETH
+            bool "Waveshare ESP32-S3-ETH (W5500 on 13/12/11/14)"
+    endchoice
+
     config ADBLOCK_NET_WIFI
         bool "Also bring up Wi-Fi STA alongside W5500 Ethernet (dual-WAN)"
         default n

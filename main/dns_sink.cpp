@@ -1,7 +1,9 @@
 /*
- * dns_sink.cpp — ESP-IDF entry point for DNS sinkhole on LilyGO T-ETH-Elite
+ * dns_sink.cpp — ESP-IDF entry point for the DNS sinkhole.
  *
- * W5500 Ethernet bringup for the T-ETH-Elite pin map (SPI2, event-group DHCP wait).
+ * W5500 Ethernet bringup (SPI2, event-group DHCP wait). The W5500 + SD pin
+ * map is selected per board via the ADBLOCK_BOARD Kconfig choice: LilyGO
+ * T-ETH-Elite (default) or Waveshare ESP32-S3-ETH.
  */
 
 #include "freertos/FreeRTOS.h"
@@ -24,6 +26,7 @@
 #include "esp_netif.h"
 #include "nvs_flash.h"
 #include "nvs.h"
+#include "esp_ota_ops.h"
 #include "esp_mac.h"
 #include "esp_timer.h"
 #include "lwip/inet.h"
@@ -54,6 +57,40 @@
 
 static const char *TAG = "dns_sink";
 
+#if CONFIG_ADBLOCK_BOARD_WAVESHARE_S3_ETH
+
+/* ── Pin maps: Waveshare ESP32-S3-ETH (ESP32-S3R8 + W5500) ──────── */
+#define BOARD_NAME    "Waveshare ESP32-S3-ETH"
+/* Distinct mDNS hostname — a T-ETH-Elite unit on the same LAN already
+ * claims esp32adblock.local. */
+#define MDNS_HOSTNAME "esp32adblock2"
+
+/* TF slot, SPI mode (CS=DAT3, MISO=DAT0, MOSI=CMD). Pins from the
+ * CircuitPython board definition; a card has not yet been tested in this
+ * slot — a wrong pin here just fails the mount and falls back to download. */
+#define SD_MISO_GPIO  5
+#define SD_MOSI_GPIO  6
+#define SD_SCLK_GPIO  7
+#define SD_CS_GPIO    4
+#define SD_SPI_HOST   SPI3_HOST
+#define SD_MOUNT      "/sdcard"
+
+#define W5500_SCLK_GPIO  13
+#define W5500_MISO_GPIO  12
+#define W5500_MOSI_GPIO  11
+#define W5500_CS_GPIO    14
+#define W5500_INT_GPIO   10
+#define W5500_RST_GPIO   9   /* real hardware reset line (the Elite has none) */
+#define W5500_SPI_HOST   SPI2_HOST
+/* Also GPIO-matrix pins (SCLK=13 ≠ FSPICLK=12, so no IO_MUX), same regime the
+ * Elite proved 40 MHz in. If w5500_reset aborts at boot, drop to 25. */
+#define W5500_SPI_CLOCK  40
+
+#else /* CONFIG_ADBLOCK_BOARD_T_ETH_ELITE */
+
+#define BOARD_NAME    "LilyGO T-ETH-Elite"
+#define MDNS_HOSTNAME "esp32adblock"
+
 /* ── SD card pin map: LilyGO T-ETH-ELITE S3 ─────────────────────── */
 #define SD_MISO_GPIO  9
 #define SD_MOSI_GPIO  11
@@ -76,6 +113,8 @@ static const char *TAG = "dns_sink";
  * latency/qps to 40 (per-query cost is transaction overhead, not clocking), so
  * we stay at the proven-safe 40 — what survives sustained full-duplex load. */
 #define W5500_SPI_CLOCK  40
+
+#endif /* board select */
 
 /* ── Event group ─────────────────────────────────────────────────── */
 #define ETH_CONNECTED_BIT   BIT0
@@ -117,6 +156,12 @@ static char s_upstream_iface[8] = "eth";   /* "eth" or "wifi" */
  * giving up and starting on the fallback resolver. Long enough for a normal
  * lease, short enough that a cable-out boot is not visibly stalled. */
 #define UPSTREAM_IFACE_WAIT_MS 5000
+
+/* How long to wait for ANY link (Ethernet or Wi-Fi) before falling back to
+ * the setup AP (#1 — see start_setup_ap). Matches upstream ESP32_AdBlocker's
+ * own wifiTimeoutSecs default (30s) closely enough; this device also has
+ * Ethernet racing in parallel, so most real boots never reach this wait. */
+#define WIFI_SETUP_AP_TIMEOUT_MS 30000
 
 extern "C" bool dns_sink_wifi_built(void)
 {
@@ -360,6 +405,10 @@ static void fetch_dhcp_dns(esp_netif_t *netif, char *out, size_t cap)
     }
 }
 
+#if CONFIG_ADBLOCK_NET_WIFI
+static void stop_setup_ap_if_active(void);   /* defined below wifi_creds_init_nvs (#1) */
+#endif
+
 static void ip_event_handler(void *, esp_event_base_t, int32_t event_id, void *event_data)
 {
     if (event_id == IP_EVENT_ETH_GOT_IP) {
@@ -370,6 +419,9 @@ static void ip_event_handler(void *, esp_event_base_t, int32_t event_id, void *e
         ESP_LOGI(TAG, "Ethernet IP: %s  GW: %s  DNS: %s", s_ip, s_gw, s_eth_dns[0] ? s_eth_dns : "(none)");
         xEventGroupSetBits(s_eth_eg, ETH_GOT_IP_BIT);
         apply_upstream_iface();
+#if CONFIG_ADBLOCK_NET_WIFI
+        stop_setup_ap_if_active();
+#endif
     }
 #if CONFIG_ADBLOCK_NET_WIFI
     else if (event_id == IP_EVENT_STA_GOT_IP) {
@@ -380,6 +432,7 @@ static void ip_event_handler(void *, esp_event_base_t, int32_t event_id, void *e
         ESP_LOGI(TAG, "Wi-Fi IP: %s  GW: %s  DNS: %s", s_wifi_ip, s_wifi_gw, s_wifi_dns[0] ? s_wifi_dns : "(none)");
         xEventGroupSetBits(s_eth_eg, WIFI_GOT_IP_BIT);
         apply_upstream_iface();
+        stop_setup_ap_if_active();
     }
 #endif
 }
@@ -417,6 +470,53 @@ static void wifi_creds_init_nvs(void)
             nvs_close(h);
         }
     }
+}
+
+/* ── Setup AP — zero-touch first-boot Wi-Fi config (#1, mirrors upstream
+ * ESP32_AdBlocker's own AP-mode bootstrap) ──────────────────────────────
+ * Reborn is Ethernet-first, so most boots never need this: plug in a cable,
+ * DHCP hands out an address, the web UI is reachable immediately. The gap is
+ * a Wi-Fi-only board with no working credentials yet (blank first boot, or a
+ * changed home network) and no Ethernet cable — before this, app_main's
+ * xEventGroupWaitBits below used portMAX_DELAY, so that boot hung forever
+ * before web_ui_start() ever ran. The only recovery was the USB serial
+ * console's `wifi` command, which needs physical access. This starts an open
+ * SoftAP (WIFI_MODE_APSTA, so STA keeps retrying and Ethernet is untouched)
+ * at the esp-netif default 192.168.4.1 so a phone can join it and reach the
+ * SAME httpd server (it listens on all interfaces already) to enter real
+ * credentials via the existing Network tab (#54, dns_sink_wifi_set_creds).
+ * Torn down automatically the moment ANY interface gets a real IP. */
+static bool s_setup_ap_active = false;
+
+static void start_setup_ap(void)
+{
+    if (s_setup_ap_active) return;
+    esp_netif_create_default_wifi_ap();
+    wifi_config_t ap_cfg = {};
+    static const char *AP_SSID = "ESP32AdBlock-Setup";
+    snprintf(reinterpret_cast<char *>(ap_cfg.ap.ssid), sizeof(ap_cfg.ap.ssid), "%s", AP_SSID);
+    ap_cfg.ap.ssid_len = strlen(AP_SSID);
+    ap_cfg.ap.channel = 1;
+    ap_cfg.ap.max_connection = 4;
+    ap_cfg.ap.authmode = WIFI_AUTH_OPEN;  /* setup-only; see the log line below */
+    if (esp_wifi_set_mode(WIFI_MODE_APSTA) != ESP_OK ||
+        esp_wifi_set_config(WIFI_IF_AP, &ap_cfg) != ESP_OK) {
+        ESP_LOGE(TAG, "setup AP failed to start");
+        return;
+    }
+    s_setup_ap_active = true;
+    ESP_LOGW(TAG, "No network link — setup AP \"%s\" is up at 192.168.4.1 "
+                  "(open, unauthenticated — join it and browse there to enter "
+                  "real Wi-Fi credentials or check status; it shuts off "
+                  "automatically once any interface gets a real IP)", AP_SSID);
+}
+
+static void stop_setup_ap_if_active(void)
+{
+    if (!s_setup_ap_active) return;
+    s_setup_ap_active = false;
+    esp_wifi_set_mode(WIFI_MODE_STA);
+    ESP_LOGI(TAG, "Network link established — setup AP shut off");
 }
 
 static NetStaticCfg s_wifi_static;
@@ -701,6 +801,8 @@ extern "C" bool dns_sink_wifi_set_creds(const char *ssid, const char *pass)
     xTaskCreate(wifi_apply_reconfigure_task, "wifi_recfg", 3072, nullptr, 3, nullptr);
     return true;
 }
+
+extern "C" bool dns_sink_setup_ap_active(void) { return s_setup_ap_active; }
 #else
 extern "C" void dns_sink_wifi_get_ssid(char *out, size_t cap) { if (cap) out[0] = '\0'; }
 extern "C" bool dns_sink_wifi_scan_start(void) { return false; }
@@ -709,14 +811,15 @@ extern "C" int  dns_sink_wifi_scan_get(char *out, size_t cap)
     return snprintf(out, cap, "{\"state\":\"idle\",\"age_s\":-1,\"aps\":[]}");
 }
 extern "C" bool dns_sink_wifi_set_creds(const char *, const char *) { return false; }
+extern "C" bool dns_sink_setup_ap_active(void) { return false; }
 #endif
 
-/* ── W5500 init for T-ETH-Elite ──────────────────────────────────── */
+/* ── W5500 init (board pin map selected above) ───────────────────── */
 static esp_eth_handle_t eth_init_w5500(void)
 {
-    ESP_LOGI(TAG, "W5500 T-ETH-ELITE: SCLK=%d MISO=%d MOSI=%d CS=%d INT=%d @ %d MHz",
-             W5500_SCLK_GPIO, W5500_MISO_GPIO, W5500_MOSI_GPIO,
-             W5500_CS_GPIO, W5500_INT_GPIO, W5500_SPI_CLOCK);
+    ESP_LOGI(TAG, "W5500 %s: SCLK=%d MISO=%d MOSI=%d CS=%d INT=%d RST=%d @ %d MHz",
+             BOARD_NAME, W5500_SCLK_GPIO, W5500_MISO_GPIO, W5500_MOSI_GPIO,
+             W5500_CS_GPIO, W5500_INT_GPIO, W5500_RST_GPIO, W5500_SPI_CLOCK);
 
     spi_bus_config_t buscfg = {};
     buscfg.miso_io_num   = W5500_MISO_GPIO;
@@ -1040,6 +1143,29 @@ static esp_err_t l2_input_cb(esp_eth_handle_t h, uint8_t *buf, uint32_t len,
     return esp_netif_receive((esp_netif_t *)priv, buf, len, NULL);
 }
 
+/* Init-failure halt, made OTA-rollback-aware (#1). Plain portMAX_DELAY halt
+ * loops here would defeat CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE: rollback
+ * only fires on the NEXT reset, and a halted board never resets, so a bad OTA
+ * image that fails init would hang forever on the safety net instead of being
+ * reverted by it. If the running partition is still ESP_OTA_IMG_PENDING_VERIFY
+ * (a freshly-OTA'd image that never reached esp_ota_mark_app_valid_cancel_
+ * rollback below), roll back and reboot immediately instead of halting.
+ * On an already-confirmed partition (state != PENDING_VERIFY — normal boot,
+ * hardware fault unrelated to OTA) there's nothing safe to roll back to, so
+ * this still just halts, same as before. */
+static void halt_or_rollback(const char *reason)
+{
+    ESP_LOGE(TAG, "%s — halting", reason);
+    esp_ota_img_states_t state;
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    if (running && esp_ota_get_state_partition(running, &state) == ESP_OK &&
+        state == ESP_OTA_IMG_PENDING_VERIFY) {
+        ESP_LOGE(TAG, "unconfirmed OTA image — rolling back to the previous slot");
+        esp_ota_mark_app_invalid_rollback_and_reboot();   /* does not return on success */
+    }
+    for (;;) vTaskDelay(portMAX_DELAY);
+}
+
 /* ── app_main ────────────────────────────────────────────────────── */
 extern "C" void app_main(void)
 {
@@ -1099,10 +1225,26 @@ extern "C" void app_main(void)
      * plugged in at all (Wi-Fi-only operation is a supported mode, not just
      * a transient boot state), so blocking on both would hang forever with
      * no cable connected. Whichever interface comes up later still fires its
-     * own IP_EVENT and joins in (apply_upstream_iface() re-runs each time). */
+     * own IP_EVENT and joins in (apply_upstream_iface() re-runs each time).
+     *
+     * Bounded, not portMAX_DELAY (#1): a board with no Ethernet cable AND no
+     * working Wi-Fi credentials (blank first boot, or a changed home network)
+     * would otherwise hang HERE forever — nothing past this line ever runs,
+     * including web_ui_start(), so the only recovery was the USB serial
+     * console. On timeout, bring up the setup AP (start_setup_ap) so the
+     * device is reachable over Wi-Fi with zero prior config — mirrors
+     * upstream ESP32_AdBlocker's own AP-mode bootstrap — then give it one
+     * more bounded window before continuing regardless: booting with no
+     * upstream reachable yet is already a supported state (see Wi-Fi-only,
+     * no-cable above), just newly reachable via the AP instead of USB. */
     ESP_LOGI(TAG, "Waiting for Ethernet or Wi-Fi link and DHCP...");
-    xEventGroupWaitBits(s_eth_eg, ETH_GOT_IP_BIT | WIFI_GOT_IP_BIT,
-                        pdFALSE, pdFALSE, portMAX_DELAY);
+    EventBits_t link_bits = xEventGroupWaitBits(s_eth_eg, ETH_GOT_IP_BIT | WIFI_GOT_IP_BIT,
+                        pdFALSE, pdFALSE, pdMS_TO_TICKS(WIFI_SETUP_AP_TIMEOUT_MS));
+    if (!(link_bits & (ETH_GOT_IP_BIT | WIFI_GOT_IP_BIT))) {
+        start_setup_ap();
+        xEventGroupWaitBits(s_eth_eg, ETH_GOT_IP_BIT | WIFI_GOT_IP_BIT,
+                            pdFALSE, pdFALSE, pdMS_TO_TICKS(WIFI_SETUP_AP_TIMEOUT_MS));
+    }
     ESP_LOGI(TAG, "Network ready — Ethernet: %s  Wi-Fi: %s",
              s_ip[0] ? s_ip : "(down)", s_wifi_ip[0] ? s_wifi_ip : "(down)");
 #else
@@ -1155,8 +1297,7 @@ extern "C" void app_main(void)
 
     /* Allocate PSRAM ping-pong buffers */
     if (!blocklist_init()) {
-        ESP_LOGE(TAG, "PSRAM blocklist init failed — halting");
-        for (;;) vTaskDelay(portMAX_DELAY);
+        halt_or_rollback("PSRAM blocklist init failed");
     }
     rewrite_init();
     dot_init_nvs();
@@ -1176,8 +1317,7 @@ extern "C" void app_main(void)
         upstream = pick_upstream(s_wifi_dns, s_wifi_gw);
 #endif
     if (!s_dns.start(upstream)) {
-        ESP_LOGE(TAG, "DNS server start failed — halting");
-        for (;;) vTaskDelay(portMAX_DELAY);
+        halt_or_rollback("DNS server start failed");
     }
     /* #80: start() unconditionally overwrites _upstream_ip, so an IP event
      * landing between the pick_upstream() read above and start() would have its
@@ -1202,12 +1342,22 @@ extern "C" void app_main(void)
     /* Start web UI on port 80 */
     web_ui_start(&s_dns);
 
-    /* mDNS: advertise as esp32adblock.local and expose the HTTP service (#20) */
+    /* OTA rollback confirmation (#1): CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE
+     * boots a freshly-flashed OTA slot in a "pending verify" state and
+     * reverts to the previous slot on the NEXT reset unless something marks
+     * it valid first. DNS serving + the web UI both being up is as good a
+     * health signal as this device has — no display, no separate healthcheck
+     * endpoint to call. If either of them had failed to reach this point
+     * (crash, hang, halt-loop above), this line never runs and the next
+     * power cycle rolls back automatically. */
+    esp_ota_mark_app_valid_cancel_rollback();
+
+    /* mDNS: advertise the per-board hostname and expose the HTTP service (#20) */
     if (mdns_init() == ESP_OK) {
-        mdns_hostname_set("esp32adblock");
+        mdns_hostname_set(MDNS_HOSTNAME);
         mdns_instance_name_set("ESP32 AdBlocker");
         mdns_service_add(nullptr, "_http", "_tcp", 80, nullptr, 0);
-        ESP_LOGI(TAG, "mDNS: reachable at esp32adblock.local");
+        ESP_LOGI(TAG, "mDNS: reachable at " MDNS_HOSTNAME ".local");
     }
 
     /* Launch blocklist download + daily reload (Core 0, priority 2).

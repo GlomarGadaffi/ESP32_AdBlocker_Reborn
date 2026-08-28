@@ -1,0 +1,15 @@
+# Waveshare ESP32-S3-ETH board overlay — apply ON TOP of sdkconfig.defaults:
+#   idf.py -B build-waveshare -DSDKCONFIG=sdkconfig.waveshare \
+#          -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.board.waveshare-s3-eth" build
+# Keeps the main sdkconfig/build directory as the T-ETH-Elite build.
+
+CONFIG_ADBLOCK_BOARD_WAVESHARE_S3_ETH=y
+
+# Target + flash geometry — the main sdkconfig carries these from set-target /
+# menuconfig, but sdkconfig.defaults doesn't, so a fresh build dir needs them.
+# ESP32-S3R8 + 16MB flash: same 16MB DIO@80m + 8MB octal PSRAM as the Elite
+# (see the flash-mode note in sdkconfig.defaults — octal PSRAM forbids QIO).
+CONFIG_IDF_TARGET="esp32s3"
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_ESPTOOLPY_FLASHMODE_DIO=y
+CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
