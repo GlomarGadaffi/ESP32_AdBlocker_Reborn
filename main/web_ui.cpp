@@ -46,6 +46,11 @@ extern "C" void dns_sink_net_get_static(const char *iface, bool *dhcp,
                                          char *nm, size_t nm_cap,
                                          char *gw, size_t gw_cap,
                                          char *dns_ip, size_t dns_cap);
+extern "C" void dns_sink_net_get_current(const char *iface,
+                                          char *ip, size_t ip_cap,
+                                          char *nm, size_t nm_cap,
+                                          char *gw, size_t gw_cap,
+                                          char *dns_ip, size_t dns_cap);
 extern "C" void dns_sink_reboot(void);
 extern "C" bool dns_sink_setup_ap_active(void);
 
@@ -683,6 +688,15 @@ static esp_err_t handle_status(httpd_req_t *r)
             bool dhcp = true; char ip[16]="", nm[16]="", gw[16]="", dns_ip[16]="";
             dns_sink_net_get_static(ifaces[i], &dhcp, ip, sizeof(ip), nm, sizeof(nm),
                                      gw, sizeof(gw), dns_ip, sizeof(dns_ip));
+            /* Under DHCP prefill the form with the live lease, not whatever
+             * strings a past dhcp-mode Save left in NVS (those are saved
+             * unvalidated — dns_sink_net_set_static only inet_aton-checks in
+             * static mode). "Go static, keep this address" becomes: pick
+             * Static, Save. Saved static config still shows as-is — it's the
+             * authoritative pending config. */
+            if (dhcp)
+                dns_sink_net_get_current(ifaces[i], ip, sizeof(ip), nm, sizeof(nm),
+                                          gw, sizeof(gw), dns_ip, sizeof(dns_ip));
             page_appendf(page, sizeof(page), &n,
                 "<h3>%s: DHCP / Static IP</h3>"
                 "<form method=post action=/net/%s/set>"

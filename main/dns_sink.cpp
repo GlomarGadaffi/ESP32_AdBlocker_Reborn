@@ -123,10 +123,12 @@ static const char *TAG = "dns_sink";
 #define WIFI_GOT_IP_BIT     BIT3
 static EventGroupHandle_t s_eth_eg = nullptr;
 static char               s_ip[16] = {};      /* Ethernet IP — the LAN-facing address, reported to clients/mDNS/web UI */
+static char               s_nm[16] = {};      /* Ethernet netmask */
 static char               s_gw[16] = {};      /* Ethernet DHCP gateway */
 static char               s_eth_dns[16] = {}; /* Ethernet DHCP-provided DNS server (option 6) — the real upstream target */
 #if CONFIG_ADBLOCK_NET_WIFI
 static char               s_wifi_ip[16] = {};
+static char               s_wifi_nm[16] = {};   /* Wi-Fi netmask */
 static char               s_wifi_gw[16] = {};   /* Wi-Fi DHCP gateway */
 static char               s_wifi_dns[16] = {};  /* Wi-Fi DHCP-provided DNS server — see s_eth_dns */
 #endif
@@ -331,6 +333,32 @@ extern "C" void dns_sink_net_get_static(const char *iface, bool *dhcp,
     if (dns_ip) snprintf(dns_ip, dns_cap, "%s", cfg.dns);
 }
 
+/* Live addressing for an interface — the DHCP lease as it arrived, or the
+ * static config once the link actually came up. The web UI prefills the
+ * static-IP form from this when the interface is in DHCP mode, so "go
+ * static, keep this address" is just picking the radio and hitting Save.
+ * Empty strings while the interface is down. */
+extern "C" void dns_sink_net_get_current(const char *iface,
+                                          char *ip, size_t ip_cap,
+                                          char *nm, size_t nm_cap,
+                                          char *gw, size_t gw_cap,
+                                          char *dns_ip, size_t dns_cap)
+{
+    const char *cip = "", *cnm = "", *cgw = "", *cdns = "";
+    if (strcmp(iface, "eth") == 0) {
+        cip = s_ip; cnm = s_nm; cgw = s_gw; cdns = s_eth_dns;
+    }
+#if CONFIG_ADBLOCK_NET_WIFI
+    else if (strcmp(iface, "wifi") == 0) {
+        cip = s_wifi_ip; cnm = s_wifi_nm; cgw = s_wifi_gw; cdns = s_wifi_dns;
+    }
+#endif
+    if (ip)     snprintf(ip,     ip_cap,  "%s", cip);
+    if (nm)     snprintf(nm,     nm_cap,  "%s", cnm);
+    if (gw)     snprintf(gw,     gw_cap,  "%s", cgw);
+    if (dns_ip) snprintf(dns_ip, dns_cap, "%s", cdns);
+}
+
 extern "C" void dns_sink_reboot(void)
 {
     esp_restart();
@@ -373,6 +401,7 @@ static void publish_static_eth(void)
 {
     if (s_eth_static.dhcp) return;
     snprintf(s_ip,      sizeof(s_ip),      "%s", s_eth_static.ip);
+    snprintf(s_nm,      sizeof(s_nm),      "%s", s_eth_static.nm);
     snprintf(s_gw,      sizeof(s_gw),      "%s", s_eth_static.gw);
     snprintf(s_eth_dns, sizeof(s_eth_dns), "%s", s_eth_static.dns);
     ESP_LOGI(TAG, "Ethernet link up — static IP: %s  GW: %s  DNS: %s",
@@ -389,7 +418,7 @@ static void eth_event_handler(void *, esp_event_base_t, int32_t event_id, void *
         publish_static_eth();      /* no-op under DHCP — the lease drives it instead */
     } else if (event_id == ETHERNET_EVENT_DISCONNECTED) {
         xEventGroupClearBits(s_eth_eg, ETH_CONNECTED_BIT | ETH_GOT_IP_BIT);
-        if (!s_eth_static.dhcp) { s_ip[0] = '\0'; s_gw[0] = '\0'; s_eth_dns[0] = '\0'; }
+        if (!s_eth_static.dhcp) { s_ip[0] = '\0'; s_nm[0] = '\0'; s_gw[0] = '\0'; s_eth_dns[0] = '\0'; }
     }
 }
 
@@ -414,6 +443,7 @@ static void ip_event_handler(void *, esp_event_base_t, int32_t event_id, void *e
     if (event_id == IP_EVENT_ETH_GOT_IP) {
         auto *ev = static_cast<ip_event_got_ip_t *>(event_data);
         esp_ip4addr_ntoa(&ev->ip_info.ip, s_ip, sizeof(s_ip));
+        esp_ip4addr_ntoa(&ev->ip_info.netmask, s_nm, sizeof(s_nm));
         esp_ip4addr_ntoa(&ev->ip_info.gw, s_gw, sizeof(s_gw));
         fetch_dhcp_dns(ev->esp_netif, s_eth_dns, sizeof(s_eth_dns));
         ESP_LOGI(TAG, "Ethernet IP: %s  GW: %s  DNS: %s", s_ip, s_gw, s_eth_dns[0] ? s_eth_dns : "(none)");
@@ -427,6 +457,7 @@ static void ip_event_handler(void *, esp_event_base_t, int32_t event_id, void *e
     else if (event_id == IP_EVENT_STA_GOT_IP) {
         auto *ev = static_cast<ip_event_got_ip_t *>(event_data);
         esp_ip4addr_ntoa(&ev->ip_info.ip, s_wifi_ip, sizeof(s_wifi_ip));
+        esp_ip4addr_ntoa(&ev->ip_info.netmask, s_wifi_nm, sizeof(s_wifi_nm));
         esp_ip4addr_ntoa(&ev->ip_info.gw, s_wifi_gw, sizeof(s_wifi_gw));
         fetch_dhcp_dns(ev->esp_netif, s_wifi_dns, sizeof(s_wifi_dns));
         ESP_LOGI(TAG, "Wi-Fi IP: %s  GW: %s  DNS: %s", s_wifi_ip, s_wifi_gw, s_wifi_dns[0] ? s_wifi_dns : "(none)");
@@ -527,6 +558,7 @@ static void publish_static_wifi(void)
 {
     if (s_wifi_static.dhcp) return;
     snprintf(s_wifi_ip,  sizeof(s_wifi_ip),  "%s", s_wifi_static.ip);
+    snprintf(s_wifi_nm,  sizeof(s_wifi_nm),  "%s", s_wifi_static.nm);
     snprintf(s_wifi_gw,  sizeof(s_wifi_gw),  "%s", s_wifi_static.gw);
     snprintf(s_wifi_dns, sizeof(s_wifi_dns), "%s", s_wifi_static.dns);
     ESP_LOGI(TAG, "Wi-Fi associated — static IP: %s  GW: %s  DNS: %s",
@@ -565,7 +597,7 @@ static void wifi_event_handler(void *, esp_event_base_t, int32_t event_id, void 
         esp_wifi_connect();
     } else if (event_id == WIFI_EVENT_STA_DISCONNECTED) {
         xEventGroupClearBits(s_eth_eg, WIFI_CONNECTED_BIT | WIFI_GOT_IP_BIT);
-        if (!s_wifi_static.dhcp) { s_wifi_ip[0] = '\0'; s_wifi_gw[0] = '\0'; s_wifi_dns[0] = '\0'; }
+        if (!s_wifi_static.dhcp) { s_wifi_ip[0] = '\0'; s_wifi_nm[0] = '\0'; s_wifi_gw[0] = '\0'; s_wifi_dns[0] = '\0'; }
         if (wifi_reconfig_active()) {
             ESP_LOGI(TAG, "Wi-Fi disconnected (reconfiguring — not auto-retrying)");
         } else {
