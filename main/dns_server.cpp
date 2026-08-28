@@ -1049,6 +1049,98 @@ static int append_bare_edns_opt(uint8_t *dst, const uint8_t *q, int mlen, int ca
     return mlen + 11;
 }
 
+/* Decompress a name that may use RFC 1035 §4.1.4 message compression —
+ * unlike extract_qname (which REJECTS compression in the question section
+ * by design), answer-section owner/RDATA names commonly use it. *off is
+ * advanced exactly like skip_name() would (stopping at the first
+ * terminator or the first compression pointer at the ORIGINAL position,
+ * +1 or +2 respectively) regardless of how many pointers are followed
+ * internally to decode the actual name — a caller walking subsequent RRs
+ * must not be dragged into wherever a jump landed.
+ * Jump targets must point strictly backward (target < the offset of the
+ * pointer that named it) and are capped at 20 hops — both guard against a
+ * malformed or hostile pointer cycle. */
+static bool decompress_name(const uint8_t *pkt, int len, int *off,
+                            char *name_out, size_t name_cap, size_t *nlen_out)
+{
+    char raw[256]; size_t rl = 0;
+    int read_off = *off;
+    bool advanced = false;
+    int jumps = 0;
+    while (read_off < len) {
+        uint8_t b = pkt[read_off];
+        if (b == 0) {
+            if (!advanced) *off = read_off + 1;
+            size_t nl = domain_normalize(name_out, name_cap, raw, rl);
+            if (!nl) return false;
+            *nlen_out = nl;
+            return true;
+        }
+        if ((b & 0xC0) == 0xC0) {
+            if (read_off + 1 >= len) return false;
+            if (!advanced) { *off = read_off + 2; advanced = true; }
+            int target = ((b & 0x3F) << 8) | pkt[read_off + 1];
+            if (target >= read_off || ++jumps > 20) return false;
+            read_off = target;
+            continue;
+        }
+        if (b & 0xC0) return false;                       /* reserved label length */
+        if (read_off + 1 + b > len) return false;
+        if (rl + (size_t)b + 1 >= sizeof(raw)) return false;
+        if (rl) raw[rl++] = '.';
+        memcpy(raw + rl, pkt + read_off + 1, b);
+        rl += b;
+        read_off += 1 + b;
+    }
+    return false;
+}
+
+static inline bool name_is_blocked_any(const char *name, size_t len)
+{
+    /* Both checks, same OR the two real call sites (UDP ~line 1661, TCP
+     * ~line 1811) already use — blocklist_is_blocked() and the custom
+     * inline-rules list are independent, not one-covers-the-other. */
+    return blocklist_is_blocked(name, len) || blocklist_custom_is_blocked(name, len);
+}
+
+/* CNAME-cloaking inspection (#74): a tracker hiding behind a CNAME to a
+ * first-party-looking name evades the blocklist if only the originally-
+ * queried name is ever checked. Walk every answer RR's owner name and,
+ * for CNAME records, their target — name_is_blocked_any() already covers
+ * whitelist + bare-TLD internally, same as the primary verdict path.
+ * A malformed/unparseable answer just stops the walk and reports
+ * not-cloaked (fail toward availability, matching how a mismatched H2
+ * question or a mutex-busy whitelist check already behave elsewhere in
+ * this file) — this is a cloaking check, not a general packet validator. */
+static bool cname_chain_is_blocked(const uint8_t *pkt, int len, int qend)
+{
+    if (len < 12) return false;
+    int ancount = (pkt[6] << 8) | pkt[7];
+    if (ancount <= 0) return false;
+    int off = qend;
+    for (int i = 0; i < ancount; i++) {
+        char name[256]; size_t nlen = 0;
+        if (!decompress_name(pkt, len, &off, name, sizeof(name), &nlen)) return false;
+        if (off + 10 > len) return false;
+        uint16_t rtype = ((uint16_t)pkt[off] << 8) | pkt[off + 1];
+        uint16_t rdlen = ((uint16_t)pkt[off + 8] << 8) | pkt[off + 9];
+        int rdata_off = off + 10;
+        off = rdata_off + rdlen;
+        if (off > len) return false;
+
+        if (name_is_blocked_any(name, nlen)) return true;
+
+        if (rtype == 5 /* CNAME */) {
+            char target[256]; size_t tlen = 0;
+            int roff = rdata_off;
+            if (decompress_name(pkt, len, &roff, target, sizeof(target), &tlen) &&
+                name_is_blocked_any(target, tlen))
+                return true;
+        }
+    }
+    return false;
+}
+
 /* ── Main loop ───────────────────────────────────────────────────── */
 DnsSinkServer::DnsSinkServer() : _exitSem(xSemaphoreCreateBinary()) {}
 
@@ -1218,15 +1310,35 @@ void DnsSinkServer::run_loop()
              * who guesses the txid would have to also match the qname+qtype.
              * On mismatch, ignore the packet WITHOUT freeing the slot so the
              * genuine reply can still be accepted (or the slot times out). */
+            int rqend;
             {
                 char rname[256]; size_t rnlen = 0;
-                int rqend = extract_qname(pkt, plen, sizeof(DnsHeader),
-                                          rname, sizeof(rname), &rnlen);
+                rqend = extract_qname(pkt, plen, sizeof(DnsHeader),
+                                      rname, sizeof(rname), &rnlen);
                 if (rqend < 0) return;
                 uint16_t rqtype = ntohs(*reinterpret_cast<uint16_t *>(pkt + rqend - 4));
                 if (rqtype != ue->qtype || domain_hash(rname, rnlen) != ue->qhash)
                     return;
             }
+
+            /* CNAME-cloaking inspection (#74): a tracker hiding behind a CNAME
+             * to a first-party-looking name evades the blocklist entirely if
+             * only the originally-queried name is ever checked — the verdict
+             * above only validated that pkt answers OUR question, not that
+             * nothing in its answer chain is itself blocked. Walk the answer
+             * section; on a hit, replace the whole reply with a blocked
+             * answer before either delivery or caching sees it. */
+            bool cloaked = cname_chain_is_blocked(pkt, plen, rqend);
+            if (cloaked) {
+                static uint8_t cloak_blocked[320];  /* worst case: 271 B question (12 hdr +
+                                                        255 B max name + 4 qtype/qclass) +
+                                                        26 B answer RR (10 hdr + 16 AAAA) */
+                int blen = build_blocked_any(pkt, rqend, ue->qtype,
+                                             cloak_blocked, sizeof(cloak_blocked));
+                if (blen > 0) { pkt = cloak_blocked; plen = blen; }
+                else           cloaked = false;  /* couldn't synthesize — fall through as-is */
+            }
+
             /* rewrite transaction ID back to client's original */
             reinterpret_cast<DnsHeader *>(pkt)->id = htons(ue->client_txid);
             /* If the receive filled the buffer exactly, the datagram was larger —
@@ -1305,11 +1417,20 @@ void DnsSinkServer::run_loop()
 
             /* Forward cache: stash the response so a repeat identical query
              * is answered locally. Only NOERROR/NXDOMAIN; TTL from the RRs
-             * (NXDOMAIN → short negative TTL). Skip truncated responses. */
-            uint8_t rcode = pkt[3] & 0x0F;
-            if (!truncated && (rcode == 0 || rcode == 3))
-                cache_store_resp(ue->qhash, ue->qtype, pkt, plen,
-                                 dns_resp_min_ttl(pkt, plen, 30), now_ms_);
+             * (NXDOMAIN → short negative TTL). Skip truncated responses.
+             * A cloaked reply is cached the same way an in-band blocklist
+             * hit already is (#74) — blocked=true, short TTL — so the L2
+             * fast path's "skip blocked entries" behavior (dns_cache_l2_get)
+             * correctly defers to the full dns_task path for this domain
+             * instead of ever serving the cloaked chain from L2. */
+            if (cloaked) {
+                cache_store_blocked(ue->qhash, ue->qtype, BLOCKED_TTL_S, now_ms_);
+            } else {
+                uint8_t rcode = pkt[3] & 0x0F;
+                if (!truncated && (rcode == 0 || rcode == 3))
+                    cache_store_resp(ue->qhash, ue->qtype, pkt, plen,
+                                     dns_resp_min_ttl(pkt, plen, 30), now_ms_);
+            }
             if (ue->hedged) s_cnt_hedged_done++;   /* (#69) see the counter's caveat */
             ue->in_use = false;
         };
