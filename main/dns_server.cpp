@@ -40,6 +40,16 @@ static uint32_t s_cnt_blocked      = 0;
 static uint32_t s_cnt_forwarded    = 0;
 static volatile bool s_reset_req   = false;  /* set by httpd; cleared+executed by dns_task */
 static uint32_t s_cnt_drop_table   = 0;  /* upstream table full */
+static uint32_t s_cnt_mbox_pressure = 0; /* (#81) client-socket drain loop hit its
+                                            per-wakeup cap with recvfrom() still
+                                            succeeding — the mailbox had more queued
+                                            than one wakeup could drain. lwIP doesn't
+                                            expose UDP_RECVMBOX overflow directly; this
+                                            is the derived signal the issue proposed.
+                                            Undercounts queries actually lost past the
+                                            mailbox depth (those never reach dns_task
+                                            at all) but turns total silence into a
+                                            visible pressure gauge. */
 static uint32_t s_cnt_upstream_to  = 0;  /* upstream timeouts (evicted in_use) */
 static uint32_t s_cnt_cache_probe  = 0;  /* result-cache lookups */
 static uint32_t s_cnt_cache_hit    = 0;  /* result-cache hits */
@@ -1391,11 +1401,12 @@ void DnsSinkServer::run_loop()
             }
 
             /* ── Drain client queries (cap per wakeup so upstream stays serviced) ── */
+            bool mbox_drained = false;
             for (int dn = 0; dn < 48; dn++) {
                 clen = sizeof(client_addr);
                 int rlen = recvfrom(csock, rx, sizeof(rx), MSG_DONTWAIT,
                                     (sockaddr *)&client_addr, &clen);
-                if (rlen < 0) break;                           /* EWOULDBLOCK: drained */
+                if (rlen < 0) { mbox_drained = true; break; }   /* EWOULDBLOCK: drained */
                 if (rlen < (int)sizeof(DnsHeader)) continue;
 
                 /* ACL check (#10) — drop queries from unlisted clients */
@@ -1588,6 +1599,13 @@ void DnsSinkServer::run_loop()
                     s_cnt_forwarded++;
                 }
             }
+            /* (#81) Ran the full 48-iteration cap without ever seeing EWOULDBLOCK:
+             * every slot had a real datagram waiting, so the mailbox was still
+             * non-empty when we stopped voluntarily. Some of what arrived between
+             * now and the next wakeup may already have missed the mailbox
+             * entirely — this can't see that part, only that we were at the edge
+             * of it. */
+            if (!mbox_drained) s_cnt_mbox_pressure++;
 
             /* ── TCP/53: accept + read + serve (one conn, one query) ──
              * Same verdict ladder as the UDP path above; contained duplication
@@ -1771,7 +1789,8 @@ extern "C" uint32_t dns_sink_l2_cached(void);
 static void do_metrics_reset(void)
 {
     s_cnt_total = s_cnt_blocked = s_cnt_forwarded = s_cnt_tcp = s_cnt_stale = 0;
-    s_cnt_drop_table = s_cnt_upstream_to = s_cnt_cache_probe = s_cnt_cache_hit = 0;
+    s_cnt_drop_table = s_cnt_mbox_pressure = s_cnt_upstream_to = 0;
+    s_cnt_cache_probe = s_cnt_cache_hit = 0;
     s_cnt_cache_evict = s_cnt_cache_toobig = 0;
     s_cnt_coalesced = 0;
     s_cnt_hedges_sent = s_cnt_hedged_done = 0;   /* (#69); note the reset also empties
@@ -1834,7 +1853,8 @@ int dns_server_metrics_json(char *out, size_t cap)
         "\"stale_served\":%" PRIu32 ","
         "\"coalesced\":%" PRIu32 ","
         "\"hedges_sent\":%" PRIu32 ",\"hedged_completions\":%" PRIu32 ","
-        "\"dropped\":{\"table_full\":%" PRIu32 "},\"upstream_timeouts\":%" PRIu32 ","
+        "\"dropped\":{\"table_full\":%" PRIu32 "},\"mbox_pressure\":%" PRIu32 ","
+        "\"upstream_timeouts\":%" PRIu32 ","
         "\"upstream_inflight\":%d,\"upstream_max\":%d,"
         "\"blocklist_count\":%" PRIu32 ",\"blocklist_loading\":%s,"
         "\"blocklist_paused\":%s,"
@@ -1852,7 +1872,7 @@ int dns_server_metrics_json(char *out, size_t cap)
         s_cnt_stale,
         s_cnt_coalesced,
         s_cnt_hedges_sent, s_cnt_hedged_done,
-        s_cnt_drop_table, s_cnt_upstream_to,
+        s_cnt_drop_table, s_cnt_mbox_pressure, s_cnt_upstream_to,
         upstream_inflight(), UPSTREAM_TABLE_SIZE,
         blocklist_domain_count(), blocklist_is_loading() ? "true" : "false",
         blocklist_is_paused() ? "true" : "false",
