@@ -97,6 +97,23 @@ CONFIG_ESP32S3_INSTRUCTION_CACHE_32KB=y
 # — QIO causes a TG0WDT watchdog boot-loop on this board. DIO@80MHz is the
 # hardware ceiling here. Confirmed empirically + in LilyGO's own examples.
 
+# ── Software AES for mbedTLS (#84) ────────────────────────────────────
+# The hardware AES driver allocates internal DMA-capable RAM per operation.
+# During a blocklist fetch (HTTP + TLS both active, internal heap already
+# under pressure from lwIP/httpd) that allocation intermittently fails
+# mid-stream — "esp-aes: Failed to allocate memory" 1-2 MB into a 5 MB
+# download, at both PSRAM clock speeds, heap_largest as low as ~10-15 KB
+# at the failure. The fetch is network-bound at ~23 KB/s; AES throughput is
+# not the bottleneck, so trading it for software AES (no internal DMA
+# allocation) costs nothing on this path. DoT (opt-in, off by default) also
+# rides mbedTLS, but for one persistent low-throughput session, not a
+# fragmentation-prone bulk download — same trade applies there if it's ever
+# turned on. Unverified: this removes the allocation this specific failure
+# needs, but wasn't soak-tested long enough this session to confirm the
+# failure is actually gone versus just less likely — worth re-visiting #84
+# if "esp-aes: Failed to allocate memory" still appears in the logs.
+CONFIG_MBEDTLS_HARDWARE_AES=n
+
 # ── TLS certificate validity dates (#75) ─────────────────────────────
 # OFF BY DEFAULT IN ESP-IDF, and that is not a size trade — it is a silent
 # security hole. With MBEDTLS_HAVE_TIME_DATE unset, mbedtls_x509_time_is_past()
