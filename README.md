@@ -377,7 +377,7 @@ feeds the browser flasher, which always reads whichever release is *latest*:
 
 ```powershell
 .\tools\make-release.ps1
-gh release create v1.1.0 (Get-ChildItem release\* | ForEach-Object FullName) --title "v1.1.0" --generate-notes
+gh release create v1.2.0 (Get-ChildItem release\* | ForEach-Object FullName) --title "v1.2.0" --generate-notes
 ```
 
 `make-release.ps1` reads the version from `version.txt`, copies the four images

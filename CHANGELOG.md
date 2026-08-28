@@ -3,7 +3,7 @@
 All notable changes to ESP32_AdBlocker_Reborn. Versions follow SemVer; the
 firmware's `esp_app_desc` version string comes from `version.txt`.
 
-## [Unreleased] — 1.2.0
+## [1.2.0] — 2026-08-28
 
 ### Security
 
@@ -15,9 +15,15 @@ firmware's `esp_app_desc` version string comes from `version.txt`.
   idle / 12 h absolute, 4 concurrent sessions); the password is stored as a
   salted PBKDF2-HMAC-SHA256 hash (a legacy plaintext one is hashed on first
   boot and erased). 5 failed logins → 60 s lockout. Per-session CSRF token on
-  every POST in addition to the Origin/Referer check. HSTS, CSP,
-  `X-Frame-Options: DENY`, `nosniff`, `no-referrer` on every response.
-  Password change requires the current password and signs everyone out.
+  every POST in addition to the Origin/Referer check. CSP,
+  `X-Frame-Options: DENY`, `nosniff`, `no-referrer` on every response (no
+  HSTS on purpose: with a self-signed cert it would turn `cert-reset` into a
+  year-long browser lockout). Password change requires the current password
+  and signs everyone out. The certificate carries EKU serverAuth, SAN =
+  mDNS name + 192.168.4.1, and a 2-year validity (Apple's trust rules),
+  regenerated at boot when expiring; a 3 s TLS handshake timeout keeps a
+  silent client from holding the single httpd task. A UI that fails to start
+  on an unverified OTA image rolls the image back instead of confirming it.
 - **Blocklist sources must be `https://`** (#90), enforced at the form and at
   fetch time.
 - **Setup AP is WPA2** with a random NVS-kept passphrase printed on the USB
@@ -35,13 +41,28 @@ device), so a LAN host can keep you locked out of `/login` with five bad
 guesses a minute — acceptable for a LAN appliance, and `admin-reset` over
 USB always works.
 
+### Added
+
+- **Browser flasher** (`docs/flasher/`, served from GitHub Pages): Web Serial +
+  esptool-js, detects the board from the firmware's version tag, fetches the
+  matching images from the latest release, flashes them at the right offsets.
+  `tools/make-release.ps1` stages the per-board artifacts and `manifest.json`.
+- **Board-tagged version**: `esp_app_desc_t.version` is now
+  `<version.txt>+<board>` (`t-eth-elite` / `waveshare-s3-eth`).
+- USB console `heap` command (internal / PSRAM free, largest, low-water).
+
 ### Changed
 
 - Web-page render buffers and the Wi-Fi scan table moved from internal .bss
-  to PSRAM (`CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY`), freeing ~40 KB of
-  internal RAM — needed for TLS session setup to coexist with the W5500's DMA
-  buffers on the Waveshare board.
+  to PSRAM (`CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY`), taking the
+  Waveshare from ~23 KB internal free / 7.6 KB largest to ~100 KB / 31 KB —
+  needed for TLS session setup to coexist with the W5500's DMA buffers.
+- Boot-time crypto runs on its own 12 KB task; `CONFIG_ESP_MAIN_TASK_STACK_SIZE`
+  raised to 6144.
 - mDNS now advertises `_https._tcp` on 443.
+- CMake refuses a `build-waveshare` dir that isn't configured with its own
+  `SDKCONFIG` — a shared one silently rewrote the default config with the
+  Waveshare pin map.
 
 ## [1.1.0] — 2026-08-28
 
