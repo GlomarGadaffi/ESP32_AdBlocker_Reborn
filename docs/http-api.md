@@ -3,8 +3,14 @@
 Every route below is served by the single httpd instance in `main/web_ui.cpp`
 on **port 80**, and every one of them (including `GET /`) passes through
 `auth_wrap` first — so if a web UI username is set, HTTP Basic Auth gates the
-whole surface. All `POST` routes additionally take a CSRF `Origin`/`Host`
-check. This is a trusted-LAN interface; don't expose port 80 to the internet.
+whole surface. CSRF is *not* in `auth_wrap`: each mutating handler calls
+`csrf_ok()` itself (`Origin`/`Referer` host must match `Host`, absent-both
+allowed for plain form posts). All 25 `POST` routes are covered — `/net/eth/set`
+and `/net/wifi/set` inherit the check from the shared `handle_net_static_set()`
+helper rather than calling it directly, so a naive per-handler grep undercounts.
+If you add a POST handler, add the `csrf_ok()` call.
+
+This is a trusted-LAN interface; don't expose port 80 to the internet.
 
 The route list is generated from the `uris[]` table in `web_ui.cpp`; the
 metrics fields from `dns_server_metrics_json()` in `dns_server.cpp`.
@@ -86,7 +92,7 @@ A single JSON object. Field names are exactly as emitted.
 | `heap_free` | int | Free internal heap, bytes. |
 | `heap_largest` | int | Largest *contiguous* internal block. This, not `heap_free`, is what TLS setup fails on. |
 | `psram_free` | int | Free PSRAM, bytes. |
-| `dns_task_stack_hwm` | int | `dns_task` stack high-water mark (`uxTaskGetStackHighWaterMark`; bytes on ESP-IDF, which sizes stacks in bytes). |
+| `dns_task_stack_hwm` | int | `dns_task` stack headroom, as reported by `uxTaskGetStackHighWaterMark()`. |
 | `latency_us` | object | See below. |
 
 `dropped` is a nested object: `"dropped":{"table_full":N,"mbox_pressure":N}`.

@@ -291,11 +291,14 @@ the flasher directly, take the offsets from the build's own `flash_args`
 rather than hand-typing them — for the default build they are:
 
 ```powershell
-esptool --chip esp32s3 -p PORT -b 460800 write-flash --flash-mode dio --flash-freq 80m --flash-size 16MB 0x0 build/bootloader/bootloader.bin 0x8000 build/partition_table/partition-table.bin 0xf000 build/ota_data_initial.bin 0x20000 build/dns-sink.bin
+python -m esptool --chip esp32s3 -p PORT -b 460800 write-flash --flash-mode dio --flash-size 16MB --flash-freq 80m 0x0 build\bootloader\bootloader.bin 0x8000 build\partition_table\partition-table.bin 0xf000 build\ota_data_initial.bin 0x20000 build\dns-sink.bin
 ```
 
-(ESP-IDF v6.0 ships esptool v5: the command is `esptool`, not `esptool.py`,
-and subcommands are hyphenated — `write-flash`.)
+That is the command `idf.py build` itself prints. ESP-IDF v6.0 ships esptool
+v5: invoke it as `esptool` or `python -m esptool` (the old `esptool.py` is a
+deprecation shim), and subcommands are hyphenated — `write-flash`. From inside
+`build/` you can skip the offsets entirely with
+`python -m esptool --chip esp32s3 write-flash "@flash_args"`.
 
 After that first flash, updates don't need a toolchain or serial cable at
 all — use the web UI's **Network → Firmware Update** upload (see Feature set
