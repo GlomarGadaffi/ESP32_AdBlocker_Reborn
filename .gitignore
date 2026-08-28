@@ -20,3 +20,6 @@
 
 # Serial monitor scratch output
 monitor_live.log
+
+# local agent workflow scripts
+/.claude/workflows/
