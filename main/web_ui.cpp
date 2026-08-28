@@ -627,7 +627,9 @@ static esp_err_t handle_status(httpd_req_t *r)
         acl_list(acl_ips, &acl_n);
         page_appendf(page, sizeof(page), &n,
             "<h3>Client Access Control</h3>"
-            "<p><small>Empty = allow all. If any IP is listed, only those clients may use this DNS server.</small></p>"
+            "<p><small>Empty = allow all. If any IP is listed, only those clients may resolve new names. "
+            "Note: on Ethernet, blocked and already-cached answers are served by the L2 fast path, "
+            "which does not check this list.</small></p>"
             "<form method=post action=/acl/add>"
             "<input name=ip placeholder='192.168.x.x' size=18>"
             "<button>Add allowed client</button></form>");
@@ -1473,9 +1475,10 @@ bool web_ui_start(DnsSinkServer *dns)
      * once max_open_sockets (7) is reached (#61). Without this a client that
      * goes away mid-request holds its slot until recv/send_wait_timeout, and
      * enough of those lock everyone else out. max_open_sockets deliberately
-     * stays at the default: CONFIG_LWIP_MAX_SOCKETS is 16 and httpd already
-     * claims ~9 of them, so raising it risks starving the DNS server's own
-     * sockets — a far worse failure than a slow dashboard. */
+     * stays at the default: CONFIG_LWIP_MAX_SOCKETS is 24 (raised from 16 in
+     * sdkconfig.defaults for TCP/53 and the DoT worker, not for httpd) and
+     * httpd already claims ~9 of them, so raising it risks starving the DNS
+     * server's own sockets — a far worse failure than a slow dashboard. */
     cfg.lru_purge_enable = true;
     if (httpd_start(&s_server, &cfg) != ESP_OK) {
         ESP_LOGE(TAG, "httpd_start failed"); return false;

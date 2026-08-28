@@ -946,7 +946,7 @@ static void download_task(void *)
 {
     /* Boot: try SD cache first for instant blocking. If present, DO NOT
      * re-download on every boot — it wastes ~230s of bandwidth and opens a
-     * sort null-window. The daily-reload timer (or manual /reload) refreshes. */
+     * sort null-window. The 4h-reload timer (or manual /reload) refreshes. */
     bool from_sd = blocklist_load_sd();
     if (!from_sd) {
         /* #75: this is the first TLS client on a cold boot, and now that
@@ -1036,7 +1036,7 @@ static void download_task(void *)
         if (s_reload_requested) {
             s_reload_requested = false;
             ESP_LOGI(TAG, "Manual reload...");
-            blocklist_load();   /* does not shift the daily deadline */
+            blocklist_load();   /* does not shift the 4h deadline */
             continue;
         }
         if (now_us >= next_save_us) {
@@ -1399,7 +1399,7 @@ extern "C" void app_main(void)
         ESP_LOGI(TAG, "mDNS: reachable at " MDNS_HOSTNAME ".local");
     }
 
-    /* Launch blocklist download + daily reload (Core 0, priority 2).
+    /* Launch blocklist download + 4h reload (Core 0, priority 2).
      * 24KB stack: mbedTLS (HTTPS fetch) + FATFS (SD save) are both deep. */
     xTaskCreatePinnedToCore(download_task, "bl_download", 24576, nullptr, 2, nullptr, 0);
 
