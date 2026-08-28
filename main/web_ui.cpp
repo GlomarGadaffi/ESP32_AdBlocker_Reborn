@@ -111,10 +111,30 @@ static bool origin_host_matches(const char *url, const char *host)
     const char *p = strstr(url, "://");
     if (!p) return false;
     p += 3;
-    size_t hl = strlen(host);
-    if (strncmp(p, host, hl) != 0) return false;
+    /* Host may carry an explicit port (":443"); compare host names only,
+     * case-insensitively — DNS names are, and browsers are inconsistent about
+     * the case they echo back in Origin vs Host. */
+    size_t hl = strcspn(host, ":");
+    if (strncasecmp(p, host, hl) != 0) return false;
     char after = p[hl];
     return after == '\0' || after == '/' || after == ':';
+}
+
+/* Pre-session POSTs (/setup, /login) have no CSRF token yet, so they lean on
+ * Origin. A browser that sends "Origin: null" (some do on POST under a strict
+ * referrer policy, or from a privacy mode) gets judged on Referer instead;
+ * with neither present the request is allowed, as SameSite can't help before
+ * a cookie exists and the only thing these two routes do is *prove* a
+ * password. */
+static bool presession_origin_ok(httpd_req_t *r)
+{
+    char host[64] = {}, origin[128] = {}, referer[128] = {};
+    httpd_req_get_hdr_value_str(r, "Host",    host,    sizeof(host));
+    httpd_req_get_hdr_value_str(r, "Origin",  origin,  sizeof(origin));
+    httpd_req_get_hdr_value_str(r, "Referer", referer, sizeof(referer));
+    if (origin[0] && strcmp(origin, "null") != 0) return origin_host_matches(origin, host);
+    if (referer[0]) return origin_host_matches(referer, host);
+    return true;
 }
 
 /* ── Session cookie ────────────────────────────────────────────────
@@ -197,7 +217,9 @@ static void set_security_headers(httpd_req_t *r)
     httpd_resp_set_hdr(r, "Cache-Control", "no-store");
     httpd_resp_set_hdr(r, "X-Content-Type-Options", "nosniff");
     httpd_resp_set_hdr(r, "X-Frame-Options", "DENY");
-    httpd_resp_set_hdr(r, "Referrer-Policy", "no-referrer");
+    /* same-origin, not no-referrer: still nothing leaks cross-site, and the
+     * Referer stays available as the pre-session CSRF fallback above. */
+    httpd_resp_set_hdr(r, "Referrer-Policy", "same-origin");
     httpd_resp_set_hdr(r, "Content-Security-Policy",
         "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; "
         "connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'");
@@ -364,10 +386,7 @@ static esp_err_t handle_setup_post(httpd_req_t *r)
     /* No session exists yet so csrf_ok can't apply; the Origin/Referer check
      * still does, and the window is one request long — the account exists
      * after it. */
-    char host[64] = {}, origin[128] = {};
-    httpd_req_get_hdr_value_str(r, "Host",   host,   sizeof(host));
-    httpd_req_get_hdr_value_str(r, "Origin", origin, sizeof(origin));
-    if (origin[0] && !origin_host_matches(origin, host)) {
+    if (!presession_origin_ok(r)) {
         httpd_resp_send_err(r, HTTPD_403_FORBIDDEN, "CSRF"); return ESP_FAIL;
     }
     char body[512] = {};
@@ -419,10 +438,7 @@ static esp_err_t handle_login_get(httpd_req_t *r)
 
 static esp_err_t handle_login_post(httpd_req_t *r)
 {
-    char host[64] = {}, origin[128] = {};
-    httpd_req_get_hdr_value_str(r, "Host",   host,   sizeof(host));
-    httpd_req_get_hdr_value_str(r, "Origin", origin, sizeof(origin));
-    if (origin[0] && !origin_host_matches(origin, host)) {
+    if (!presession_origin_ok(r)) {
         httpd_resp_send_err(r, HTTPD_403_FORBIDDEN, "CSRF"); return ESP_FAIL;
     }
     char body[384] = {};
