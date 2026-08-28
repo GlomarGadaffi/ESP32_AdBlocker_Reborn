@@ -69,12 +69,41 @@ leak into every later client's answer. Two rules follow:
 
 ### 3. Single-task httpd
 
-`web_ui.cpp` starts one httpd instance and all 30 handlers run on it, serially.
-`max_open_sockets` stays at the default 7 with `lru_purge_enable` on (#61):
-raising it competes with the DNS server for `CONFIG_LWIP_MAX_SOCKETS`. Anything
-slow in a handler blocks every other viewer — which is why the Wi-Fi scan was
-moved to a worker task (#62). Long or blocking work belongs on a worker, with
-the handler polling for the result.
+`web_ui.cpp` starts one HTTPS httpd instance and all UI handlers run on it,
+serially. `max_open_sockets` stays at the TLS default 4 with
+`lru_purge_enable` on (#61): raising it competes with the DNS server for
+`CONFIG_LWIP_MAX_SOCKETS`. Anything slow in a handler blocks every other
+viewer — which is why the Wi-Fi scan was moved to a worker task (#62). Long or
+blocking work belongs on a worker, with the handler polling for the result.
+
+The `:80` redirect listener is a second httpd instance but not an exception
+to the rule: it renders nothing, reads nothing, holds no state. The rule
+exists so UI state has one writer — a server with no state has none.
+
+Because there is one request in flight at a time, `auth_wrap` parses the
+session cookie once into a file-static (`s_req_sid`) that handlers and
+`csrf_ok()` read. That shortcut is only valid on a single-task httpd; if the
+UI ever gets a second worker task, it becomes a race.
+
+Security gates live in `auth_wrap` (setup wizard, session) and `csrf_ok()`
+(origin + per-session token); see `docs/http-api.md`. Anything that proves
+identity (passwords, the session cookie) only ever travels over the TLS
+listener — never add a handler to the `:80` instance.
+
+### 3a. Internal RAM is the scarce resource
+
+The S3 has 8 MB of PSRAM and ~170 KB of usable internal heap after Wi-Fi,
+lwIP, and the DNS server's hot-path state take theirs. `libmain`'s internal
+`.bss` was 130 KB before #89. Anything internal that a TLS handshake or a
+DMA driver can't get is a live outage (the W5500 driver logs
+`Failed to allocate priv TX buffer` and Ethernet stalls). Rules:
+
+- Cold, task-private buffers (page renderers, scan tables, one-shot work
+  areas) get `EXT_RAM_BSS_ATTR` → PSRAM.
+- Hot-path DNS state (`s_upstream`, cache, the L2 hook's scratch) stays
+  internal.
+- Measure with the USB console `heap` command before and after; `min-ever`
+  is the number that matters.
 
 ### 4. `IRAM_ATTR` on definitions only
 

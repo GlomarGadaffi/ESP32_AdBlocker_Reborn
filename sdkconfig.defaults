@@ -97,6 +97,37 @@ CONFIG_ESP32S3_INSTRUCTION_CACHE_32KB=y
 # — QIO causes a TG0WDT watchdog boot-loop on this board. DIO@80MHz is the
 # hardware ceiling here. Confirmed empirically + in LilyGO's own examples.
 
+# ── Static buffers in PSRAM (#89) ─────────────────────────────────────
+# libmain carried ~130 KB of internal .bss, ~40 KB of it web-page render
+# buffers. Internal heap idled at 20-30 KB free / <8 KB largest on the
+# Waveshare, and the first TLS handshakes tipped it over: httpd's per-request
+# header array failed to allocate (responses went out with no headers) and
+# the W5500 SPI driver couldn't get a DMA TX buffer (Ethernet stalled). This
+# lets EXT_RAM_BSS_ATTR put cold, task-private buffers (web_ui pages, the Wi-Fi
+# scan table) in PSRAM. DNS hot-path state stays internal.
+CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y
+
+# ── HTTPS web UI (#89) ────────────────────────────────────────────────
+# The UI serves only over TLS on :443 with a self-signed ECDSA P-256 cert
+# generated on first boot (main/web_tls.c) — :80 just redirects. X509_CREATE
+# + CRT_WRITE are what mint the cert; the server side of TLS is already on
+# for DoT's sake. Buffers land in PSRAM (EXTERNAL_MEM_ALLOC below).
+CONFIG_ESP_HTTPS_SERVER_ENABLE=y
+CONFIG_MBEDTLS_X509_CREATE_C=y
+CONFIG_MBEDTLS_X509_CRT_WRITE_C=y
+CONFIG_MBEDTLS_PEM_WRITE_C=y
+# Posts a default-event-loop event on every TLS recv/send with a 2 s timeout;
+# nothing here listens, and the UI shouldn't depend on a shared queue.
+CONFIG_ESP_HTTPS_SERVER_EVENTS=n
+# Login uses PSA PBKDF2-HMAC-SHA256 (web_auth.c). No Kconfig pins it: it comes
+# from TF-PSA-Crypto's default crypto_config.h (PSA_WANT_ALG_PBKDF2_HMAC). If
+# a future IDF gates it, login breaks at build time, not at runtime.
+
+# app_main runs the DNS server bring-up, the httpd, and the boot-time
+# crypto-init hand-off (web_ui.cpp secure_init_task waits on it). 3584 was
+# the IDF default; the extra is freed when app_main returns.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=6144
+
 # ── Software AES for mbedTLS (#84) ────────────────────────────────────
 # The hardware AES driver allocates internal DMA-capable RAM per operation.
 # During a blocklist fetch (HTTP + TLS both active, internal heap already

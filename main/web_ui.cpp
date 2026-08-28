@@ -1,6 +1,7 @@
 #include "web_ui.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include "blocklist.h"
 #include "domain.h"
 #include "rewrite.h"
@@ -8,12 +9,16 @@
 #include "dot.h"
 #include "query_log.h"
 #include "esp_http_server.h"
+#include "esp_https_server.h"
 #include "esp_log.h"
+#include "esp_attr.h"
 #include "esp_ota_ops.h"
 #include "nvs_flash.h"
 #include "nvs.h"
-#include "mbedtls/base64.h"
+#include "web_tls.h"
+#include "web_auth.h"
 #include <cstring>
+#include <strings.h>
 #include <cstdio>
 #include <cstdlib>
 #include <cstdarg>
@@ -22,11 +27,9 @@
 #include "timesync.h"
 
 static const char *TAG = "web_ui";
-/* Same NVS namespace as blocklist.c/dot.c/acl.c/rewrite.c — see the F-series
- * note in blocklist.c's wl_save_nvs() about NOT erase_all()'ing it. */
-#define AUTH_NVS_NS "dns_sink"
-static httpd_handle_t  s_server = nullptr;
-static DnsSinkServer  *s_dns    = nullptr;
+static httpd_handle_t  s_server   = nullptr;   /* HTTPS :443 — the real UI */
+static httpd_handle_t  s_redirect = nullptr;   /* HTTP  :80  — 301 to https only */
+static DnsSinkServer  *s_dns      = nullptr;
 
 extern "C" void dns_sink_trigger_reload(void);
 extern "C" bool dns_sink_wifi_built(void);
@@ -114,91 +117,137 @@ static bool origin_host_matches(const char *url, const char *host)
     return after == '\0' || after == '/' || after == ':';
 }
 
-/* Check Origin/Referer header against Host on POST handlers to block CSRF.
- * Returns true when the request looks same-origin (or has no Origin/Referer). */
+/* ── Session cookie ────────────────────────────────────────────────
+ * The session token rides in `sid`. Pulled once per request in auth_wrap and
+ * kept here (single-task httpd, #61 — one request in flight at a time) so
+ * handlers and csrf_ok don't re-parse the Cookie header. */
+static char s_req_sid[WEB_AUTH_TOKEN_HEX + 1] = "";
+
+static void cookie_get_sid(httpd_req_t *r)
+{
+    s_req_sid[0] = '\0';
+    char ck[256] = {};
+    if (httpd_req_get_hdr_value_str(r, "Cookie", ck, sizeof(ck)) != ESP_OK) return;
+    const char *p = ck;
+    while ((p = strstr(p, "sid=")) != nullptr) {
+        /* must be at start or after "; " so `xsid=` can't match */
+        if (p == ck || p[-1] == ' ' || p[-1] == ';') {
+            p += 4;
+            size_t l = 0;
+            while (p[l] && p[l] != ';' && l < WEB_AUTH_TOKEN_HEX) l++;
+            if (l == WEB_AUTH_TOKEN_HEX) { memcpy(s_req_sid, p, l); s_req_sid[l] = '\0'; }
+            return;
+        }
+        p += 4;
+    }
+}
+
+/* Cookie attributes: HttpOnly keeps scripts away from it, Secure keeps it off
+ * the :80 redirect listener, SameSite=Strict makes the browser itself refuse
+ * to attach it to any cross-site request — the first CSRF line of defence,
+ * before csrf_ok's own checks. */
+static void set_session_cookie(httpd_req_t *r, const char *sid)
+{
+    static EXT_RAM_BSS_ATTR char hdr[160];
+    snprintf(hdr, sizeof(hdr), "sid=%s; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=43200", sid);
+    httpd_resp_set_hdr(r, "Set-Cookie", hdr);
+}
+static void clear_session_cookie(httpd_req_t *r)
+{
+    httpd_resp_set_hdr(r, "Set-Cookie", "sid=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0");
+}
+
+/* Check a state-changing request is same-origin AND carries this session's
+ * CSRF token (query string `csrf=` for forms, `X-CSRF` header for fetch()).
+ * Three independent checks, any one of which is enough on a modern browser;
+ * together they also cover older ones and the "no Origin header sent" case
+ * that used to be a silent allow. */
 static bool csrf_ok(httpd_req_t *r)
 {
     char host[64] = {}, origin[128] = {}, referer[128] = {};
     httpd_req_get_hdr_value_str(r, "Host",    host,    sizeof(host));
     httpd_req_get_hdr_value_str(r, "Origin",  origin,  sizeof(origin));
     httpd_req_get_hdr_value_str(r, "Referer", referer, sizeof(referer));
+    if (origin[0]  != '\0' && !origin_host_matches(origin,  host)) return false;
+    if (referer[0] != '\0' && !origin_host_matches(referer, host)) return false;
 
-    /* If Origin is present its host must exactly match ours. */
-    if (origin[0] != '\0') return origin_host_matches(origin, host);
-    /* Else if Referer is present its host must exactly match ours. */
-    if (referer[0] != '\0') return origin_host_matches(referer, host);
-    /* Neither header present — allow (same-origin form, no JS/Origin sent). */
-    return true;
-}
-
-/* ── Optional web UI login (#1) ──────────────────────────────────────
- * Mirrors upstream s60sc/ESP32_AdBlocker's optional Auth_Name/Auth_Pass:
- * empty username = disabled (the default), matching this device's own
- * documented trusted-LAN-only threat model when left off. HTTP Basic Auth
- * rather than a session/cookie scheme — simplest thing that matches
- * upstream's guarantee (a browser password prompt gates every page) without
- * adding session-state cross-viewer complexity to the single-task httpd
- * (#61's load-bearing single-task design already rules out per-session
- * server state). */
-static char s_auth_user[32] = {0};
-static char s_auth_pass[64] = {0};
-
-static void auth_load_nvs(void)
-{
-    nvs_handle_t h;
-    if (nvs_open(AUTH_NVS_NS, NVS_READONLY, &h) != ESP_OK) return;
-    size_t ulen = sizeof(s_auth_user);
-    if (nvs_get_str(h, "http_user", s_auth_user, &ulen) != ESP_OK) s_auth_user[0] = '\0';
-    size_t plen = sizeof(s_auth_pass);
-    if (nvs_get_str(h, "http_pass", s_auth_pass, &plen) != ESP_OK) s_auth_pass[0] = '\0';
-    nvs_close(h);
-}
-
-static void auth_save_nvs(const char *user, const char *pass)
-{
-    snprintf(s_auth_user, sizeof(s_auth_user), "%s", user);
-    snprintf(s_auth_pass, sizeof(s_auth_pass), "%s", pass);
-    nvs_handle_t h;
-    if (nvs_open(AUTH_NVS_NS, NVS_READWRITE, &h) == ESP_OK) {
-        nvs_set_str(h, "http_user", s_auth_user);
-        nvs_set_str(h, "http_pass", s_auth_pass);
-        nvs_commit(h);
-        nvs_close(h);
+    char want[33];
+    if (!web_auth_session_csrf(s_req_sid, want, sizeof(want))) return false;
+    char got[48] = {};
+    if (httpd_req_get_hdr_value_str(r, "X-CSRF", got, sizeof(got)) != ESP_OK) {
+        char q[96] = {};
+        if (httpd_req_get_url_query_str(r, q, sizeof(q)) != ESP_OK) return false;
+        if (httpd_query_key_value(q, "csrf", got, sizeof(got)) != ESP_OK) return false;
     }
+    return strlen(got) == 32 && memcmp(got, want, 32) == 0;
 }
 
-static bool auth_ok(httpd_req_t *r)
+/* ── Response hardening ────────────────────────────────────────────
+ * Applied to every response by auth_wrap. All values are string literals
+ * because httpd keeps the pointers, not copies. CSP allows inline script and
+ * style because the page is one self-contained document with no external
+ * resources — everything else is closed: no framing, no form posts to other
+ * origins, no base-URI tricks. No HSTS on purpose: with a self-signed cert a
+ * pinned HSTS entry turns a `cert-reset` (or an NVS wipe) into a browser
+ * hard-lockout with no "proceed anyway" link for a year, and it buys nothing
+ * here — :80 already redirects and browsers ignore HSTS on untrusted
+ * connections anyway. */
+static void set_security_headers(httpd_req_t *r)
 {
-    if (s_auth_user[0] == '\0') return true;   /* disabled */
-    char hdr[160] = {0};
-    if (httpd_req_get_hdr_value_str(r, "Authorization", hdr, sizeof(hdr)) != ESP_OK) return false;
-    size_t hlen = strlen(hdr);
-    if (hlen <= 6 || strncmp(hdr, "Basic ", 6) != 0) return false;
-    unsigned char decoded[128] = {0};
-    size_t out_len = 0;
-    if (mbedtls_base64_decode(decoded, sizeof(decoded) - 1, &out_len,
-                               (const unsigned char *)hdr + 6, hlen - 6) != 0) return false;
-    decoded[out_len] = '\0';
-    char want[96];
-    snprintf(want, sizeof(want), "%s:%s", s_auth_user, s_auth_pass);
-    return strcmp((const char *)decoded, want) == 0;
+    httpd_resp_set_hdr(r, "Cache-Control", "no-store");
+    httpd_resp_set_hdr(r, "X-Content-Type-Options", "nosniff");
+    httpd_resp_set_hdr(r, "X-Frame-Options", "DENY");
+    httpd_resp_set_hdr(r, "Referrer-Policy", "no-referrer");
+    httpd_resp_set_hdr(r, "Content-Security-Policy",
+        "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; "
+        "connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'");
+}
+
+static void redirect_to(httpd_req_t *r, const char *where)
+{
+    httpd_resp_set_status(r, "303 See Other");
+    httpd_resp_set_hdr(r, "Location", where);
+    httpd_resp_send(r, nullptr, 0);
 }
 
 /* ── Auth trampoline ──────────────────────────────────────────────
- * Every registered URI is wrapped through this so login is enforced in one
- * place rather than duplicated at the top of ~26 handlers — the same
+ * Every registered URI is wrapped through this so policy is enforced in one
+ * place rather than duplicated at the top of ~30 handlers — the same
  * "policy in shared code, not per-call-site" reasoning as the blocklist
- * verdict path. The real handler is stashed in httpd_uri_t.user_ctx. */
+ * verdict path. The real handler is stashed in httpd_uri_t.user_ctx.
+ *
+ * Order of gates:
+ *   1. no admin account yet → everything goes to the setup wizard (#89 —
+ *      the device must not serve a single page of config, or accept one,
+ *      before it has an owner);
+ *   2. no valid session → login page;
+ *   3. otherwise run the handler. */
 typedef esp_err_t (*raw_handler_t)(httpd_req_t *);
+static esp_err_t handle_setup_get(httpd_req_t *r);
+static esp_err_t handle_setup_post(httpd_req_t *r);
+static esp_err_t handle_login_get(httpd_req_t *r);
+static esp_err_t handle_login_post(httpd_req_t *r);
 
 static esp_err_t auth_wrap(httpd_req_t *r)
 {
-    if (!auth_ok(r)) {
-        httpd_resp_set_hdr(r, "WWW-Authenticate", "Basic realm=\"DNS Sinkhole\"");
-        httpd_resp_send_err(r, HTTPD_401_UNAUTHORIZED, "Login required");
-        return ESP_FAIL;
-    }
+    web_auth_poll_reset();
+    set_security_headers(r);
+    cookie_get_sid(r);
     raw_handler_t fn = (raw_handler_t)r->user_ctx;
+
+    if (web_auth_setup_needed()) {
+        if (fn == handle_setup_get || fn == handle_setup_post) return fn(r);
+        if (r->method == HTTP_GET) { redirect_to(r, "/setup"); return ESP_OK; }
+        httpd_resp_send_err(r, HTTPD_403_FORBIDDEN, "Setup required"); return ESP_FAIL;
+    }
+    if (fn == handle_setup_get || fn == handle_setup_post) { redirect_to(r, "/"); return ESP_OK; }
+    if (fn == handle_login_get  || fn == handle_login_post) return fn(r);
+
+    if (!web_auth_session_valid(s_req_sid)) {
+        if (r->method == HTTP_GET) { redirect_to(r, "/login"); return ESP_OK; }
+        httpd_resp_send_err(r, HTTPD_401_UNAUTHORIZED, "Login required"); return ESP_FAIL;
+    }
+    web_auth_session_touch(s_req_sid);
     return fn(r);
 }
 
@@ -237,8 +286,179 @@ static void page_mark_truncated(char *page, size_t cap, int *n)
 static void send_html(httpd_req_t *r, const char *body)
 {
     httpd_resp_set_type(r, "text/html; charset=utf-8");
-    httpd_resp_set_hdr(r, "Cache-Control", "no-store");
     httpd_resp_send(r, body, HTTPD_RESP_USE_STRLEN);
+}
+
+/* Shared shell for the two pre-login pages (setup wizard, login). Kept
+ * deliberately plain: no tabs, no refresh, nothing that needs a session. */
+static const char AUTH_PAGE_HEAD[] =
+    "<!DOCTYPE html><html><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>"
+    "<title>DNS Sinkhole</title>"
+    "<style>body{font-family:monospace;max-width:520px;margin:3em auto;padding:0 1em}"
+    "input{font:inherit;padding:.4em;width:100%%;box-sizing:border-box;margin:.25em 0 .8em}"
+    "button{font:inherit;padding:.5em 1.2em}.err{color:#b00020}.fp{word-break:break-all;background:#f4f4f4;"
+    "border:1px solid #ccc;padding:.6em;font-size:.85em}small{color:#555}</style></head><body>";
+
+/* Read a form body field into dst (URL-decoded). Body is the raw
+ * application/x-www-form-urlencoded request. */
+static void form_field(const char *body, const char *key, char *dst, size_t cap)
+{
+    dst[0] = '\0';
+    size_t kl = strlen(key);
+    const char *p = body;
+    while ((p = strstr(p, key)) != nullptr) {
+        if ((p == body || p[-1] == '&') && p[kl] == '=') {
+            p += kl + 1;
+            size_t l = 0;
+            while (p[l] && p[l] != '&' && p[l] != '\r' && p[l] != '\n') l++;
+            url_decode(dst, cap, p, l);
+            return;
+        }
+        p += kl;
+    }
+}
+
+/* ── GET/POST /setup — first-boot onboarding (#89) ───────────────────
+ * Reached only while no admin account exists (auth_wrap routes everything
+ * here until one does). Creates the account, opens a session, and lands on
+ * the dashboard. Shows the certificate fingerprint so the browser warning
+ * the user just clicked through can be checked against what the device
+ * itself reports — the only trust anchor a self-signed cert has. */
+static esp_err_t setup_page(httpd_req_t *r, const char *err)
+{
+    static EXT_RAM_BSS_ATTR char page[3072];
+    char fp[96]; web_tls_fingerprint(fp, sizeof(fp));
+    int n = 0;
+    page_appendf(page, sizeof(page), &n, AUTH_PAGE_HEAD);
+    page_appendf(page, sizeof(page), &n,
+        "<h2>Welcome &mdash; secure this device</h2>"
+        "<p>This DNS sinkhole will hold your Wi-Fi password and every client's DNS history. "
+        "Before it serves anything, create the admin account that guards it.</p>"
+        "<p><b>Certificate fingerprint (SHA-256)</b><br><small>Your browser warned about a "
+        "self-signed certificate. Compare its fingerprint with this one, then you can trust it "
+        "permanently. It also prints on the USB console at boot.</small></p>"
+        "<div class=fp>%s</div><br>"
+        "%s%s%s"
+        "<form method=post action=/setup>"
+        "<label>Admin username<input name=user maxlength=%d autocomplete=username required></label>"
+        "<label>Password <small>(%d&ndash;%d characters)</small><input name=pass type=password "
+        "minlength=%d maxlength=%d autocomplete=new-password required></label>"
+        "<label>Confirm password<input name=pass2 type=password minlength=%d maxlength=%d "
+        "autocomplete=new-password required></label>"
+        "<button>Create account &amp; continue</button></form>"
+        "<p><small>Lost the password later? The USB console command <code>admin-reset</code> "
+        "brings this page back &mdash; it needs the cable, not the network.</small></p>"
+        "</body></html>",
+        fp[0] ? fp : "(unavailable)",
+        err ? "<p class=err>" : "", err ? err : "", err ? "</p>" : "",
+        WEB_AUTH_USER_MAX, WEB_AUTH_PASS_MIN, WEB_AUTH_PASS_MAX,
+        WEB_AUTH_PASS_MIN, WEB_AUTH_PASS_MAX, WEB_AUTH_PASS_MIN, WEB_AUTH_PASS_MAX);
+    send_html(r, page);
+    return ESP_OK;
+}
+
+static esp_err_t handle_setup_get(httpd_req_t *r) { return setup_page(r, nullptr); }
+
+static esp_err_t handle_setup_post(httpd_req_t *r)
+{
+    /* No session exists yet so csrf_ok can't apply; the Origin/Referer check
+     * still does, and the window is one request long — the account exists
+     * after it. */
+    char host[64] = {}, origin[128] = {};
+    httpd_req_get_hdr_value_str(r, "Host",   host,   sizeof(host));
+    httpd_req_get_hdr_value_str(r, "Origin", origin, sizeof(origin));
+    if (origin[0] && !origin_host_matches(origin, host)) {
+        httpd_resp_send_err(r, HTTPD_403_FORBIDDEN, "CSRF"); return ESP_FAIL;
+    }
+    char body[512] = {};
+    int got = httpd_req_recv(r, body, sizeof(body) - 1);
+    if (got <= 0) { httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST, ""); return ESP_FAIL; }
+    char user[WEB_AUTH_USER_MAX + 2], pass[WEB_AUTH_PASS_MAX + 2], pass2[WEB_AUTH_PASS_MAX + 2];
+    form_field(body, "user",  user,  sizeof(user));
+    form_field(body, "pass",  pass,  sizeof(pass));
+    form_field(body, "pass2", pass2, sizeof(pass2));
+    memset(body, 0, sizeof(body));
+
+    const char *err = nullptr;
+    if (strcmp(pass, pass2) != 0)                 err = "Passwords don't match.";
+    else if (!web_auth_set_credentials(user, pass)) err = "Username must be 1-31 printable characters (no ':'); password 10-63 characters.";
+    memset(pass, 0, sizeof(pass)); memset(pass2, 0, sizeof(pass2));
+    if (err) return setup_page(r, err);
+
+    char sid[WEB_AUTH_TOKEN_HEX + 1];
+    if (web_auth_session_create(sid, sizeof(sid))) set_session_cookie(r, sid);
+    redirect_to(r, "/");
+    return ESP_OK;
+}
+
+/* ── GET/POST /login, POST /logout ───────────────────────────────── */
+static esp_err_t login_page(httpd_req_t *r, const char *err)
+{
+    static EXT_RAM_BSS_ATTR char page[2048];
+    int n = 0;
+    page_appendf(page, sizeof(page), &n, AUTH_PAGE_HEAD);
+    page_appendf(page, sizeof(page), &n,
+        "<h2>DNS Sinkhole &mdash; sign in</h2>"
+        "%s%s%s"
+        "<form method=post action=/login>"
+        "<label>Username<input name=user maxlength=%d autocomplete=username required autofocus></label>"
+        "<label>Password<input name=pass type=password maxlength=%d autocomplete=current-password required></label>"
+        "<button>Sign in</button></form>"
+        "</body></html>",
+        err ? "<p class=err>" : "", err ? err : "", err ? "</p>" : "",
+        WEB_AUTH_USER_MAX, WEB_AUTH_PASS_MAX);
+    send_html(r, page);
+    return ESP_OK;
+}
+
+static esp_err_t handle_login_get(httpd_req_t *r)
+{
+    if (web_auth_session_valid(s_req_sid)) { redirect_to(r, "/"); return ESP_OK; }
+    return login_page(r, nullptr);
+}
+
+static esp_err_t handle_login_post(httpd_req_t *r)
+{
+    char host[64] = {}, origin[128] = {};
+    httpd_req_get_hdr_value_str(r, "Host",   host,   sizeof(host));
+    httpd_req_get_hdr_value_str(r, "Origin", origin, sizeof(origin));
+    if (origin[0] && !origin_host_matches(origin, host)) {
+        httpd_resp_send_err(r, HTTPD_403_FORBIDDEN, "CSRF"); return ESP_FAIL;
+    }
+    char body[384] = {};
+    int got = httpd_req_recv(r, body, sizeof(body) - 1);
+    if (got <= 0) { httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST, ""); return ESP_FAIL; }
+    char user[WEB_AUTH_USER_MAX + 2], pass[WEB_AUTH_PASS_MAX + 2];
+    form_field(body, "user", user, sizeof(user));
+    form_field(body, "pass", pass, sizeof(pass));
+    memset(body, 0, sizeof(body));
+
+    int retry = 0;
+    bool ok = web_auth_check_password(user, pass, &retry);
+    memset(pass, 0, sizeof(pass));
+    if (!ok) {
+        static EXT_RAM_BSS_ATTR char msg[96];
+        if (retry > 0) snprintf(msg, sizeof(msg), "Too many failed attempts. Try again in %d s.", retry);
+        else           snprintf(msg, sizeof(msg), "Wrong username or password.");
+        ESP_LOGW(TAG, "failed login for \"%s\"", user);
+        return login_page(r, msg);
+    }
+    char sid[WEB_AUTH_TOKEN_HEX + 1];
+    if (!web_auth_session_create(sid, sizeof(sid))) {
+        httpd_resp_send_err(r, HTTPD_500_INTERNAL_SERVER_ERROR, "session"); return ESP_FAIL;
+    }
+    set_session_cookie(r, sid);
+    redirect_to(r, "/");
+    return ESP_OK;
+}
+
+static esp_err_t handle_logout(httpd_req_t *r)
+{
+    if (!csrf_ok(r)) { httpd_resp_send_err(r, HTTPD_403_FORBIDDEN, "CSRF"); return ESP_FAIL; }
+    web_auth_session_destroy(s_req_sid);
+    clear_session_cookie(r);
+    redirect_to(r, "/login");
+    return ESP_OK;
 }
 
 /* ── GET / — status page ─────────────────────────────────────────── */
@@ -261,8 +481,10 @@ static esp_err_t handle_status(httpd_req_t *r)
      * at once) — page_appendf clamps silently on overflow (H1), which with the
      * tabbed layout would truncate mid-markup and leave unbalanced <div>s, so
      * the failure would present as dead tabs rather than an error (#60). */
-    static char page[16384];
+    static EXT_RAM_BSS_ATTR char page[16384];
     int  n = 0;
+    char csrf[33] = "";
+    web_auth_session_csrf(s_req_sid, csrf, sizeof(csrf));
     page_appendf(page, sizeof(page), &n,
         "<!DOCTYPE html><html><head><meta charset=utf-8>"
         "<title>DNS Sinkhole</title>"
@@ -285,6 +507,17 @@ static esp_err_t handle_status(httpd_req_t *r)
         ".tabs button.active{border-bottom-color:#1a1a8c;color:#1a1a8c;font-weight:bold}"
         ".tab{display:none}.tab.active{display:block}</style>"
         "<script>"
+        /* Per-session CSRF token. Every <form> gets it appended to its action
+         * as ?csrf= on submit and every fetch() sends it as X-CSRF, so no
+         * handler body-parsing had to change (csrf_ok reads the query string
+         * or the header). JS is already required for the tabs, and with JS
+         * off every POST simply fails closed with 403. */
+        "var CSRF='%s';"
+        "document.addEventListener('submit',function(e){var f=e.target;"
+        "if(f.method&&f.method.toLowerCase()=='post'){var a=f.getAttribute('action')||location.pathname;"
+        "f.action=a+(a.indexOf('?')<0?'?':'&')+'csrf='+CSRF;}});"
+        "var _fetch=window.fetch;window.fetch=function(u,o){o=o||{};o.headers=o.headers||{};"
+        "o.headers['X-CSRF']=CSRF;return _fetch(u,o);};"
         "var RT=null;"
         "function showTab(id){"
         "document.querySelectorAll('.tab').forEach(function(e){e.classList.remove('active')});"
@@ -313,7 +546,10 @@ static esp_err_t handle_status(httpd_req_t *r)
         "showTab(id);"
         "}"
         "</script>"
-        "</head><body><h2>ESP32 AdBlocker</h2>"
+        "</head><body>"
+        "<div style='display:flex;justify-content:space-between;align-items:baseline'>"
+        "<h2>ESP32 AdBlocker</h2>"
+        "<form method=post action=/logout><button>Sign out</button></form></div>"
         "<div class=tabs>"
         "<button id=btn-dashboard onclick=\"showTab('dashboard')\">Dashboard</button>"
         "<button id=btn-blocklist onclick=\"showTab('blocklist')\">Blocklist</button>"
@@ -321,7 +557,7 @@ static esp_err_t handle_status(httpd_req_t *r)
         "<button id=btn-access onclick=\"showTab('access')\">Access</button>"
         "<button id=btn-upstream onclick=\"showTab('upstream')\">Upstream DNS</button>"
         "</div>"
-        "<div class='tab' id=tab-dashboard>");
+        "<div class='tab' id=tab-dashboard>", csrf);
     float pct = total > 0 ? 100.0f * (float)blocked / (float)total : 0.0f;
     /* F9: this chip had a DUPLICATE class attribute (class=val class='%s') —
      * HTML keeps only the first, so the ok/warn class never actually applied.
@@ -352,8 +588,8 @@ static esp_err_t handle_status(httpd_req_t *r)
         page_appendf(page, sizeof(page), &n,
             "<p style='background:#fff3cd;border:1px solid #ffe08a;border-radius:6px;"
             "padding:.6em 1em'><b>Setup AP active</b> — no Ethernet or Wi-Fi link yet. "
-            "Join \"ESP32AdBlock-Setup\" (open) and browse here at "
-            "<b>192.168.4.1</b> to enter real Wi-Fi credentials in the Network tab; "
+            "Join \"ESP32AdBlock-Setup\" (WPA2 passphrase printed on the USB console) and browse "
+            "<b>https://192.168.4.1</b> to enter real Wi-Fi credentials in the Network tab; "
             "this AP shuts off automatically once a link comes up.</p>");
     }
     page_appendf(page, sizeof(page), &n,
@@ -413,7 +649,7 @@ static esp_err_t handle_status(httpd_req_t *r)
         page_appendf(page, sizeof(page), &n,
             "<h3>Whitelist</h3><table>"
             "<tr><th>Domain</th><th>Action</th></tr>");
-        static char wl[WHITELIST_MAX][64]; uint32_t cnt = WHITELIST_MAX;
+        static EXT_RAM_BSS_ATTR char wl[WHITELIST_MAX][64]; uint32_t cnt = WHITELIST_MAX;
         blocklist_whitelist_get(wl, &cnt);
         for (uint32_t i = 0; i < cnt && n < (int)sizeof(page) - 256; i++) {
             char safe_text[384], safe_attr[384];
@@ -431,8 +667,8 @@ static esp_err_t handle_status(httpd_req_t *r)
 
     /* Custom block rules (#14) */
     {
-        static char crules[CUSTOM_RULES_CAP + 8];
-        static char safe_cr[CUSTOM_RULES_CAP * 2 + 8];
+        static EXT_RAM_BSS_ATTR char crules[CUSTOM_RULES_CAP + 8];
+        static EXT_RAM_BSS_ATTR char safe_cr[CUSTOM_RULES_CAP * 2 + 8];
         size_t clen = blocklist_custom_get(crules, sizeof(crules));
         html_escape(safe_cr, sizeof(safe_cr), crules);
         page_appendf(page, sizeof(page), &n,
@@ -651,18 +887,24 @@ static esp_err_t handle_status(httpd_req_t *r)
         }
     }
 
-    /* Web UI login (#1) — optional, empty username = disabled */
+    /* Admin account (#89) — always on; changing it signs every session out. */
     {
-        char safe_user[64]; html_escape(safe_user, sizeof(safe_user), s_auth_user);
+        char user[WEB_AUTH_USER_MAX + 1]; web_auth_get_user(user, sizeof(user));
+        char safe_user[80]; html_escape(safe_user, sizeof(safe_user), user);
+        char fp[96]; web_tls_fingerprint(fp, sizeof(fp));
         page_appendf(page, sizeof(page), &n,
-            "<h3>Web UI Login</h3>"
-            "<p><small>Optional. Leave username blank to leave the UI open "
-            "(default, and the intended mode for a trusted-LAN device).</small></p>"
+            "<h3>Admin account</h3>"
+            "<p>Signed in as <b>%s</b>. Sessions expire after 30 min idle / 12 h.</p>"
             "<form method=post action=/auth/set>"
-            "<input name=user placeholder='username' size=16 value=\"%s\"> "
-            "<input name=pass type=password placeholder='password' size=16>"
-            "<button>%s</button></form>",
-            safe_user, s_auth_user[0] ? "Update / disable" : "Enable");
+            "<input name=cur type=password placeholder='current password' size=18 autocomplete=current-password> "
+            "<input name=user placeholder='username' size=12 value=\"%s\" maxlength=%d> "
+            "<input name=pass type=password placeholder='new password (%d+ chars)' size=22 autocomplete=new-password>"
+            "<button>Change</button></form>"
+            "<p><small>Lost password: USB console <code>admin-reset</code>.</small></p>"
+            "<h3>TLS certificate</h3>"
+            "<p><small>Self-signed, generated on this device. SHA-256 fingerprint:</small><br>"
+            "<code style='word-break:break-all'>%s</code></p>",
+            safe_user, safe_user, WEB_AUTH_USER_MAX, WEB_AUTH_PASS_MIN, fp);
     }
 
     page_appendf(page, sizeof(page), &n, "</div><div class='tab' id=tab-network>");
@@ -826,7 +1068,7 @@ static esp_err_t handle_status(httpd_req_t *r)
 /* ── GET /metrics — JSON telemetry ───────────────────────────────── */
 static esp_err_t handle_metrics(httpd_req_t *r)
 {
-    static char json[2048];
+    static EXT_RAM_BSS_ATTR char json[2048];
     int n = dns_server_metrics_json(json, sizeof(json));
     httpd_resp_set_type(r, "application/json");
     httpd_resp_set_hdr(r, "Cache-Control", "no-store");
@@ -887,26 +1129,39 @@ static esp_err_t handle_pause(httpd_req_t *r)
     return ESP_OK;
 }
 
-/* ── POST /auth/set — set/clear the optional web UI login (#1) ────── */
+/* ── POST /auth/set — change the admin account (#1, #89) ──────────
+ * Requires the current password: a session cookie left in a browser must
+ * not be enough to take the account over. Success drops every session
+ * (including this one), so the user lands on the login page. */
 static esp_err_t handle_auth_set(httpd_req_t *r)
 {
     if (!csrf_ok(r)) {
         httpd_resp_send_err(r, HTTPD_403_FORBIDDEN, "CSRF"); return ESP_FAIL;
     }
-    char body[160] = {}; httpd_req_recv(r, body, sizeof(body) - 1);
-    char user[32] = {0}, pass[64] = {0};
-    const char *pu = strstr(body, "user=");
-    if (pu) { pu += 5; size_t l=0; char raw[32]={0}; for(;pu[l]&&pu[l]!='&'&&pu[l]!='\r'&&l<31;l++) raw[l]=pu[l]; url_decode(user,sizeof(user),raw,l); }
-    const char *pp = strstr(body, "pass=");
-    if (pp) { pp += 5; size_t l=0; char raw[64]={0}; for(;pp[l]&&pp[l]!='&'&&pp[l]!='\r'&&l<63;l++) raw[l]=pp[l]; url_decode(pass,sizeof(pass),raw,l); }
-    /* Empty username disables auth regardless of what's in pass, matching
-     * the "optional" semantics: a stray leftover password can't half-lock
-     * the UI once the username is cleared. */
-    if (user[0] == '\0') pass[0] = '\0';
-    auth_save_nvs(user, pass);
-    httpd_resp_set_status(r, "303 See Other");
-    httpd_resp_set_hdr(r, "Location", "/");
-    httpd_resp_send(r, nullptr, 0);
+    char body[512] = {}; httpd_req_recv(r, body, sizeof(body) - 1);   /* 3 x 63 chars, worst-case %XX encoded, fits */
+    char cur[WEB_AUTH_PASS_MAX + 2], user[WEB_AUTH_USER_MAX + 2], pass[WEB_AUTH_PASS_MAX + 2];
+    form_field(body, "cur",  cur,  sizeof(cur));
+    form_field(body, "user", user, sizeof(user));
+    form_field(body, "pass", pass, sizeof(pass));
+    memset(body, 0, sizeof(body));
+
+    char cur_user[WEB_AUTH_USER_MAX + 1]; web_auth_get_user(cur_user, sizeof(cur_user));
+    int retry = 0;
+    bool ok = web_auth_check_password(cur_user, cur, &retry);
+    memset(cur, 0, sizeof(cur));
+    if (!ok) {
+        memset(pass, 0, sizeof(pass));
+        httpd_resp_send_err(r, HTTPD_403_FORBIDDEN, retry ? "Locked out — wait a minute" : "Current password is wrong");
+        return ESP_FAIL;
+    }
+    ok = web_auth_set_credentials(user, pass);
+    memset(pass, 0, sizeof(pass));
+    if (!ok) {
+        httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST, "Username 1-31 printable chars (no ':'), password 10-63 chars");
+        return ESP_FAIL;
+    }
+    clear_session_cookie(r);
+    redirect_to(r, "/login");
     return ESP_OK;
 }
 
@@ -1085,7 +1340,7 @@ static esp_err_t handle_ota_update(httpd_req_t *r)
         return ESP_FAIL;
     }
 
-    static char buf[1536];
+    static char buf[1536];   /* stays INTERNAL: esp_flash_write bounces PSRAM sources 32 B at a time */
     int remaining = r->content_len;
     bool ok = true;
     while (remaining > 0) {
@@ -1148,7 +1403,7 @@ static esp_err_t handle_wifi_scan_start(httpd_req_t *r)
  * the 10s meta-refresh instead of losing it. */
 static esp_err_t handle_wifi_scan_get(httpd_req_t *r)
 {
-    static char json[3072];   /* wrapper + the cached AP array */
+    static EXT_RAM_BSS_ATTR char json[3072];   /* wrapper + the cached AP array */
     int n = dns_sink_wifi_scan_get(json, sizeof(json));
     httpd_resp_set_type(r, "application/json");
     httpd_resp_set_hdr(r, "Cache-Control", "no-store");
@@ -1205,7 +1460,7 @@ static esp_err_t handle_custom_rules(httpd_req_t *r)
     if (!csrf_ok(r)) {
         httpd_resp_send_err(r, HTTPD_403_FORBIDDEN, "CSRF"); return ESP_FAIL;
     }
-    static char body[CUSTOM_RULES_CAP + 64];
+    static EXT_RAM_BSS_ATTR char body[CUSTOM_RULES_CAP + 64];
     int got = httpd_req_recv(r, body, sizeof(body) - 1);
     if (got <= 0) { httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST, ""); return ESP_FAIL; }
     body[got] = '\0';
@@ -1213,7 +1468,7 @@ static esp_err_t handle_custom_rules(httpd_req_t *r)
     if (!p) { httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST, ""); return ESP_FAIL; }
     p += 6;
     /* url-decode into a temp buffer */
-    static char decoded[CUSTOM_RULES_CAP + 4];
+    static EXT_RAM_BSS_ATTR char decoded[CUSTOM_RULES_CAP + 4];
     url_decode(decoded, sizeof(decoded), p, strlen(p));
     blocklist_custom_set(decoded);
     httpd_resp_set_status(r, "303 See Other");
@@ -1225,9 +1480,9 @@ static esp_err_t handle_custom_rules(httpd_req_t *r)
 /* ── GET /log — recent query log (#8) ───────────────────────────── */
 static esp_err_t handle_log(httpd_req_t *r)
 {
-    static QLogEntry entries[64];
+    static EXT_RAM_BSS_ATTR QLogEntry entries[64];
     uint32_t n = query_log_snapshot(entries, 64);
-    static char page[6144];
+    static EXT_RAM_BSS_ATTR char page[6144];
     int pg = 0;
     page_appendf(page, sizeof(page), &pg,
         "<!DOCTYPE html><html><head><meta charset=utf-8>"
@@ -1283,7 +1538,7 @@ static esp_err_t handle_top(httpd_req_t *r)
     uint32_t h_max = 1;
     for (uint32_t i = 0; i < h_count; i++) if (h_total[i] > h_max) h_max = h_total[i];
 
-    static char page[6144];
+    static EXT_RAM_BSS_ATTR char page[6144];
     int pg = 0;
     page_appendf(page, sizeof(page), &pg,
         "<!DOCTYPE html><html><head><meta charset=utf-8>"
@@ -1415,6 +1670,14 @@ static esp_err_t handle_bl_url_set(httpd_req_t *r)
      * blocklist_extra_url_set(N, "") and silently delete a configured slot
      * behind a success-looking 303. Clearing a slot is a deliberate action
      * that must go through /blocklist/url/clear; reject an empty url here. */
+    /* #90: only https. An http:// feed lets anyone on the path rewrite the
+     * list this sinkhole trusts. blocklist.c refuses at fetch time too, for
+     * entries that predate this check. */
+    if (decoded[0] != '\0' && strncasecmp(decoded, "https://", 8) != 0) {
+        httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST,
+            "Blocklist sources must be https:// URLs");
+        return ESP_FAIL;
+    }
     if (decoded[0] == '\0') {
         httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST,
             "empty url — use /blocklist/url/clear to remove a source");
@@ -1462,33 +1725,137 @@ static esp_err_t handle_bl_url_toggle(httpd_req_t *r)
     return ESP_OK;
 }
 
+/* ── HTTP :80 → HTTPS redirect ───────────────────────────────────────
+ * Its own tiny httpd instance (2 sockets, small stack) because one httpd can
+ * only listen on one port. It renders nothing, reads nothing, holds no state
+ * — every path gets a 301 to the same path on https — so it doesn't touch
+ * the single-task-httpd design rule (#61): that rule exists so the UI's
+ * rendering state has exactly one writer, and this server has none. */
+static esp_err_t handle_redirect(httpd_req_t *r)
+{
+    char host[80] = {};
+    httpd_req_get_hdr_value_str(r, "Host", host, sizeof(host));
+    char *colon = strchr(host, ':');
+    if (colon) *colon = '\0';
+    static EXT_RAM_BSS_ATTR char loc[600];
+    snprintf(loc, sizeof(loc), "https://%s%s", host[0] ? host : "esp32adblock.local", r->uri);
+    httpd_resp_set_status(r, "301 Moved Permanently");
+    httpd_resp_set_hdr(r, "Location", loc);
+    httpd_resp_set_hdr(r, "Cache-Control", "no-store");
+    httpd_resp_send(r, nullptr, 0);
+    return ESP_OK;
+}
+
+static void start_redirect_server(void)
+{
+    httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
+    cfg.server_port      = 80;
+    cfg.ctrl_port        = 32770;
+    cfg.max_open_sockets = 2;
+    cfg.max_uri_handlers = 2;
+    cfg.stack_size       = 4096;
+    cfg.lru_purge_enable = true;
+    cfg.uri_match_fn     = httpd_uri_match_wildcard;
+    if (httpd_start(&s_redirect, &cfg) != ESP_OK) { ESP_LOGW(TAG, ":80 redirect listener failed"); return; }
+    static const httpd_uri_t any_get  = { "/*", HTTP_GET,  handle_redirect, nullptr };
+    static const httpd_uri_t any_post = { "/*", HTTP_POST, handle_redirect, nullptr };
+    httpd_register_uri_handler(s_redirect, &any_get);
+    httpd_register_uri_handler(s_redirect, &any_post);
+}
+
 /* ── Public API ──────────────────────────────────────────────────── */
+/* Boot-time crypto (legacy password migration's PBKDF2, cert load/generate)
+ * runs here, on a task with a real stack — app_main's is 3.5 KB
+ * (CONFIG_ESP_MAIN_TASK_STACK_SIZE) and the first attempt to do the cert
+ * generation on it overflowed into the heap; the corruption surfaced as an
+ * interrupt-WDT spin on a garbage mutex, three frames from the cause. */
+struct SecureInitJob {
+    SemaphoreHandle_t done;
+    const char *crt, *key; size_t crt_len, key_len;
+    bool ok;
+};
+
+static void secure_init_task(void *arg)
+{
+    SecureInitJob *job = static_cast<SecureInitJob *>(arg);
+    web_auth_init();
+    job->ok = web_tls_get_identity(&job->crt, &job->crt_len, &job->key, &job->key_len);
+    ESP_LOGI(TAG, "secure_init stack high-water: %u B free", (unsigned)uxTaskGetStackHighWaterMark(nullptr));
+    xSemaphoreGive(job->done);
+    vTaskDelete(nullptr);
+}
+
 bool web_ui_start(DnsSinkServer *dns)
 {
     s_dns = dns;
-    auth_load_nvs();
-    httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
-    cfg.server_port      = 80;
-    cfg.max_uri_handlers = 32;
-    cfg.stack_size       = 16384;
+
+    SecureInitJob job = {};
+    job.done = xSemaphoreCreateBinary();
+    if (!job.done) return false;
+    if (xTaskCreate(secure_init_task, "secure_init", 12288, &job, 5, nullptr) != pdPASS) {
+        vSemaphoreDelete(job.done);
+        return false;
+    }
+    xSemaphoreTake(job.done, portMAX_DELAY);
+    vSemaphoreDelete(job.done);
+    if (!job.ok) {
+        /* No identity means no HTTPS, and this UI is not allowed to exist
+         * over plain HTTP (#89). DNS keeps running; the USB console is the
+         * recovery path (`cert-reset`, then reboot). The caller turns this
+         * into an OTA rollback while the image is still unverified. */
+        ESP_LOGE(TAG, "no TLS identity — web UI NOT started");
+        return false;
+    }
+    const char *crt = job.crt, *key = job.key;
+    size_t crt_len = job.crt_len, key_len = job.key_len;
+
+    /* IDF's HTTPD_SSL_CONFIG_DEFAULT() omits use_secure_element, which
+     * -Werror=missing-field-initializers flags under C++; the field is
+     * zero-initialised anyway. */
+    #pragma GCC diagnostic push
+    #pragma GCC diagnostic ignored "-Wmissing-field-initializers"
+    httpd_ssl_config_t cfg = HTTPD_SSL_CONFIG_DEFAULT();
+    #pragma GCC diagnostic pop
+    cfg.servercert       = (const uint8_t *)crt;
+    cfg.servercert_len   = crt_len;
+    cfg.prvtkey_pem      = (const uint8_t *)key;
+    cfg.prvtkey_len      = key_len;
+    cfg.port_secure      = 443;
+    cfg.httpd.max_uri_handlers = 40;
+    cfg.httpd.max_resp_headers = 16;   /* 5 hardening headers + cookie + Location + type */
+    cfg.httpd.stack_size       = 16384;
     /* Recycle the least-recently-used connection instead of refusing new ones
-     * once max_open_sockets (7) is reached (#61). Without this a client that
-     * goes away mid-request holds its slot until recv/send_wait_timeout, and
-     * enough of those lock everyone else out. max_open_sockets deliberately
-     * stays at the default: CONFIG_LWIP_MAX_SOCKETS is 24 (raised from 16 in
-     * sdkconfig.defaults for TCP/53 and the DoT worker, not for httpd) and
-     * httpd already claims ~9 of them, so raising it risks starving the DNS
-     * server's own sockets — a far worse failure than a slow dashboard. */
-    cfg.lru_purge_enable = true;
-    if (httpd_start(&s_server, &cfg) != ESP_OK) {
-        ESP_LOGE(TAG, "httpd_start failed"); return false;
+     * once max_open_sockets is reached (#61). Without this a client that goes
+     * away mid-request holds its slot until recv/send_wait_timeout, and
+     * enough of those lock everyone else out. 4 sockets is the TLS default:
+     * each idle TLS connection pins ~40 KB (buffers land in PSRAM via
+     * CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC, so internal heap is safe), and
+     * CONFIG_LWIP_MAX_SOCKETS=24 still has to leave room for TCP/53, the DoT
+     * worker, and the :80 redirect listener. */
+    cfg.httpd.lru_purge_enable = true;
+    cfg.httpd.recv_wait_timeout = 10;   /* OTA uploads over TLS are slower */
+    cfg.httpd.send_wait_timeout = 10;
+    /* The handshake runs synchronously on the httpd task; a client that
+     * connects and says nothing (port scanner, stalled browser) would
+     * otherwise hold every other viewer for the full recv timeout. */
+    cfg.tls_handshake_timeout_ms = 3000;
+    esp_err_t started = httpd_ssl_start(&s_server, &cfg);
+    web_tls_release_identity();   /* httpd_ssl_start took its own copies */
+    if (started != ESP_OK) {
+        ESP_LOGE(TAG, "httpd_ssl_start failed"); return false;
     }
 
     /* Every URI routes through auth_wrap with the real handler stashed in
      * user_ctx (#1) — see auth_wrap's comment for why this beats a per-handler
-     * check. */
+     * check. /setup and /login are in the same table; auth_wrap recognises
+     * them by handler pointer and applies the setup/session gates around them. */
     #define H(fn) auth_wrap, (void *)(raw_handler_t)(fn)
     static const httpd_uri_t uris[] = {
+        { "/setup",               HTTP_GET,  H(handle_setup_get)     },
+        { "/setup",               HTTP_POST, H(handle_setup_post)    },
+        { "/login",               HTTP_GET,  H(handle_login_get)     },
+        { "/login",               HTTP_POST, H(handle_login_post)    },
+        { "/logout",              HTTP_POST, H(handle_logout)        },
         { "/",                    HTTP_GET,  H(handle_status)        },
         { "/metrics",             HTTP_GET,  H(handle_metrics)       },
         { "/metrics/reset",       HTTP_POST, H(handle_metrics_reset) },
@@ -1523,11 +1890,14 @@ bool web_ui_start(DnsSinkServer *dns)
     #undef H
     for (auto &u : uris) httpd_register_uri_handler(s_server, &u);
 
-    ESP_LOGI(TAG, "Web UI on port 80");
+    start_redirect_server();
+    ESP_LOGI(TAG, "Web UI on https://:443 (:80 redirects)%s",
+             web_auth_setup_needed() ? " — SETUP MODE: create the admin account in a browser" : "");
     return true;
 }
 
 void web_ui_stop(void)
 {
-    if (s_server) { httpd_stop(s_server); s_server = nullptr; }
+    if (s_server)   { httpd_ssl_stop(s_server); s_server = nullptr; }
+    if (s_redirect) { httpd_stop(s_redirect);   s_redirect = nullptr; }
 }

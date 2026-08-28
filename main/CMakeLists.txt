@@ -12,6 +12,8 @@ idf_component_register(
         "murmur3.c"
         "domain.c"
         "console.c"
+        "web_tls.c"
+        "web_auth.c"
         "web_ui.cpp"
     INCLUDE_DIRS "."
     REQUIRES
@@ -24,6 +26,7 @@ idf_component_register(
         lwip
         esp_http_client
         esp_http_server
+        esp_https_server
         esp-tls
         mbedtls
         esp_driver_gpio

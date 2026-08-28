@@ -9,6 +9,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include <string.h>
+#include <strings.h>
 #include <stdlib.h>
 #include <stdatomic.h>
 #include <inttypes.h>
@@ -583,6 +584,15 @@ uint32_t blocklist_load(void)
 
         uint32_t before = lc.n, rej_before = lc.rejected;
         uint32_t dup_before = lc.deduped, drop_before = lc.dropped;
+        /* #90: refuse plaintext feeds even if NVS holds one from before the
+         * web UI started rejecting them — an http:// list is an on-path
+         * attacker's list. Counts as a feed failure so the UI shows it. */
+        if (strncasecmp(s_extra_urls[i], "https://", 8) != 0) {
+            feed_failures++;
+            ESP_LOGE(TAG, "Extra list %d REFUSED — not https:// (%s); this reload is DEGRADED",
+                     i, s_extra_urls[i]);
+            continue;
+        }
         ESP_LOGI(TAG, "Downloading extra list %d: %s", i, s_extra_urls[i]);
         bool feed_ok = http_fetch_lines(s_extra_urls[i], on_domain_line, &lc);
         if (!feed_ok) {
@@ -892,7 +902,7 @@ bool blocklist_load_sd(void)
 
     /* Read via DRAM bounce buffer — same pattern as blocklist_save_sd, avoids
      * handing the SDSPI/FATFS path a single huge PSRAM-sourced read. */
-    static uint32_t chunk[1024];
+    static EXT_RAM_BSS_ATTR uint32_t chunk[1024];   /* SD path only — cold */
     uint32_t *dst = s_buf[s_active_buf];
     size_t remaining = hdr.count, total_read = 0;
     while (remaining > 0) {
@@ -945,7 +955,7 @@ void blocklist_save_sd(void)
 
     /* Write in chunks from a small DRAM bounce buffer — avoids handing the
      * SDSPI/FATFS path a single huge PSRAM-sourced write. */
-    static uint32_t chunk[1024];
+    static EXT_RAM_BSS_ATTR uint32_t chunk[1024];   /* SD path only — cold */
     size_t written = 0;
     while (written < n) {
         size_t batch = n - written;

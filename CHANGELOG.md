@@ -3,6 +3,46 @@
 All notable changes to ESP32_AdBlocker_Reborn. Versions follow SemVer; the
 firmware's `esp_app_desc` version string comes from `version.txt`.
 
+## [Unreleased] — 1.2.0
+
+### Security
+
+- **HTTPS-only web UI with first-boot onboarding** (#89). Self-signed ECDSA
+  P-256 certificate generated on the device and kept in NVS; `:80` only
+  redirects. A setup wizard gates every route until an admin account exists
+  and shows the certificate fingerprint for pinning. Basic Auth replaced by
+  a login form + `HttpOnly; Secure; SameSite=Strict` session cookie (30 min
+  idle / 12 h absolute, 4 concurrent sessions); the password is stored as a
+  salted PBKDF2-HMAC-SHA256 hash (a legacy plaintext one is hashed on first
+  boot and erased). 5 failed logins → 60 s lockout. Per-session CSRF token on
+  every POST in addition to the Origin/Referer check. HSTS, CSP,
+  `X-Frame-Options: DENY`, `nosniff`, `no-referrer` on every response.
+  Password change requires the current password and signs everyone out.
+- **Blocklist sources must be `https://`** (#90), enforced at the form and at
+  fetch time.
+- **Setup AP is WPA2** with a random NVS-kept passphrase printed on the USB
+  console, instead of open — nobody nearby can reach the setup wizard before
+  the owner does.
+- **USB console** gained `admin-reset`, `cert-reset`, `cert`, `setup-psk`,
+  `heap`.
+
+**Upgrading from 1.1:** the device comes up in setup mode — browse to it
+right after the OTA and create the admin account, because until you do, the
+first host on the LAN to open the page can. A 1.1 web password ≥ 10
+characters is migrated (hashed, plaintext erased); a shorter one is dropped
+and the wizard appears. The login lockout is global (one counter for the
+device), so a LAN host can keep you locked out of `/login` with five bad
+guesses a minute — acceptable for a LAN appliance, and `admin-reset` over
+USB always works.
+
+### Changed
+
+- Web-page render buffers and the Wi-Fi scan table moved from internal .bss
+  to PSRAM (`CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY`), freeing ~40 KB of
+  internal RAM — needed for TLS session setup to coexist with the W5500's DMA
+  buffers on the Waveshare board.
+- mDNS now advertises `_https._tcp` on 443.
+
 ## [1.1.0] — 2026-08-28
 
 Everything from the "roadmap wave 1–3" work: the speed/resilience roadmap,

@@ -109,7 +109,9 @@ appliance — these are all live and verified on hardware:
 * **Cache-poisoning hardening** — randomized transaction IDs plus question
   (qname + qtype) validation on every upstream reply before it is cached.
 * **USB recovery console** — a serial console over the S3's native
-  USB-Serial-JTAG, for recovering a box whose network config is wrong.
+  USB-Serial-JTAG, for recovering a box whose network config is wrong or
+  whose admin password is lost: `wifi`, `status`, `heap`, `admin-reset`,
+  `cert-reset`, `cert`, `setup-psk`. Physical access is the only auth.
 * **Pause blocking** — a one-click Dashboard toggle (mirroring upstream
   s60sc/ESP32_AdBlocker's "Enable AdBlocker" switch) that allows every query
   through without touching the loaded blocklist, whitelist, custom rules, or
@@ -117,19 +119,36 @@ appliance — these are all live and verified on hardware:
 * **Stop an in-progress reload** (mirrors upstream's Stop Load button) — abort
   the current blocklist download/reload; the previously-loaded list keeps
   serving throughout, same as any other reload.
-* **Optional web UI login** (mirrors upstream's Auth_Name/Auth_Pass) — HTTP
-  Basic Auth gating every page and endpoint, off by default (empty username).
-  NVS-persisted. No recovery path short of an NVS erase if forgotten — same
-  as upstream, which has none either.
+* **HTTPS-only web UI with a first-boot setup wizard** (#89) — the UI is
+  served only on **:443** behind a self-signed ECDSA P-256 certificate the
+  device mints on first boot and keeps in NVS (`:80` just redirects). Until an
+  admin account exists every route lands on `/setup`, which shows the
+  certificate's SHA-256 fingerprint (also printed on the USB console, so the
+  browser warning can be checked against something the device itself said)
+  and creates the account. After that: login form → session cookie
+  (`HttpOnly; Secure; SameSite=Strict`, 30 min idle / 12 h absolute), password
+  stored only as a salted PBKDF2-HMAC-SHA256 hash, 5 failed logins → 60 s
+  lockout, per-session CSRF token on every POST on top of the Origin/Referer
+  check, and `Strict-Transport-Security` / CSP / `X-Frame-Options: DENY` /
+  `nosniff` on every response. Changing the password needs the current one and
+  signs every session out. Lost it? USB console `admin-reset` brings the
+  wizard back — that needs the cable, not the network. Nothing that proves who
+  you are ever crosses the wire in the clear, which is the point: this box
+  holds your Wi-Fi password, the admin password, and every client's DNS
+  history.
+* **Blocklist sources must be `https://`** (#90) — rejected at the form and
+  again at fetch time for anything left in NVS from before, so an on-path
+  attacker can't rewrite the list the sinkhole trusts.
 * **Setup AP for zero-touch first-boot Wi-Fi config** (mirrors upstream's
   AP-mode bootstrap) — if neither Ethernet nor Wi-Fi comes up within 30s of
-  boot, an open SoftAP ("ESP32AdBlock-Setup") comes up at 192.168.4.1 serving
-  the same web UI, so a phone can join it and enter real Wi-Fi credentials
-  with no serial cable. Shuts off automatically once any interface gets an
-  IP. It's unauthenticated by design (nothing is configured yet to
-  authenticate against) and can appear during any boot-time link outage
-  longer than 30s, not just a true first boot — same trusted-LAN threat
-  model as upstream's own AP mode.
+  boot, a WPA2 SoftAP ("ESP32AdBlock-Setup") comes up at 192.168.4.1 serving
+  the same web UI at `https://192.168.4.1`, so a phone can join it and enter
+  real Wi-Fi credentials with no serial cable. Its passphrase is random,
+  minted once, kept in NVS, and printed on the USB console (`setup-psk`) —
+  so reaching the setup wizard over the AP takes the same physical access as
+  `admin-reset`, and nobody nearby can race you to become admin. Shuts off
+  automatically once any interface gets an IP. It can appear during any
+  boot-time link outage longer than 30s, not just a true first boot.
 * **Browser-driven firmware update** (mirrors upstream's OTA Upload tab) —
   upload a merged `.bin` from the Network tab, no toolchain or serial cable
   needed. Dual OTA partitions with automatic rollback
@@ -147,7 +166,7 @@ appliance — these are all live and verified on hardware:
 | Add/Del/Check domain | ✅ | Whitelist + Custom block rules + `/check`, all NVS-backed |
 | Clear custom blocklist | ✅ | Custom Block Rules textarea, save empty to clear |
 | Single blocklist URL, daily reload | ✅ (exceeded) | up to 4 extra sources with dedup-aware capacity, hagezi presets, 4h reload |
-| Auth_Name / Auth_Pass (optional login) | ✅ | Optional web UI login, above |
+| Auth_Name / Auth_Pass (optional login) | ✅ | Mandatory admin account + HTTPS, above (stricter than upstream) |
 | AP-mode first-boot Wi-Fi setup | ✅ | Setup AP, above |
 | OTA Upload tab | ✅ | Browser-driven firmware update, above, plus auto-rollback upstream doesn't have |
 | Verbose per-query logging | ✅ (superseded) | `/log` query-log ring with real timestamps + `/top` analytics, more structured than a verbose toggle |
@@ -220,8 +239,10 @@ per-item record. Resolved since the original audit:
 * **HTTP control UI hardened.** CSRF origin/host checking on all POSTs, HTML
   escaping of reflected/stored input, client ACL, and upstream replies validated
   by source address *and* by matching question (qname+qtype) with randomized
-  txids. It is still intended for trusted-LAN use — don't expose port 80 to the
-  internet. (#22, #23, #24, #28, #35, #44)
+  txids. (#22, #23, #24, #28, #35, #44) Since 1.2 the UI is HTTPS-only with
+  a mandatory admin account — see the feature list above. Still don't expose
+  it to the internet: a self-signed cert and one password are a LAN-grade
+  bar, not an internet-grade one.
 * **Concurrency races fixed.** The custom-rules, ACL, and rewrite tables are now
   synchronized between the httpd writer and the dns_task reader.
 * **DoT no longer runs synchronously in the DNS task.** A dedicated worker
@@ -269,6 +290,41 @@ mount and takes the download path.
 
 ## Build and flash
 
+### Flash from your browser
+
+The quickest way onto a board, and the one that needs no toolchain at all:
+
+**<https://glomargadaffi.github.io/ESP32_AdBlocker_Reborn/flasher/>**
+
+Plug the board into USB, click **Connect**, pick the port. The page reads the
+board's flash to work out which of the two supported boards it is (the firmware
+tags its version string with the board, e.g. `1.1.0+waveshare-s3-eth`) and pulls
+the matching images from the latest release. You can override the detection, and
+if the chip is blank or running something else you just pick the board from a
+list.
+
+Two modes: **Full flash** writes the bootloader, partition table, OTA data, and
+app; **App only** writes just the OTA data and app, like an over-the-air update.
+Neither erases the whole chip, so settings, Wi-Fi credentials, and blocklists in
+NVS survive both.
+
+Requirements and caveats:
+
+* **Chrome, Edge, or Opera on desktop.** It uses the Web Serial API, which
+  Firefox, Safari, and mobile browsers don't implement.
+* **Close any serial monitor first** — `idf.py monitor`, PuTTY, the Arduino IDE,
+  or a VS Code serial terminal will be holding the COM port, and the browser
+  can't open it while they do.
+* Firmware is fetched from this repo's GitHub Release and written by your own
+  browser; nothing is uploaded anywhere.
+
+There's a "flash your own build" file picker on the same page if you've built
+locally and would rather not install esptool. See
+[`docs/flasher/README.md`](docs/flasher/README.md) for how detection and the
+release manifest work.
+
+### Build from source
+
 The default build (`sdkconfig`, `build/`) targets the **LilyGO T-ETH-Elite**.
 The **Waveshare ESP32-S3-ETH** builds into its own directory with its own
 sdkconfig, so the two builds never fight over the board choice:
@@ -304,15 +360,35 @@ After that first flash, updates don't need a toolchain or serial cable at
 all — use the web UI's **Network → Firmware Update** upload (see Feature set
 above); it auto-reverts if the new image doesn't come up cleanly.
 
-Or build from source. Toolchain: **ESP-IDF v6.0.x**, natively on Windows,
-with the environment sourced from PowerShell — `. $HOME\esp\esp-idf\export.ps1`.
-Git Bash / MSYS is not a supported build shell for this project.
+Toolchain: **ESP-IDF v6.0.x**, natively on Windows, with the environment sourced
+from PowerShell — `. $HOME\esp\esp-idf\export.ps1`. Git Bash / MSYS is not a
+supported build shell for this project.
 
 ```powershell
 idf.py set-target esp32s3
 idf.py build
 idf.py -p PORT flash monitor
 ```
+
+### Cutting a release
+
+Build both boards, then package the artifacts and publish them — this is what
+feeds the browser flasher, which always reads whichever release is *latest*:
+
+```powershell
+.\tools\make-release.ps1
+gh release create v1.1.0 (Get-ChildItem release\* | ForEach-Object FullName) --title "v1.1.0" --generate-notes
+```
+
+`make-release.ps1` reads the version from `version.txt`, copies the four images
+per board out of `build/` and `build-waveshare/` into `release/` under board- and
+version-qualified names, and writes `release/manifest.json` — taking the offsets
+and the flash mode/frequency/size from each build's own `flash_args` rather than
+hardcoding them. It prints the `gh` command and does not run it. `release/` is
+gitignored.
+
+(The argument list is expanded explicitly because PowerShell doesn't glob-expand
+arguments to native executables, and `gh` doesn't expand them itself.)
 
 First boot downloads the blocklist over HTTPS and writes it to SD. Later boots
 load from SD in about a second. Point your router's DNS at the board's DHCP
@@ -355,6 +431,8 @@ main/
   domain.c         shared domain normalization and TLD detection
   murmur3.c        MurmurHash3_x86_32
   console.c        USB-Serial-JTAG recovery console
+  web_tls.c        self-signed TLS identity (generate, store, fingerprint)
+  web_auth.c       admin account (PBKDF2 hash), sessions, login lockout
   web_ui.cpp       HTTP status UI, JSON metrics, control endpoints
 ```
 

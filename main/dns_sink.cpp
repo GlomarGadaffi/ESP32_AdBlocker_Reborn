@@ -28,6 +28,7 @@
 #include "nvs.h"
 #include "esp_ota_ops.h"
 #include "esp_mac.h"
+#include "esp_random.h"
 #include "esp_timer.h"
 #include "esp_attr.h"
 #include "lwip/inet.h"
@@ -520,27 +521,50 @@ static void wifi_creds_init_nvs(void)
  * Torn down automatically the moment ANY interface gets a real IP. */
 static bool s_setup_ap_active = false;
 
+/* WPA2 passphrase for the setup AP (#89). Random, minted once and kept in
+ * NVS, printed on the USB console whenever the AP comes up. An OPEN setup AP
+ * would let whoever is nearest race the owner to the first-boot wizard and
+ * become the admin; with this, reaching the wizard over Wi-Fi needs the
+ * console (i.e. the cable) — the same physical-access bar as `admin-reset`. */
+static void setup_ap_passphrase(char *out, size_t cap)
+{
+    nvs_handle_t h;
+    size_t len = cap;
+    if (nvs_open(NVS_NS, NVS_READWRITE, &h) != ESP_OK) { snprintf(out, cap, "%s", "setup-nvs-fail"); return; }
+    if (nvs_get_str(h, "setup_psk", out, &len) != ESP_OK || strlen(out) < 8) {
+        static const char alpha[] = "abcdefghjkmnpqrstuvwxyz23456789";   /* no 0/O/1/l/i */
+        uint8_t rnd[16]; esp_fill_random(rnd, sizeof(rnd));
+        for (int i = 0; i < 16 && i < (int)cap - 1; i++) out[i] = alpha[rnd[i] % (sizeof(alpha) - 1)];
+        out[16 < (int)cap - 1 ? 16 : (int)cap - 1] = '\0';
+        nvs_set_str(h, "setup_psk", out);
+        nvs_commit(h);
+    }
+    nvs_close(h);
+}
+
 static void start_setup_ap(void)
 {
     if (s_setup_ap_active) return;
     esp_netif_create_default_wifi_ap();
     wifi_config_t ap_cfg = {};
     static const char *AP_SSID = "ESP32AdBlock-Setup";
+    char psk[24]; setup_ap_passphrase(psk, sizeof(psk));
     snprintf(reinterpret_cast<char *>(ap_cfg.ap.ssid), sizeof(ap_cfg.ap.ssid), "%s", AP_SSID);
+    snprintf(reinterpret_cast<char *>(ap_cfg.ap.password), sizeof(ap_cfg.ap.password), "%s", psk);
     ap_cfg.ap.ssid_len = strlen(AP_SSID);
     ap_cfg.ap.channel = 1;
     ap_cfg.ap.max_connection = 4;
-    ap_cfg.ap.authmode = WIFI_AUTH_OPEN;  /* setup-only; see the log line below */
+    ap_cfg.ap.authmode = WIFI_AUTH_WPA2_PSK;
     if (esp_wifi_set_mode(WIFI_MODE_APSTA) != ESP_OK ||
         esp_wifi_set_config(WIFI_IF_AP, &ap_cfg) != ESP_OK) {
         ESP_LOGE(TAG, "setup AP failed to start");
         return;
     }
     s_setup_ap_active = true;
-    ESP_LOGW(TAG, "No network link — setup AP \"%s\" is up at 192.168.4.1 "
-                  "(open, unauthenticated — join it and browse there to enter "
-                  "real Wi-Fi credentials or check status; it shuts off "
-                  "automatically once any interface gets a real IP)", AP_SSID);
+    ESP_LOGW(TAG, "No network link — setup AP \"%s\" is up at 192.168.4.1, "
+                  "WPA2 passphrase: %s  (join it and browse https://192.168.4.1 "
+                  "to enter real Wi-Fi credentials; it shuts off automatically "
+                  "once any interface gets a real IP)", AP_SSID, psk);
 }
 
 static void stop_setup_ap_if_active(void)
@@ -688,7 +712,7 @@ extern "C" void dns_sink_wifi_get_ssid(char *out, size_t cap)
 
 static void wifi_scan_task(void *)
 {
-    static wifi_ap_record_t recs[WIFI_SCAN_MAX];   /* only this task touches it */
+    static EXT_RAM_BSS_ATTR wifi_ap_record_t recs[WIFI_SCAN_MAX];   /* only this task touches it */
     wifi_scan_config_t scan_cfg = {};
     esp_err_t rc = esp_wifi_scan_start(&scan_cfg, true /* block — we're off the httpd task */);
 
@@ -836,6 +860,7 @@ extern "C" bool dns_sink_wifi_set_creds(const char *ssid, const char *pass)
 }
 
 extern "C" bool dns_sink_setup_ap_active(void) { return s_setup_ap_active; }
+extern "C" void dns_sink_setup_ap_passphrase(char *out, size_t cap) { setup_ap_passphrase(out, cap); }
 #else
 extern "C" void dns_sink_wifi_get_ssid(char *out, size_t cap) { if (cap) out[0] = '\0'; }
 extern "C" bool dns_sink_wifi_scan_start(void) { return false; }
@@ -845,7 +870,12 @@ extern "C" int  dns_sink_wifi_scan_get(char *out, size_t cap)
 }
 extern "C" bool dns_sink_wifi_set_creds(const char *, const char *) { return false; }
 extern "C" bool dns_sink_setup_ap_active(void) { return false; }
+extern "C" void dns_sink_setup_ap_passphrase(char *out, size_t cap) { if (cap) out[0] = '\0'; }
 #endif
+
+/* Full mDNS name — the TLS certificate's CN/SAN (web_tls.c) and the console's
+ * "browse to" hints. */
+extern "C" const char *dns_sink_hostname(void) { return MDNS_HOSTNAME ".local"; }
 
 /* ── W5500 init (board pin map selected above) ───────────────────── */
 static esp_eth_handle_t eth_init_w5500(void)
@@ -1378,8 +1408,8 @@ extern "C" void app_main(void)
                  s_upstream_iface, live, lan_ip, lan_if);
     }
 
-    /* Start web UI on port 80 */
-    web_ui_start(&s_dns);
+    /* Start web UI (HTTPS :443, :80 redirects) */
+    bool ui_up = web_ui_start(&s_dns);
 
     /* OTA rollback confirmation (#1): CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE
      * boots a freshly-flashed OTA slot in a "pending verify" state and
@@ -1388,14 +1418,31 @@ extern "C" void app_main(void)
      * health signal as this device has — no display, no separate healthcheck
      * endpoint to call. If either of them had failed to reach this point
      * (crash, hang, halt-loop above), this line never runs and the next
-     * power cycle rolls back automatically. */
-    esp_ota_mark_app_valid_cancel_rollback();
+     * power cycle rolls back automatically.
+     *
+     * A UI that failed to start (no TLS identity, httpd_ssl_start failure)
+     * is a confirmed image with no way to see it from the network, so on an
+     * unverified image that's a rollback, not a confirmation. On an already
+     * confirmed image DNS keeps serving and the USB console is the way in —
+     * never halt_or_rollback() there: a cert problem is not a reason to stop
+     * resolving. */
+    if (!ui_up) {
+        const esp_partition_t *run = esp_ota_get_running_partition();
+        esp_ota_img_states_t st;
+        if (run && esp_ota_get_state_partition(run, &st) == ESP_OK && st == ESP_OTA_IMG_PENDING_VERIFY) {
+            ESP_LOGE(TAG, "web UI failed on an unverified image — rolling back");
+            esp_ota_mark_app_invalid_rollback_and_reboot();
+        }
+        ESP_LOGE(TAG, "web UI failed to start — DNS keeps serving; USB console for recovery");
+    } else {
+        esp_ota_mark_app_valid_cancel_rollback();
+    }
 
     /* mDNS: advertise the per-board hostname and expose the HTTP service (#20) */
     if (mdns_init() == ESP_OK) {
         mdns_hostname_set(MDNS_HOSTNAME);
         mdns_instance_name_set("ESP32 AdBlocker");
-        mdns_service_add(nullptr, "_http", "_tcp", 80, nullptr, 0);
+        mdns_service_add(nullptr, "_https", "_tcp", 443, nullptr, 0);
         ESP_LOGI(TAG, "mDNS: reachable at " MDNS_HOSTNAME ".local");
     }
 

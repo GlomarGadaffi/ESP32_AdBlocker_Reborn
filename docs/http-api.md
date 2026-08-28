@@ -1,16 +1,36 @@
 # HTTP API reference
 
-Every route below is served by the single httpd instance in `main/web_ui.cpp`
-on **port 80**, and every one of them (including `GET /`) passes through
-`auth_wrap` first — so if a web UI username is set, HTTP Basic Auth gates the
-whole surface. CSRF is *not* in `auth_wrap`: each mutating handler calls
-`csrf_ok()` itself (`Origin`/`Referer` host must match `Host`, absent-both
-allowed for plain form posts). All 25 `POST` routes are covered — `/net/eth/set`
-and `/net/wifi/set` inherit the check from the shared `handle_net_static_set()`
-helper rather than calling it directly, so a naive per-handler grep undercounts.
-If you add a POST handler, add the `csrf_ok()` call.
+Every route below is served by the HTTPS httpd instance in `main/web_ui.cpp`
+on **port 443** (self-signed cert from `main/web_tls.c`; port 80 is a
+separate 2-socket listener that only 301s to `https://`). Every route
+(including `GET /`) passes through `auth_wrap` first, which applies, in order:
 
-This is a trusted-LAN interface; don't expose port 80 to the internet.
+1. **Setup gate** — while no admin account exists (`web_auth_setup_needed()`),
+   every GET redirects to `/setup` and every POST gets 403, except `/setup`
+   itself.
+2. **Session gate** — without a valid `sid` cookie, GET → 303 `/login`,
+   POST → 401. `/login` is exempt; `/setup` bounces to `/` once an account
+   exists.
+3. Security headers on every response: `Cache-Control: no-store`,
+   `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`,
+   `Referrer-Policy: no-referrer`, HSTS, and a CSP that allows only inline
+   script/style and same-origin fetch/form targets.
+
+CSRF is *not* in `auth_wrap`: each mutating handler calls `csrf_ok()` itself.
+It requires **both** a same-origin `Origin`/`Referer` (when present) **and**
+the session's CSRF token — `?csrf=<token>` in the query string (the page's JS
+appends it to every form action on submit) or an `X-CSRF: <token>` header
+(the page wraps `fetch()` to add it). The token is in the page as
+`var CSRF='…'`. `/setup` and `/login` POSTs run before a session exists, so
+they check Origin only. All mutating routes are covered — `/net/eth/set` and
+`/net/wifi/set` inherit the check from the shared `handle_net_static_set()`
+helper rather than calling it directly, so a naive per-handler grep
+undercounts. If you add a POST handler, add the `csrf_ok()` call.
+
+Scripting it: `curl -k -c jar -X POST -d 'user=U&pass=P' https://HOST/login`,
+then `curl -k -b jar https://HOST/` and pull the token out of `var CSRF=`.
+
+This is a trusted-LAN interface; don't expose it to the internet.
 
 The route list is generated from the `uris[]` table in `web_ui.cpp`; the
 metrics fields from `dns_server_metrics_json()` in `dns_server.cpp`.
@@ -19,6 +39,11 @@ metrics fields from `dns_server_metrics_json()` in `dns_server.cpp`.
 
 | method | path | purpose |
 | --- | --- | --- |
+| GET | `/setup` | First-boot wizard: certificate fingerprint + admin account form. Only while no account exists. |
+| POST | `/setup` | Create the admin account (`user`, `pass`, `pass2`); opens a session. |
+| GET | `/login` | Sign-in form. |
+| POST | `/login` | Verify `user`/`pass`; sets the `sid` cookie. 5 failures → 60 s lockout. |
+| POST | `/logout` | Destroy the current session and clear the cookie. |
 | GET | `/` | Status page (Dashboard + tabs). Auto-refreshes every 10 s. |
 | GET | `/metrics` | JSON counters and latency histograms — see below. |
 | POST | `/metrics/reset` | Zero the counters and histograms. |
@@ -26,10 +51,10 @@ metrics fields from `dns_server_metrics_json()` in `dns_server.cpp`.
 | POST | `/blocklist/stop` | Abort an in-progress download/reload; the previously loaded list keeps serving. |
 | POST | `/pause` | Toggle global pause (allow every query without unloading anything). |
 | POST | `/check` | Test one domain against the current verdict ladder. |
-| POST | `/auth/set` | Set/clear the web UI Basic Auth username and password. |
+| POST | `/auth/set` | Change the admin account (`cur` = current password, `user`, `pass`). Drops every session. |
 | POST | `/whitelist/add` | Add a domain to the whitelist. |
 | POST | `/whitelist/remove` | Remove a whitelist entry. |
-| POST | `/blocklist/url/set` | Set one of the 4 extra feed URL slots. |
+| POST | `/blocklist/url/set` | Set one of the 4 extra feed URL slots. `https://` only (#90). |
 | POST | `/blocklist/url/clear` | Clear one extra feed slot. |
 | POST | `/blocklist/url/toggle` | Enable/disable one extra feed without clearing its URL. |
 | POST | `/rewrite/set` | Add a DNS rewrite rule (domain → fixed IP). |
