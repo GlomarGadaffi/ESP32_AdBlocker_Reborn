@@ -85,6 +85,13 @@ void     blocklist_save_sd(void);   /* write sorted array to SD after successful
 bool blocklist_extra_url_set(int idx, const char *url);   /* "" to clear */
 void blocklist_extra_url_get(int idx, char *buf, size_t cap);
 
+/* Per-slot enable/disable (#48): keeps the URL on a disabled source instead of
+ * clearing it, so it can be re-enabled later without retyping. Default true
+ * (enabled) for any slot with no stored preference — existing configured URLs
+ * stay active with no migration. Takes effect on the next reload. */
+bool blocklist_extra_enabled_get(int idx);
+bool blocklist_extra_enabled_set(int idx, bool enabled);
+
 /* Custom block rules — domains entered inline in the UI (#14).
  * Newline/space-separated list, stored in NVS as a single blob (max 4000 chars).
  * Supports plain domain names and hosts-file format ("0.0.0.0 domain").

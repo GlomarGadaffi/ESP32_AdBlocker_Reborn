@@ -479,20 +479,25 @@ static esp_err_t handle_status(httpd_req_t *r)
     /* Blocklist sources section (#4, #9) */
     page_appendf(page, sizeof(page), &n,
         "<h3>Blocklist Sources</h3>"
-        "<table><tr><th>#</th><th>URL</th><th>Action</th></tr>"
-        "<tr><td>0 (primary)</td><td>%s</td><td>built-in</td></tr>",
+        "<table><tr><th>#</th><th>URL</th><th>Status</th><th>Action</th></tr>"
+        "<tr><td>0 (primary)</td><td>%s</td><td class='ok'>enabled</td><td>built-in</td></tr>",
         BLOCKLIST_URL);
     int free_slot = -1;
     for (int i = 0; i < BLOCKLIST_EXTRA_MAX && n < (int)sizeof(page) - 512; i++) {
         char url[BLOCKLIST_URL_CAP]; blocklist_extra_url_get(i, url, sizeof(url));
         if (url[0]) {
             char safe_url[BLOCKLIST_URL_CAP * 2]; html_escape(safe_url, sizeof(safe_url), url);
+            bool en = blocklist_extra_enabled_get(i);
             page_appendf(page, sizeof(page), &n,
-                "<tr><td>%d</td><td>%s</td><td>"
-                "<form method=post action=/blocklist/url/clear>"
+                "<tr><td>%d</td><td>%s</td><td class='%s'>%s</td><td>"
+                "<form method=post action=/blocklist/url/toggle style='display:inline'>"
+                "<input type=hidden name=idx value=%d>"
+                "<button>%s</button></form> "
+                "<form method=post action=/blocklist/url/clear style='display:inline'>"
                 "<input type=hidden name=idx value=%d>"
                 "<button>Remove</button></form></td></tr>",
-                i + 1, safe_url, i);
+                i + 1, safe_url, en ? "ok" : "warn", en ? "enabled" : "disabled",
+                i, en ? "Disable" : "Enable", i);
         } else {
             if (free_slot < 0) free_slot = i;
             page_appendf(page, sizeof(page), &n,
@@ -500,7 +505,7 @@ static esp_err_t handle_status(httpd_req_t *r)
                 "<form method=post action=/blocklist/url/set style='display:inline'>"
                 "<input type=hidden name=idx value=%d>"
                 "<input name=url placeholder='https://...' size=50>"
-                "<button>Add</button></form></td><td></td></tr>",
+                "<button>Add</button></form></td><td></td><td></td></tr>",
                 i + 1, i);
         }
     }
@@ -1437,6 +1442,24 @@ static esp_err_t handle_bl_url_clear(httpd_req_t *r)
     return ESP_OK;
 }
 
+/* ── POST /blocklist/url/toggle — enable/disable a source without losing its
+ * URL (#48). Takes effect on the next reload, same as add/remove. */
+static esp_err_t handle_bl_url_toggle(httpd_req_t *r)
+{
+    if (!csrf_ok(r)) {
+        httpd_resp_send_err(r, HTTPD_403_FORBIDDEN, "CSRF"); return ESP_FAIL;
+    }
+    char body[64] = {}; httpd_req_recv(r, body, sizeof(body) - 1);
+    const char *pidx = strstr(body, "idx=");
+    if (!pidx) { httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST, ""); return ESP_FAIL; }
+    int idx = (int)strtol(pidx + 4, nullptr, 10);
+    blocklist_extra_enabled_set(idx, !blocklist_extra_enabled_get(idx));
+    httpd_resp_set_status(r, "303 See Other");
+    httpd_resp_set_hdr(r, "Location", "/");
+    httpd_resp_send(r, nullptr, 0);
+    return ESP_OK;
+}
+
 /* ── Public API ──────────────────────────────────────────────────── */
 bool web_ui_start(DnsSinkServer *dns)
 {
@@ -1475,6 +1498,7 @@ bool web_ui_start(DnsSinkServer *dns)
         { "/whitelist/remove",    HTTP_POST, H(handle_wl_remove)     },
         { "/blocklist/url/set",   HTTP_POST, H(handle_bl_url_set)    },
         { "/blocklist/url/clear", HTTP_POST, H(handle_bl_url_clear)  },
+        { "/blocklist/url/toggle",HTTP_POST, H(handle_bl_url_toggle) },
         { "/rewrite/set",         HTTP_POST, H(handle_rw_set)        },
         { "/rewrite/clear",       HTTP_POST, H(handle_rw_clear)      },
         { "/log",                 HTTP_GET,  H(handle_log)           },

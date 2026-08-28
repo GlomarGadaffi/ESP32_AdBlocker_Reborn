@@ -1745,11 +1745,20 @@ void DnsSinkServer::run_loop()
                                         /* (#69) same DoT gate as the UDP path;
                                          * a TCP-origin flight still goes
                                          * upstream over UDP, so it hedges the
-                                         * same way. mlen may exceed HEDGE_QMAX
-                                         * (TCP_QUERY_MAX is 768) — hedge_stash
-                                         * then leaves the flight un-hedged. */
+                                         * same way. Stash edns_q, not q: a
+                                         * hedge retransmit of the ORIGINAL
+                                         * EDNS-less query would undo the #66
+                                         * fix above for that copy — same
+                                         * txid, so whichever reply lands
+                                         * first wins, and an EDNS-less
+                                         * retransmit can still land a
+                                         * truncated dead end over TCP. elen
+                                         * may exceed HEDGE_QMAX (512; TCP_QUERY_MAX
+                                         * is 768, +11 for the OPT) — hedge_stash
+                                         * then leaves the flight un-hedged,
+                                         * same graceful no-op as before. */
                                         if (!dot_is_enabled())
-                                            hedge_stash(ue, q, mlen, (uint32_t)now_ms);
+                                            hedge_stash(ue, edns_q, elen, (uint32_t)now_ms);
                                     }
                                     s_cnt_forwarded++;
                                     s_tcp.awaiting = true;
@@ -1853,7 +1862,7 @@ int dns_server_metrics_json(char *out, size_t cap)
         "\"stale_served\":%" PRIu32 ","
         "\"coalesced\":%" PRIu32 ","
         "\"hedges_sent\":%" PRIu32 ",\"hedged_completions\":%" PRIu32 ","
-        "\"dropped\":{\"table_full\":%" PRIu32 "},\"mbox_pressure\":%" PRIu32 ","
+        "\"dropped\":{\"table_full\":%" PRIu32 ",\"mbox_pressure\":%" PRIu32 "},"
         "\"upstream_timeouts\":%" PRIu32 ","
         "\"upstream_inflight\":%d,\"upstream_max\":%d,"
         "\"blocklist_count\":%" PRIu32 ",\"blocklist_loading\":%s,"

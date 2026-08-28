@@ -197,6 +197,32 @@ void blocklist_extra_url_get(int idx, char *buf, size_t cap)
     snprintf(buf, cap, "%s", s_extra_urls[idx]);
 }
 
+/* Per-slot enable flag (#48). Absent key = enabled (default), so a slot
+ * nobody has ever touched behaves exactly as before this feature existed. */
+bool blocklist_extra_enabled_get(int idx)
+{
+    if (idx < 0 || idx >= BLOCKLIST_EXTRA_MAX) return false;
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS, NVS_READONLY, &h) != ESP_OK) return true;
+    char key[10]; snprintf(key, sizeof(key), "bl_en_%d", idx);
+    uint8_t v = 1;
+    esp_err_t err = nvs_get_u8(h, key, &v);
+    nvs_close(h);
+    return (err != ESP_OK) || (v != 0);
+}
+
+bool blocklist_extra_enabled_set(int idx, bool enabled)
+{
+    if (idx < 0 || idx >= BLOCKLIST_EXTRA_MAX) return false;
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS, NVS_READWRITE, &h) != ESP_OK) return false;
+    char key[10]; snprintf(key, sizeof(key), "bl_en_%d", idx);
+    nvs_set_u8(h, key, enabled ? 1 : 0);
+    nvs_commit(h);
+    nvs_close(h);
+    return true;
+}
+
 /* ── Whitelist (SRAM, NVS-backed) ────────────────────────────────── */
 static char s_whitelist[WHITELIST_MAX][64];
 static uint32_t s_wl_count = 0;
@@ -497,7 +523,7 @@ uint32_t blocklist_load(void)
 
     bool have_extras = false;
     for (int i = 0; i < BLOCKLIST_EXTRA_MAX; i++)
-        if (s_extra_urls[i][0] != '\0') { have_extras = true; break; }
+        if (s_extra_urls[i][0] != '\0' && blocklist_extra_enabled_get(i)) { have_extras = true; break; }
 
     /* Dedup-aware extras: sort+dedup the primary IN PLACE first, using its own
      * free tail as scratch — never the other buffer, which is live and must
@@ -515,6 +541,10 @@ uint32_t blocklist_load(void)
     /* Fetch extra blocklists and append (deduped vs everything already loaded) */
     for (int i = 0; i < BLOCKLIST_EXTRA_MAX; i++) {
         if (s_extra_urls[i][0] == '\0') continue;
+        if (!blocklist_extra_enabled_get(i)) {
+            ESP_LOGI(TAG, "Extra list %d disabled — skipping", i);
+            continue;
+        }
 
         /* Full: every remaining feed would be downloaded, TLS-decrypted and
          * parsed only for on_domain_line to drop it. Stop and name what is
@@ -523,7 +553,7 @@ uint32_t blocklist_load(void)
             char skipped[32] = "";     /* indices only — BLOCKLIST_EXTRA_MAX is single-digit */
             size_t sl = 0;
             for (int j = i; j < BLOCKLIST_EXTRA_MAX && sl + 3 < sizeof(skipped); j++) {
-                if (s_extra_urls[j][0] == '\0') continue;
+                if (s_extra_urls[j][0] == '\0' || !blocklist_extra_enabled_get(j)) continue;
                 if (sl) skipped[sl++] = ',';
                 skipped[sl++] = (char)('0' + j);
                 skipped[sl] = '\0';

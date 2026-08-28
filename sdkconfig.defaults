@@ -1,6 +1,7 @@
 # T-ETH-Elite (ESP32-S3 + W5500 + OPI PSRAM)
 
-# PSRAM — OPI at 40MHz (matches LilyGO example; 80MHz marginal through GPIO matrix)
+# PSRAM — OPI at 80MHz (a8b2d4c: raised from the original 40MHz-matches-LilyGO-
+# example setting; measured stable on both boards, see ISSUES.md).
 CONFIG_SPIRAM=y
 CONFIG_SPIRAM_MODE_OCT=y
 CONFIG_SPIRAM_SPEED_80M=y
