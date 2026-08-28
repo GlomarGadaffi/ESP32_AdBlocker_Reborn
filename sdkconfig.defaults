@@ -53,6 +53,26 @@ CONFIG_LWIP_IRAM_OPTIMIZATION=y
 # clears the current ~1.15MB binary with headroom; nvs/otadata/phy_init total
 # under 40KB, so this still uses well under 4MB of the board's 16MB flash.
 CONFIG_PARTITION_TABLE_TWO_OTA_LARGE=y
+# The module is 16MB flash; IDF's own default is 2MB. Without this explicit,
+# regenerating sdkconfig from just this file silently produces a 2MB-flash
+# image against the wrong offsets (#82) — it still builds and links clean.
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+
+# Bring up Wi-Fi STA alongside the W5500 (dual-WAN) — this is how both boards
+# are actually deployed. Also gitignore-invisible until moved here (#82).
+# NOTE: CONFIG_ADBLOCK_WIFI_SSID / CONFIG_ADBLOCK_WIFI_PASSWORD stay OUT of
+# this file deliberately (credentials) — don't sweep them in on a future pass.
+CONFIG_ADBLOCK_NET_WIFI=y
+
+# Interrupt watchdog: raised from IDF's 300ms default to 800ms. Carried over
+# from the pre-#82 generated sdkconfig with no recorded reason — the setting
+# predates this file tracking it (sdkconfig itself was gitignored as
+# "regenerable" until #82). Moved here as-is to stop it from silently
+# reverting to 300ms on a clean regenerate; if it ever needs re-tuning,
+# suspect a long interrupts-disabled section (flash/NVS write during
+# blocklist reload is the likely candidate) rather than assuming it's
+# unnecessary.
+CONFIG_ESP_INT_WDT_TIMEOUT_MS=800
 # Auto-revert to the previous slot if a new image never confirms itself valid
 # (crash-loops, or dns_task/web UI never come up) — the load-bearing safety net
 # for OTA on a device with no local recovery display. app_main calls
