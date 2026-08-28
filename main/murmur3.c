@@ -4,7 +4,7 @@
 static inline uint32_t rotl32(uint32_t x, int8_t r) { return (x << r) | (x >> (32 - r)); }
 #define FMIX32(h) h ^= h >> 16; h *= 0x85ebca6bu; h ^= h >> 13; h *= 0xc2b2ae35u; h ^= h >> 16;
 
-uint32_t murmur3_32(const void *key, size_t len, uint32_t seed)
+uint32_t IRAM_ATTR murmur3_32(const void *key, size_t len, uint32_t seed)
 {
     const uint8_t *data = (const uint8_t *)key;
     const int nblocks = (int)len / 4;

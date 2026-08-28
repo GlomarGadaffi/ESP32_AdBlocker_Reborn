@@ -3,6 +3,7 @@
 #include "http_fetch.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_attr.h"
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "freertos/FreeRTOS.h"
@@ -689,7 +690,11 @@ uint32_t blocklist_load(void)
  * blocklist_whitelist_contains_nb (non-blocking for L2 eth RX task). */
 typedef bool (*wl_fn_t)(const char *, size_t);
 
-static bool is_blocked_impl(const char *domain, size_t len, wl_fn_t wl_check)
+/* IRAM_ATTR (#78): blocklist_is_blocked_nb() -> here is the verdict call on
+ * the L2 fast path (dns_sink.cpp's l2_input_cb), which must never fault to
+ * flash. domain_is_bare_tld() and the wl_check callback it invokes are NOT
+ * tagged — out of this pass's scope, a real gap if full coverage matters. */
+static bool IRAM_ATTR is_blocked_impl(const char *domain, size_t len, wl_fn_t wl_check)
 {
     if (atomic_load_explicit(&s_paused, memory_order_relaxed)) return false;
     uint32_t *arr = atomic_load_explicit(&s_live, memory_order_acquire);

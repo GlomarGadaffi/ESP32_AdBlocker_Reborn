@@ -29,6 +29,7 @@
 #include "esp_ota_ops.h"
 #include "esp_mac.h"
 #include "esp_timer.h"
+#include "esp_attr.h"
 #include "lwip/inet.h"
 
 #include "driver/gpio.h"
@@ -1058,8 +1059,9 @@ static uint32_t s_l2_cached  = 0;   /* L2-handled forward-cache hits (bypassed l
 extern "C" uint32_t dns_sink_l2_blocked(void) { return s_l2_blocked; }
 extern "C" uint32_t dns_sink_l2_cached(void)  { return s_l2_cached; }
 
-/* Parse question qname → normalized name; return qend offset within DNS msg. */
-static int l2_qname(const uint8_t *dns, int dns_len, char *out, size_t cap, size_t *outlen)
+/* Parse question qname → normalized name; return qend offset within DNS msg.
+ * IRAM_ATTR (#78): called from l2_input_cb, which must never fault to flash. */
+static int IRAM_ATTR l2_qname(const uint8_t *dns, int dns_len, char *out, size_t cap, size_t *outlen)
 {
     static char raw[256];
     int off = 12; size_t rl = 0;
@@ -1080,7 +1082,12 @@ static int l2_qname(const uint8_t *dns, int dns_len, char *out, size_t cap, size
     return off + 4;
 }
 
-static esp_err_t l2_input_cb(esp_eth_handle_t h, uint8_t *buf, uint32_t len,
+/* IRAM_ATTR (#78): makes the "never touch flash from the L2 hook" invariant
+ * explicit rather than relying on CONFIG_LWIP_IRAM_OPTIMIZATION to have
+ * caught it incidentally — that setting only covers lwIP's own component
+ * sources, not this callback, which esp_eth invokes via a stored function
+ * pointer (so it can't be inlined into anything already in IRAM). */
+static esp_err_t IRAM_ATTR l2_input_cb(esp_eth_handle_t h, uint8_t *buf, uint32_t len,
                              void *priv, void *info)
 {
     (void)info;

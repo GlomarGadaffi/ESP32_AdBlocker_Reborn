@@ -5,7 +5,7 @@ extern "C" {
 
 #include <stddef.h>
 #include <stdbool.h>
-#include "murmur3.h"
+#include "murmur3.h"   /* also brings in the IRAM_ATTR portability shim */
 
 #define DOMAIN_HASH_SEED  0xDEADF00Du
 #define TLD_MAX_LEN       24  /* longest bare TLD we track */
@@ -35,7 +35,7 @@ bool domain_is_bare_tld(const char *name, size_t len);
 size_t domain_extract_token(const char *line, size_t len, const char **tok_out);
 
 /* Hash a normalized domain. Caller must normalize first. */
-static inline uint32_t domain_hash(const char *name, size_t len)
+static inline IRAM_ATTR uint32_t domain_hash(const char *name, size_t len)
 {
     return murmur3_32(name, len, DOMAIN_HASH_SEED);
 }

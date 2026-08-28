@@ -10,6 +10,7 @@
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
 #include "esp_random.h"
+#include "esp_attr.h"
 #include "lwip/sockets.h"
 #include <fcntl.h>
 #include <cstring>
@@ -309,7 +310,7 @@ static void rewrite_answer_ttls(uint8_t *pkt, int len, uint32_t ttl_s)
  * the txid + builds the frame). Returns the DNS length, or -1 on miss / expired /
  * blocked-entry / write-race. Blocked domains are handled by the blocklist check
  * in the L2 hook, so we only replay allowed (forward-cached) responses here. */
-extern "C" int dns_cache_l2_get(uint32_t qhash, uint16_t qtype, uint8_t *out, int out_cap)
+extern "C" int IRAM_ATTR dns_cache_l2_get(uint32_t qhash, uint16_t qtype, uint8_t *out, int out_cap)
 {
     if (!s_cache || !out) return -1;
     uint64_t now_ms = (uint64_t)(esp_timer_get_time() / 1000);

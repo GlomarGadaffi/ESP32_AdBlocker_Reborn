@@ -31,6 +31,10 @@ void dns_server_metrics_reset(void);
 #ifdef __cplusplus
 extern "C" {
 #endif
+/* IRAM_ATTR tag lives on the definition in dns_server.cpp only — repeating
+ * it here would give GCC two different generated section names for the
+ * same symbol (each IRAM_ATTR expansion mints a fresh one) and fail the
+ * build under -Werror=attributes. */
 int dns_cache_l2_get(uint32_t qhash, uint16_t qtype, uint8_t *out, int out_cap);
 
 /* Persist the forward cache to /sdcard/fwdcache.bin so a reboot keeps its
