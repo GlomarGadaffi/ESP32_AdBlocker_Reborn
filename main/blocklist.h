@@ -95,6 +95,24 @@ bool   blocklist_custom_set(const char *text);      /* save text, re-parse */
 size_t blocklist_custom_get(char *buf, size_t cap); /* retrieve raw text */
 bool   blocklist_custom_is_blocked(const char *domain, size_t len);
 
+/* Global pause switch — mirrors upstream ESP32_AdBlocker's "Enable AdBlocker"
+ * toggle. While paused, blocklist_is_blocked()/_nb() and
+ * blocklist_custom_is_blocked() all return false (every query resolves
+ * ALLOWED); whitelist, custom rules, and ACL data are untouched, only the
+ * verdict is short-circuited, in the shared verdict path so the L2 hook and
+ * the socket path can't diverge. NVS-persisted, survives reboot. */
+void blocklist_set_paused(bool paused);
+bool blocklist_is_paused(void);
+
+/* Abort an in-progress blocklist download/reload (#1, mirrors upstream's
+ * xStop). No-op (logged, not silently dropped) if nothing is loading yet —
+ * see blocklist_stop_load()'s own comment for why that guard exists. The
+ * current fetch's callback returns false on its next line, which
+ * blocklist_load() already treats like a dead feed: "keeping previous list"
+ * for the primary, feed_failures++ for an extra — the old list keeps serving
+ * either way. */
+void blocklist_stop_load(void);
+
 /* Stats */
 uint32_t blocklist_domain_count(void);
 bool     blocklist_is_loading(void);

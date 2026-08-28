@@ -48,8 +48,17 @@ CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
 # p99-tail win on the forwarded/cached (lwIP) path. Costs IRAM; back out if build overflows.
 CONFIG_LWIP_IRAM_OPTIMIZATION=y
 
-# Partition table — use the custom one already on the board (ota_0/ota_1/prompts layout)
-# CONFIG_PARTITION_TABLE_CUSTOM is set per-project in sdkconfig when needed
+# Partition table — dual OTA slots (#1: browser-driven firmware update, matching
+# upstream ESP32_AdBlocker's OTA Upload tab). ota_0/ota_1 at 1700K each easily
+# clears the current ~1.15MB binary with headroom; nvs/otadata/phy_init total
+# under 40KB, so this still uses well under 4MB of the board's 16MB flash.
+CONFIG_PARTITION_TABLE_TWO_OTA_LARGE=y
+# Auto-revert to the previous slot if a new image never confirms itself valid
+# (crash-loops, or dns_task/web UI never come up) — the load-bearing safety net
+# for OTA on a device with no local recovery display. app_main calls
+# esp_ota_mark_app_valid_cancel_rollback() once the DNS server and web UI are
+# both confirmed running; anything short of that self-reverts on next boot.
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
 
 # ── Release performance + size ───────────────────────────────────────
 # Ship a real release build, not the IDF default -Og debug build.

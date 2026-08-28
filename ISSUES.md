@@ -21,17 +21,23 @@ reader takes it with a bounded 2 ms wait and fails open (forwards) on
 contention; writers (`blocklist_custom_set`, `custom_load_nvs`) hold it across
 `custom_parse`.
 
-### C2 — DoT blocks the entire DNS task per query 🟡
-`dot.c` / `dns_server.cpp` — `dot_resolve()` does a synchronous TLS handshake +
-round-trip inline in the single-threaded dns_task loop. While it runs, no other
-query is serviced and upstream UDP replies aren't drained.
-**Mitigation:** inline DoT timeout cut from 3000 ms → **1500 ms**, bounding the
-worst-case stall while still allowing a first handshake to complete; on timeout
-the query falls through to plain-UDP upstream (slot draining resumes next loop).
-**Follow-up (open):** move DoT to a dedicated worker task fed by a queue, or
-keep a persistent/reused TLS session, so a slow DoT query can't stall other
-clients at all. DoT is opt-in and **off by default**, so this is deferred rather
-than blocking. Tracked here as the remaining half of C2.
+### C2 — DoT blocks the entire DNS task per query ✅
+`dot.c` / `dns_server.cpp` — `dot_resolve()` did a synchronous TLS handshake +
+round-trip inline in the single-threaded dns_task loop. While it ran, no other
+query was serviced and upstream UDP replies weren't drained.
+**Fix (`e85f61a`, #5):** a dedicated worker task (8 KB stack, Core 0) owns one
+persistent RFC 7858 session. `dns_task` enqueues raw queries
+(`dot_enqueue`) and drains raw replies (`dot_reply_get`) in its `select()`
+loop without blocking. Replies flow through the same
+validation/delivery/cache code as plain-UDP upstream replies
+(`process_reply()`, factored out of the UDP drain), so H2's qname/qtype checks,
+TCP handback, `refresh_only`, and caching apply identically to both
+transports. On TLS failure the worker echoes the query back flagged failed and
+`dns_task` re-sends it over plain UDP (same fallback contract as before, 3 s
+table eviction as the outer net); first failure after idle is treated as a
+server-closed session and retried once after reconnect. The old inline
+1500 ms-timeout mitigation and the synchronous `dot_resolve()` are both gone.
+DoT remains opt-in and off by default.
 
 ---
 
@@ -363,7 +369,7 @@ Based on an external review of the audit findings, the architectural approach al
 * **DNS Validation (H2):** Using hardware RNG (`esp_random()`) for TXIDs and validating `qname`/`qtype` effectively mitigates Kaminsky-style off-path cache poisoning.
 * **String Handling (H1 & L1):** Replacing `snprintf` accumulators with a clamped wrapper prevents buffer overflows. **Caveat (H1):** Ensure `page_appendf` guarantees strict null-termination on truncation.
 * **L2 Fast-Path Seqlock:** The seqlock is an advanced and correct primitive here, protecting high-frequency lock-free reads without thrashing cache lines with atomic writes.
-* **Blocking DoT (C2):** The 1.5s timeout prevents a total DoS, but blocking the main `dns_task` for a TLS handshake remains an anti-pattern. The documented follow-up (moving it to a dedicated worker task fed by a queue) is the correct architectural fix.
+* **Blocking DoT (C2):** The 1.5s timeout prevents a total DoS, but blocking the main `dns_task` for a TLS handshake remains an anti-pattern. The documented follow-up (moving it to a dedicated worker task fed by a queue) is the correct architectural fix. **Done — see C2 above (`e85f61a`, #5).**
 
 
 ---
@@ -400,3 +406,219 @@ TIF feed, not full TIF in a cheaper encoding. The new presets use the
 `wildcard/` variants throughout, and `tif.medium` (≈326k) specifically for
 the threat-intel preset, labeled as "TIF medium" so the distinction is
 visible in the UI.
+
+---
+
+## 2026-08-27 — pause-blocking toggle (feature parity vs upstream), plus two bugs found while adding it (flashed + verified on hardware, uncommitted)
+
+**Feature: global pause/resume switch (closes the whole-device half of #48).**
+Upstream s60sc/ESP32_AdBlocker has always had a single "Enable AdBlocker"
+checkbox; Reborn had no equivalent — every query was either blocked or
+forwarded, with no way to suspend blocking without clearing the whole
+blocklist. `blocklist_set_paused()`/`blocklist_is_paused()` (`blocklist.c`)
+add an `_Atomic bool` gate checked at the top of `is_blocked_impl()` (shared
+by `blocklist_is_blocked`/`_nb`, so both the socket path and the L2 Ethernet
+fast path honor it identically — no chance of it silently working on one
+path and not the other) and at the top of `blocklist_custom_is_blocked()`
+(a separate function, not routed through `is_blocked_impl`, so it needs its
+own check to make "paused" mean *all* blocking off, matching upstream's
+single global switch rather than leaving custom rules still enforced).
+NVS-persisted (`paused` key, `dns_sink` namespace), survives reboot —
+verified: paused, hard-rebooted via `/reboot`, `/metrics` still read
+`blocklist_paused:true` after boot. Dashboard gets a `Pause blocking` /
+`Resume blocking` button next to Reload, and the status chip shows "Paused"
+(ranked above "Degraded" — a deliberate user action shouldn't be masked by an
+incidental one, both below the transient "Reloading"). `/metrics` gains
+`blocklist_paused`. Verified end-to-end over HTTP and with real DNS queries:
+`ssl.google-analytics.com` BLOCKED → paused → ALLOWED (`/check` and live
+resolution both) → resumed → BLOCKED again.
+
+**Bug found while adding it, fixed: `wl_save_nvs()` erased the ENTIRE
+`dns_sink` NVS namespace on every whitelist add/remove — blast radius is
+larger than first recorded here.** `blocklist.c` — whitelist, extra
+blocklist-source URLs (`bl_url_%d`), custom block rules (`custom_blk`), and
+now `paused` all share the `dns_sink` NVS namespace in `blocklist.c`.
+**Correction:** so does `dns_sink.cpp` (`#define NVS_NS "dns_sink"`, same
+literal) — Wi-Fi SSID/password, per-interface static-IP config, and the
+upstream-interface selection all live in the *same* namespace. `wl_save_nvs()`
+called `nvs_erase_all(h)` before rewriting the `wl%d` keys, wiping every
+other key in the namespace — so adding or removing a single whitelist entry
+silently deleted any configured extra blocklist-source URLs, saved custom
+block rules, **and the board's saved Wi-Fi credentials and static-IP/upstream
+config**, falling back to the Kconfig-seeded defaults on next boot. Also
+DoT's `dot_en`/`dot_srv`/`dot_sni` (`dot.c`, same namespace). Reproduced the
+narrower case: set an extra URL, added a whitelist entry, extra URL was gone.
+Every headline multi-source/config feature in this codebase sharing one
+namespace with the whitelist made this reachable in completely ordinary use,
+not an edge case. **Fix:** erase only the `wl0`..`wl{WHITELIST_MAX-1}` key
+range via `nvs_erase_key()` before rewriting, so a shrinking whitelist still
+drops its stale tail without touching unrelated keys. Verified: added an
+extra URL + a whitelist entry, both survived; had this been the old code, the
+URL would have vanished (and, per the wider radius above, Wi-Fi credentials
+would have too, in the field).
+
+**Bug found while adding it, fixed: `POST /check` never consulted custom
+block rules.** `web_ui.cpp` `handle_check()` computed `blocked` from
+`blocklist_is_blocked()` alone; the real verdict path in `dns_server.cpp`
+always checks `blocklist_is_blocked() || blocklist_custom_is_blocked()`. A
+domain blocked only via a custom rule (not the main list) genuinely
+sinkholed on the wire but showed **ALLOWED** on `/check` — the tool meant to
+verify a rule couldn't verify its own kind of rule. Caught because pausing
+made a custom-rule domain read ALLOWED for the wrong reason (pause hadn't
+shipped yet in that check), which led to testing the *unpaused* case and
+finding it was already wrong. **Fix:** `handle_check` now OR's in
+`blocklist_custom_is_blocked()`, matching `dns_server.cpp` exactly. Verified:
+added a custom rule for a domain not on any list, `/check` now says BLOCKED,
+and a real `nslookup` against the board resolves it to `0.0.0.0`/`::`.
+
+Also updated stale docs found in the same pass: README/ISSUES both still
+described DoT as running synchronously in `dns_task` with a 1.5 s inline
+timeout (C2 "mitigated, follow-up open") — that follow-up shipped weeks ago
+(`e85f61a`, worker task + persistent TLS session, closes C2). Marked ✅ in
+both files; the code was already correct, only the docs had drifted.
+
+---
+
+## 2026-08-27 (session 2) — closing the rest of feature parity: auth, setup AP, OTA, stop-load (flashed + verified on hardware, uncommitted)
+
+Continuation of the same-day parity pass above. A reviewer correctly pushed
+back that closing one gap (pause/resume) while explicitly listing the rest as
+deferred didn't satisfy "feature parity" — so the rest got built, not argued
+away. See the README's new **Feature parity with upstream** table for the
+full checklist; this entry has the implementation and verification detail.
+
+**Optional web UI login (`web_ui.cpp`).** HTTP Basic Auth behind a single
+`auth_wrap()` trampoline — every `httpd_uri_t` now routes through it with the
+real handler stashed in `user_ctx`, so login is enforced in one place rather
+than duplicated at the top of ~26 handlers (same "policy in shared code, not
+per-call-site" reasoning as the blocklist verdict path). Empty username (the
+default) disables it entirely, matching upstream's optional Auth_Name/
+Auth_Pass. NVS-persisted in the same `dns_sink` namespace, new keys
+`http_user`/`http_pass`. **Verified on hardware, deliberately including the
+lockout-risk path:** enabled it, confirmed unauthenticated requests 401 and
+wrong credentials 401, confirmed correct credentials 200, confirmed it
+survives a real `/reboot`, then disabled it again with the (still-live)
+credentials and confirmed the board was left open. No recovery path if
+forgotten short of an NVS erase — noted in the README, same as upstream which
+has none either.
+
+**Setup AP for zero-touch first-boot Wi-Fi (`dns_sink.cpp`).** Found while
+implementing this: `app_main`'s wait for a network link used
+`xEventGroupWaitBits(..., portMAX_DELAY)` — a board with no Ethernet cable
+AND no working Wi-Fi credentials (blank first boot, or a changed home
+network) hung there **forever**, before `web_ui_start()` ever ran. The only
+recovery was the USB serial console's `wifi` command, which needs physical
+access — Reborn had no equivalent to upstream's AP-mode bootstrap at all.
+**Fix:** the wait is now bounded (`WIFI_SETUP_AP_TIMEOUT_MS`, 30s, close to
+upstream's own `wifiTimeoutSecs` default); on timeout, `start_setup_ap()`
+brings up an open SoftAP (`WIFI_MODE_APSTA`, so STA keeps retrying and
+Ethernet is untouched) at the esp-netif default 192.168.4.1. No separate
+captive-portal page was built: `esp_http_server` already listens on all
+interfaces, so a phone joining the AP reaches the *same* dashboard and can
+enter real credentials via the existing Network tab (#54). Torn down
+automatically (`stop_setup_ap_if_active()`) the moment any interface gets a
+real IP — wired into `ip_event_handler`'s `IP_EVENT_ETH_GOT_IP` and
+`IP_EVENT_STA_GOT_IP` branches. **Verification gap, disclosed rather than
+hidden:** the board is PoE-powered over the same cable that carries its only
+Ethernet link (see the poetest.sh section above), so pulling the cable to
+exercise the "no link at all" path also cuts power and would have taken the
+household's live DNS resolution down for an extended, uncontrolled test.
+Verified instead by (a) code review against documented ESP-IDF APSTA
+semantics, (b) confirming a *normal* boot with Ethernet present shows no
+setup-AP banner and behaves identically to before (dashboard reachable
+immediately, DNS working, no regression) — the common-case path this change
+could most easily have broken. The AP-fallback branch itself remains
+untested on real hardware; flagged here rather than claimed.
+
+**Firmware update via the browser + dual OTA partitions (`web_ui.cpp`,
+`dns_sink.cpp`, `sdkconfig`/`sdkconfig.defaults`, `main/CMakeLists.txt`).**
+The single biggest-blast-radius change of the day: switched
+`CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE` → `CONFIG_PARTITION_TABLE_TWO_OTA_LARGE`
+(ota_0/ota_1 @ 1700K each, replacing the old single 1500K app partition) and
+enabled `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE`. `POST /ota/update` streams a
+raw firmware binary (the UI sends the picked `File` object directly via
+`fetch`, not multipart — no parsing needed) straight into
+`esp_ota_write()`/`esp_ota_end()`, then `esp_ota_set_boot_partition()` +
+reboot. Needed `app_update` added to `main`'s `CMakeLists.txt` `REQUIRES`
+(missing this produced `fatal error: esp_ota_ops.h: No such file or
+directory` — the header is provided by that component, not pulled in
+transitively).
+- **Rollback is the load-bearing safety net** for a device with no display
+  and (this session) no physical access to recover it if an OTA image fails
+  to boot. `app_main` calls `esp_ota_mark_app_valid_cancel_rollback()` once
+  DNS serving and the web UI are both confirmed up — as good a health signal
+  as this device has. Reviewed pre-flight (external check, not just
+  self-review) surfaced a real gap: the two `for(;;) vTaskDelay(portMAX_DELAY)`
+  halt-loops on init failure (PSRAM/blocklist init, DNS server start) would
+  have **defeated** rollback — it only fires on the *next reset*, and a
+  halted board never resets. Fixed with `halt_or_rollback()`: if the running
+  partition is still `ESP_OTA_IMG_PENDING_VERIFY` (an unconfirmed OTA image),
+  it calls `esp_ota_mark_app_invalid_rollback_and_reboot()` instead of
+  halting; on an already-confirmed partition (hardware fault unrelated to
+  OTA) it still just halts, since there's nothing safe to roll back to.
+- **NVS survives the partition migration.** `nvs` is the first entry with no
+  explicit offset in both the old and new partition CSVs, and
+  `CONFIG_PARTITION_TABLE_OFFSET` (0x8000) didn't change, so it computes to
+  the same address either way — verified, not assumed: ran
+  `gen_esp32part.py` against the freshly built table and confirmed `nvs @
+  0x9000 / 24K` before flashing anything. The one-time migration flash writes
+  bootloader + partition-table + `ota_data_initial.bin` (0xf000) + app
+  (0x20000, the new ota_0 offset) — four explicit regions, never touching
+  0x9000–0xf000. Old single-app-layout files (`bootloader.bin`,
+  `partition-table.bin`, `dns-sink.bin`, `dns-sink-known-good.bin`,
+  `flash.sh`) were backed up to `~/firmware/pre-ota-backup/` on glolab
+  *before* migrating, as the one-command full-rollback path.
+- **`flash.sh`'s `app` mode would have corrupted the board on its next
+  ordinary use.** It wrote to `0x10000`, which is now inside `otadata`
+  (0xf000–0x10fff) and the head of `ota_0` — a habitual app-only re-flash
+  after this migration would have corrupted otadata *and* the start of
+  ota_0, boot-looping the board until a manual esptool rescue. Fixed before
+  ever using it again: `app` mode now writes `ota_data_initial.bin @ 0xf000`
+  **and** the app `@ 0x20000` every time. Rewriting otadata on every
+  app-only flash is deliberate, not incidental — it makes esptool app-flashes
+  deterministic (always boot the image just written) regardless of whatever
+  OTA state the board's own `/ota/update` had last left behind.
+- **Verified end-to-end on hardware, including the actual rollback
+  confirmation, not just a happy-path upload:** full 4-region migration
+  flash → `/metrics` up, blocklist count unchanged (715,057, SD warm-boot
+  intact), Wi-Fi SSID/upstream-iface/extra-blocklist-URLs all survived in
+  NVS, real DNS query resolved → uploaded the running binary via
+  `/ota/update` → running partition flipped `ota_0` → `ota_1` → **`POST
+  /reboot` and confirmed it stayed on `ota_1`** (the test that actually
+  proves `mark_app_valid_cancel_rollback` ran — if it hadn't, the bootloader
+  would have reverted to `ota_0` on this second boot) → uploaded the final
+  build (with the stop-load fix below) the same way, flipped back to `ota_0`,
+  confirmed it too survives a reboot.
+
+**Stop an in-progress blocklist load (`blocklist.c`, upstream's `xStop`).**
+`on_domain_line` checks a `s_stop_requested` flag and returns `false` on the
+next line, which `http_fetch_lines` (and everything downstream of it in
+`blocklist_load()`) already treats exactly like a dead feed — no new
+"stopped" state needed, the old list keeps serving either way, same as any
+other reload path.
+- **Bug found in the FIRST version of this, before it ever shipped:**
+  `blocklist_stop_load()` unconditionally set the flag, and
+  `blocklist_load()` reset it to `false` at its own entry. `download_task`
+  (`dns_sink.cpp`) only checks its "reload requested" flag once per second
+  (`vTaskDelay(1000ms)` between checks), so a stop request landing in that
+  ≤1s window — plausible for a human clicking Reload then Stop in quick
+  succession, and exactly what happened testing this via curl 0.5s apart —
+  got silently cleared by `blocklist_load()`'s own reset before the download
+  even started, and the reload ran to completion uninterrupted. **Fix:**
+  `blocklist_stop_load()` is now a no-op (logged, not silently dropped) if
+  `blocklist_is_loading()` is false, turning the race into a well-defined
+  "nothing to stop yet" instead of a request that looks accepted but quietly
+  evaporates. **Verified against a GENUINELY in-progress reload** (not a
+  synthetic one): triggered `/reload`, waited for `blocklist_loading:true`,
+  called `/blocklist/stop`, watched it flip to `false` ~10-13s later with
+  `blocklist_count` unchanged (715,057 — old list still serving) and DNS
+  resolution unaffected throughout.
+
+**How this session was different from the first:** an external review
+(advisor) was consulted before touching the live board's partition table,
+specifically because the blast radius (a device serving live household DNS,
+reachable only over the network this session, no physical recovery access)
+warranted a second opinion over solo judgment. Its three pre-flight items —
+verify the generated partition table rather than trust the offset reasoning,
+keep an untouched rollback kit before migrating, and fix `flash.sh` before
+using it again — are the reason this landed without an outage.

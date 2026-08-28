@@ -44,6 +44,8 @@ static int       s_active_buf = 0;  /* which buffer is currently live  */
 static _Atomic(uint32_t *) s_live    = NULL;
 static _Atomic uint32_t    s_count   = 0;
 static _Atomic bool        s_loading = false;
+static _Atomic bool        s_paused  = false;  /* global block/allow-all switch */
+static _Atomic bool        s_stop_requested = false;  /* #1: mirrors upstream's xStop */
 static _Atomic uint32_t    s_dropped = 0;   /* entries lost to capacity on last reload */
 /* Extra feeds that hard-failed (404 / timeout / mid-stream death) on the last
  * reload that actually published a list. Non-zero means the live list is
@@ -118,6 +120,7 @@ size_t blocklist_custom_get(char *buf, size_t cap)
 bool blocklist_custom_is_blocked(const char *domain, size_t len)
 {
     if (!domain) return false;
+    if (atomic_load_explicit(&s_paused, memory_order_relaxed)) return false;
     /* Bounded take: if the writer is mid-rewrite, treat as no-match and forward
      * (fail-open) rather than stall the dns_task hot path. Same contract as
      * blocklist_whitelist_contains (C1). */
@@ -230,6 +233,13 @@ typedef struct {
 static bool on_domain_line(const char *line, size_t len, void *ctx)
 {
     load_ctx_t *lc = (load_ctx_t *)ctx;
+
+    /* #1: user-requested abort (upstream's xStop). Returning false here is
+     * exactly http_fetch_lines' documented abort signal, so this reuses the
+     * same failure path a dead/truncated feed already takes — "keeping
+     * previous list" for the primary, feed_failures++ for an extra — rather
+     * than needing a distinct stopped state threaded through blocklist_load. */
+    if (atomic_load_explicit(&s_stop_requested, memory_order_relaxed)) return false;
 
     /* Hosts-format prefixes and adblock ||anchors^ must be peeled off, or the
      * whole raw line hashes as one junk entry: the feed then reports a healthy
@@ -371,12 +381,30 @@ static void wl_save_nvs(void)
 {
     nvs_handle_t h;
     if (nvs_open(NVS_NS, NVS_READWRITE, &h) != ESP_OK) return;
-    nvs_erase_all(h);
+    /* NOT nvs_erase_all(h): the "dns_sink" namespace also holds bl_url_*,
+     * custom_blk and paused, all unrelated to the whitelist — erase_all wiped
+     * them on every whitelist add/remove. Erase only the wl* key range instead,
+     * so a shrinking list still drops its stale tail. */
+    for (uint32_t i = 0; i < WHITELIST_MAX; i++) {
+        char key[16]; snprintf(key, sizeof(key), "wl%" PRIu32, i);
+        nvs_erase_key(h, key);
+    }
     for (uint32_t i = 0; i < s_wl_count; i++) {
         char key[16]; snprintf(key, sizeof(key), "wl%" PRIu32, i);
         nvs_set_str(h, key, s_whitelist[i]);
     }
     nvs_commit(h);
+    nvs_close(h);
+}
+
+/* ── NVS pause-state persistence ─────────────────────────────────── */
+static void paused_load_nvs(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS, NVS_READONLY, &h) != ESP_OK) return;
+    uint8_t v = 0;
+    if (nvs_get_u8(h, "paused", &v) == ESP_OK)
+        atomic_store_explicit(&s_paused, v != 0, memory_order_relaxed);
     nvs_close(h);
 }
 
@@ -402,6 +430,7 @@ bool blocklist_init(void)
     extra_urls_load_nvs();
     custom_load_nvs();
     wl_load_nvs();
+    paused_load_nvs();
     return true;
 }
 
@@ -443,6 +472,7 @@ static void reload_diff_vs_sd(const uint32_t *neu, uint32_t n_new)
 uint32_t blocklist_load(void)
 {
     atomic_store(&s_loading, true);
+    atomic_store_explicit(&s_stop_requested, false, memory_order_relaxed);
 
     /* Point to the buffer NOT currently live. Download into it while the
      * OLD list keeps serving — no null-blocking window during the fetch. */
@@ -631,6 +661,7 @@ typedef bool (*wl_fn_t)(const char *, size_t);
 
 static bool is_blocked_impl(const char *domain, size_t len, wl_fn_t wl_check)
 {
+    if (atomic_load_explicit(&s_paused, memory_order_relaxed)) return false;
     uint32_t *arr = atomic_load_explicit(&s_live, memory_order_acquire);
     if (!arr) return false;
     uint32_t n = atomic_load_explicit(&s_count, memory_order_relaxed);
@@ -668,6 +699,23 @@ bool blocklist_is_blocked(const char *domain, size_t len)
 bool blocklist_is_blocked_nb(const char *domain, size_t len)
 {
     return is_blocked_impl(domain, len, blocklist_whitelist_contains_nb);
+}
+
+bool blocklist_is_paused(void)
+{
+    return atomic_load_explicit(&s_paused, memory_order_relaxed);
+}
+
+void blocklist_set_paused(bool paused)
+{
+    atomic_store_explicit(&s_paused, paused, memory_order_relaxed);
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_u8(h, "paused", paused ? 1 : 0);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+    ESP_LOGW(TAG, "Ad blocking %s", paused ? "PAUSED (all queries allowed)" : "resumed");
 }
 
 bool blocklist_whitelist_add(const char *domain)
@@ -850,3 +898,21 @@ uint32_t blocklist_domain_count(void)  { return atomic_load(&s_count); }
 bool     blocklist_is_loading(void)    { return atomic_load(&s_loading); }
 uint32_t blocklist_dropped_count(void) { return atomic_load(&s_dropped); }
 uint32_t blocklist_feed_failures(void) { return atomic_load(&s_feed_failures); }
+
+void blocklist_stop_load(void)
+{
+    /* No-op if nothing is loading: without this guard, a stop that lands in
+     * the narrow window between a reload being requested and download_task
+     * actually starting blocklist_load() (which polls every 1s — see
+     * download_task) would sit as a stale "true" that blocklist_load()'s own
+     * reset-at-entry then clears right out from under it, silently. Guarding
+     * on s_loading turns that race into a clean, intentional no-op — "there's
+     * nothing to stop yet" — instead of a request that looks accepted but
+     * quietly evaporates. */
+    if (!atomic_load_explicit(&s_loading, memory_order_relaxed)) {
+        ESP_LOGW(TAG, "Stop requested but nothing is loading — ignored");
+        return;
+    }
+    atomic_store_explicit(&s_stop_requested, true, memory_order_relaxed);
+    ESP_LOGW(TAG, "Blocklist load stop requested");
+}

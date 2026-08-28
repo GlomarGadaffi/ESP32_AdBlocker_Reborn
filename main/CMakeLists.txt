@@ -37,4 +37,5 @@ idf_component_register(
         fatfs
         esp_driver_sdspi
         espressif__mdns
+        app_update
 )

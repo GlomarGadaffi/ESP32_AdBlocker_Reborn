@@ -1787,6 +1787,7 @@ int dns_server_metrics_json(char *out, size_t cap)
         "\"dropped\":{\"table_full\":%" PRIu32 "},\"upstream_timeouts\":%" PRIu32 ","
         "\"upstream_inflight\":%d,\"upstream_max\":%d,"
         "\"blocklist_count\":%" PRIu32 ",\"blocklist_loading\":%s,"
+        "\"blocklist_paused\":%s,"
         "\"blocklist_dropped\":%" PRIu32 ","
         "\"blocklist_feed_failures\":%" PRIu32 ","
         "\"heap_free\":%u,\"heap_largest\":%u,\"psram_free\":%u,\"dns_task_stack_hwm\":%u,",
@@ -1804,6 +1805,7 @@ int dns_server_metrics_json(char *out, size_t cap)
         s_cnt_drop_table, s_cnt_upstream_to,
         upstream_inflight(), UPSTREAM_TABLE_SIZE,
         blocklist_domain_count(), blocklist_is_loading() ? "true" : "false",
+        blocklist_is_paused() ? "true" : "false",
         blocklist_dropped_count(),
         blocklist_feed_failures(),
         (unsigned)free_int, (unsigned)big_int, (unsigned)free_psr, (unsigned)hwm);

@@ -9,6 +9,10 @@
 #include "query_log.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
+#include "esp_ota_ops.h"
+#include "nvs_flash.h"
+#include "nvs.h"
+#include "mbedtls/base64.h"
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
@@ -18,6 +22,9 @@
 #include "timesync.h"
 
 static const char *TAG = "web_ui";
+/* Same NVS namespace as blocklist.c/dot.c/acl.c/rewrite.c — see the F-series
+ * note in blocklist.c's wl_save_nvs() about NOT erase_all()'ing it. */
+#define AUTH_NVS_NS "dns_sink"
 static httpd_handle_t  s_server = nullptr;
 static DnsSinkServer  *s_dns    = nullptr;
 
@@ -40,6 +47,7 @@ extern "C" void dns_sink_net_get_static(const char *iface, bool *dhcp,
                                          char *gw, size_t gw_cap,
                                          char *dns_ip, size_t dns_cap);
 extern "C" void dns_sink_reboot(void);
+extern "C" bool dns_sink_setup_ap_active(void);
 
 /* ── helpers ─────────────────────────────────────────────────────── */
 
@@ -118,6 +126,77 @@ static bool csrf_ok(httpd_req_t *r)
     return true;
 }
 
+/* ── Optional web UI login (#1) ──────────────────────────────────────
+ * Mirrors upstream s60sc/ESP32_AdBlocker's optional Auth_Name/Auth_Pass:
+ * empty username = disabled (the default), matching this device's own
+ * documented trusted-LAN-only threat model when left off. HTTP Basic Auth
+ * rather than a session/cookie scheme — simplest thing that matches
+ * upstream's guarantee (a browser password prompt gates every page) without
+ * adding session-state cross-viewer complexity to the single-task httpd
+ * (#61's load-bearing single-task design already rules out per-session
+ * server state). */
+static char s_auth_user[32] = {0};
+static char s_auth_pass[64] = {0};
+
+static void auth_load_nvs(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(AUTH_NVS_NS, NVS_READONLY, &h) != ESP_OK) return;
+    size_t ulen = sizeof(s_auth_user);
+    if (nvs_get_str(h, "http_user", s_auth_user, &ulen) != ESP_OK) s_auth_user[0] = '\0';
+    size_t plen = sizeof(s_auth_pass);
+    if (nvs_get_str(h, "http_pass", s_auth_pass, &plen) != ESP_OK) s_auth_pass[0] = '\0';
+    nvs_close(h);
+}
+
+static void auth_save_nvs(const char *user, const char *pass)
+{
+    snprintf(s_auth_user, sizeof(s_auth_user), "%s", user);
+    snprintf(s_auth_pass, sizeof(s_auth_pass), "%s", pass);
+    nvs_handle_t h;
+    if (nvs_open(AUTH_NVS_NS, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_str(h, "http_user", s_auth_user);
+        nvs_set_str(h, "http_pass", s_auth_pass);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+}
+
+static bool auth_ok(httpd_req_t *r)
+{
+    if (s_auth_user[0] == '\0') return true;   /* disabled */
+    char hdr[160] = {0};
+    if (httpd_req_get_hdr_value_str(r, "Authorization", hdr, sizeof(hdr)) != ESP_OK) return false;
+    size_t hlen = strlen(hdr);
+    if (hlen <= 6 || strncmp(hdr, "Basic ", 6) != 0) return false;
+    unsigned char decoded[128] = {0};
+    size_t out_len = 0;
+    if (mbedtls_base64_decode(decoded, sizeof(decoded) - 1, &out_len,
+                               (const unsigned char *)hdr + 6, hlen - 6) != 0) return false;
+    decoded[out_len] = '\0';
+    char want[96];
+    snprintf(want, sizeof(want), "%s:%s", s_auth_user, s_auth_pass);
+    return strcmp((const char *)decoded, want) == 0;
+}
+
+/* ── Auth trampoline ──────────────────────────────────────────────
+ * Every registered URI is wrapped through this so login is enforced in one
+ * place rather than duplicated at the top of ~26 handlers — the same
+ * "policy in shared code, not per-call-site" reasoning as the blocklist
+ * verdict path. The real handler is stashed in httpd_uri_t.user_ctx. */
+typedef esp_err_t (*raw_handler_t)(httpd_req_t *);
+
+static esp_err_t auth_wrap(httpd_req_t *r)
+{
+    if (!auth_ok(r)) {
+        httpd_resp_set_hdr(r, "WWW-Authenticate", "Basic realm=\"DNS Sinkhole\"");
+        httpd_resp_send_err(r, HTTPD_401_UNAUTHORIZED, "Login required");
+        return ESP_FAIL;
+    }
+    raw_handler_t fn = (raw_handler_t)r->user_ctx;
+    return fn(r);
+}
+
 /* Bounded append into a page buffer. *pos tracks the current write offset.
  * snprintf returns the length it WOULD have written, so a naive
  * `n += snprintf(buf+n, cap-n, ...)` lets n exceed cap; the next call then
@@ -164,6 +243,7 @@ static esp_err_t handle_status(httpd_req_t *r)
     uint32_t blocked = s_dns ? (uint32_t)s_dns->queries_blocked() : 0;
     uint32_t domains = blocklist_domain_count();
     bool     loading = blocklist_is_loading();
+    bool     paused  = blocklist_is_paused();
     uint32_t wl_n    = blocklist_whitelist_count();
     /* F9: hoisted so the Dashboard chip below can reflect degradation, not
      * just loading state — these were previously only read down in the
@@ -246,8 +326,12 @@ static esp_err_t handle_status(httpd_req_t *r)
      * on a degraded box. Reloading still wins over Degraded — it's the more
      * urgent, and more likely transient, state. */
     bool degraded = (bl_dropped > 0) || (bl_feed_fail > 0);
-    const char *status_cls = loading ? "warn" : (degraded ? "warn" : "ok");
-    const char *status_txt = loading ? "Reloading" : (degraded ? "Degraded" : "Active");
+    /* Paused ranks above Degraded: it's a deliberate user action, not an
+     * incidental condition, so it should never be silently masked by a stale
+     * "Degraded" chip left over from before blocking was paused. Loading still
+     * wins over both — it's transient and self-clears. */
+    const char *status_cls = loading ? "warn" : (paused ? "warn" : (degraded ? "warn" : "ok"));
+    const char *status_txt = loading ? "Reloading" : (paused ? "Paused" : (degraded ? "Degraded" : "Active"));
     page_appendf(page, sizeof(page), &n,
         "<div class=stats>"
         "<div class=stat><div class=val>%" PRIu32 "</div><div class=lbl>Domains</div></div>"
@@ -259,9 +343,26 @@ static esp_err_t handle_status(httpd_req_t *r)
         domains, total, blocked, pct,
         status_cls, status_txt);
 
+    if (dns_sink_setup_ap_active()) {
+        page_appendf(page, sizeof(page), &n,
+            "<p style='background:#fff3cd;border:1px solid #ffe08a;border-radius:6px;"
+            "padding:.6em 1em'><b>Setup AP active</b> — no Ethernet or Wi-Fi link yet. "
+            "Join \"ESP32AdBlock-Setup\" (open) and browse here at "
+            "<b>192.168.4.1</b> to enter real Wi-Fi credentials in the Network tab; "
+            "this AP shuts off automatically once a link comes up.</p>");
+    }
     page_appendf(page, sizeof(page), &n,
         "<h3>Actions</h3>"
-        "<form method=post action=/reload><button>Reload blocklist</button></form><br>"
+        "<form method=post action=/reload><button>Reload blocklist</button></form><br>");
+    if (loading) {
+        page_appendf(page, sizeof(page), &n,
+            "<form method=post action=/blocklist/stop>"
+            "<button>Stop load</button></form><br>");
+    }
+    page_appendf(page, sizeof(page), &n,
+        "<form method=post action=/pause>"
+        "<input type=hidden name=on value=%d>"
+        "<button>%s</button></form><br>"
         "<form method=post action=/check>"
         "<input name=domain placeholder='Check domain' size=40>"
         "<button>Check</button></form><br>"
@@ -271,7 +372,8 @@ static esp_err_t handle_status(httpd_req_t *r)
         "<a href='/log'>Query log</a> &nbsp; <a href='/top'>Top lists</a>"
         " &nbsp; <a href='/metrics'>Metrics JSON</a>"
         "<p><small>This tab auto-refreshes every 10s; the other tabs don't, so "
-        "they won't reload while you're editing.</small></p>");
+        "they won't reload while you're editing.</small></p>",
+        paused ? 0 : 1, paused ? "Resume blocking" : "Pause blocking");
 
     /* Clock status (NTP) */
     {
@@ -536,6 +638,21 @@ static esp_err_t handle_status(httpd_req_t *r)
                 "<button>Clear all (allow everyone)</button></form>");
         }
     }
+
+    /* Web UI login (#1) — optional, empty username = disabled */
+    {
+        char safe_user[64]; html_escape(safe_user, sizeof(safe_user), s_auth_user);
+        page_appendf(page, sizeof(page), &n,
+            "<h3>Web UI Login</h3>"
+            "<p><small>Optional. Leave username blank to leave the UI open "
+            "(default, and the intended mode for a trusted-LAN device).</small></p>"
+            "<form method=post action=/auth/set>"
+            "<input name=user placeholder='username' size=16 value=\"%s\"> "
+            "<input name=pass type=password placeholder='password' size=16>"
+            "<button>%s</button></form>",
+            safe_user, s_auth_user[0] ? "Update / disable" : "Enable");
+    }
+
     page_appendf(page, sizeof(page), &n, "</div><div class='tab' id=tab-network>");
 
     /* Dual-WAN interface selection (#53) */
@@ -584,6 +701,32 @@ static esp_err_t handle_status(httpd_req_t *r)
         page_appendf(page, sizeof(page), &n,
             "<form method=post action=/reboot style='margin-top:.5em'>"
             "<button>Reboot now</button></form>");
+    }
+
+    /* Firmware update (#1) — mirrors upstream's OTA Upload tab */
+    {
+        const esp_partition_t *running = esp_ota_get_running_partition();
+        page_appendf(page, sizeof(page), &n,
+            "<h3>Firmware Update</h3>"
+            "<p><small>Running from: <b>%s</b>. Pick a merged firmware .bin "
+            "(built with idf.py build, or a release asset) and upload — no "
+            "toolchain or serial cable needed. If the new image never comes "
+            "back up cleanly, it auto-reverts to this slot.</small></p>"
+            "<input type=file id=ota-file accept='.bin'> "
+            "<button type=button onclick=\"otaUpload()\">Upload &amp; apply</button>"
+            "<span id=ota-status></span>"
+            "<script>"
+            "function otaUpload(){"
+            "var f=document.getElementById('ota-file').files[0];"
+            "if(!f){document.getElementById('ota-status').textContent=' pick a file first';return;}"
+            "document.getElementById('ota-status').textContent=' uploading\xe2\x80\xa6';"
+            "fetch('/ota/update',{method:'POST',body:f})"
+            ".then(function(r){if(!r.ok)return r.text().then(function(t){throw new Error(t)});"
+            "document.getElementById('ota-status').textContent=' applied, rebooting\xe2\x80\xa6';})"
+            ".catch(function(e){document.getElementById('ota-status').textContent=' failed: '+e.message;});"
+            "}"
+            "</script>",
+            running ? running->label : "?");
     }
 
     /* Wi-Fi scan + reconfigure (#54) */
@@ -695,6 +838,57 @@ static esp_err_t handle_reload(httpd_req_t *r)
     return ESP_OK;
 }
 
+/* ── POST /blocklist/stop — abort an in-progress load (#1, upstream xStop) */
+static esp_err_t handle_bl_stop(httpd_req_t *r)
+{
+    if (!csrf_ok(r)) {
+        httpd_resp_send_err(r, HTTPD_403_FORBIDDEN, "CSRF"); return ESP_FAIL;
+    }
+    blocklist_stop_load();
+    httpd_resp_set_status(r, "303 See Other");
+    httpd_resp_set_hdr(r, "Location", "/");
+    httpd_resp_send(r, nullptr, 0);
+    return ESP_OK;
+}
+
+/* ── POST /pause — global block/allow-all toggle, mirrors upstream
+ * ESP32_AdBlocker's "Enable AdBlocker" switch ────────────────────── */
+static esp_err_t handle_pause(httpd_req_t *r)
+{
+    if (!csrf_ok(r)) {
+        httpd_resp_send_err(r, HTTPD_403_FORBIDDEN, "CSRF"); return ESP_FAIL;
+    }
+    char body[16] = {}; httpd_req_recv(r, body, sizeof(body) - 1);
+    blocklist_set_paused(strstr(body, "on=1") != nullptr);
+    httpd_resp_set_status(r, "303 See Other");
+    httpd_resp_set_hdr(r, "Location", "/");
+    httpd_resp_send(r, nullptr, 0);
+    return ESP_OK;
+}
+
+/* ── POST /auth/set — set/clear the optional web UI login (#1) ────── */
+static esp_err_t handle_auth_set(httpd_req_t *r)
+{
+    if (!csrf_ok(r)) {
+        httpd_resp_send_err(r, HTTPD_403_FORBIDDEN, "CSRF"); return ESP_FAIL;
+    }
+    char body[160] = {}; httpd_req_recv(r, body, sizeof(body) - 1);
+    char user[32] = {0}, pass[64] = {0};
+    const char *pu = strstr(body, "user=");
+    if (pu) { pu += 5; size_t l=0; char raw[32]={0}; for(;pu[l]&&pu[l]!='&'&&pu[l]!='\r'&&l<31;l++) raw[l]=pu[l]; url_decode(user,sizeof(user),raw,l); }
+    const char *pp = strstr(body, "pass=");
+    if (pp) { pp += 5; size_t l=0; char raw[64]={0}; for(;pp[l]&&pp[l]!='&'&&pp[l]!='\r'&&l<63;l++) raw[l]=pp[l]; url_decode(pass,sizeof(pass),raw,l); }
+    /* Empty username disables auth regardless of what's in pass, matching
+     * the "optional" semantics: a stray leftover password can't half-lock
+     * the UI once the username is cleared. */
+    if (user[0] == '\0') pass[0] = '\0';
+    auth_save_nvs(user, pass);
+    httpd_resp_set_status(r, "303 See Other");
+    httpd_resp_set_hdr(r, "Location", "/");
+    httpd_resp_send(r, nullptr, 0);
+    return ESP_OK;
+}
+
 /* ── POST /check ─────────────────────────────────────────────────── */
 static esp_err_t handle_check(httpd_req_t *r)
 {
@@ -712,7 +906,13 @@ static esp_err_t handle_check(httpd_req_t *r)
 
     char decoded[256]; url_decode(decoded, sizeof(decoded), p, dlen);
     char norm[256]; size_t nlen = domain_normalize(norm, sizeof(norm), decoded, strlen(decoded));
-    bool blocked = (nlen > 0) && blocklist_is_blocked(norm, nlen);
+    /* Match the real verdict path (dns_server.cpp): main list OR custom rules.
+     * Previously checked only the main list, so a domain blocked solely by a
+     * custom rule showed ALLOWED here even though it was genuinely sinkholed
+     * on the wire — the tool meant to verify a rule couldn't verify its own
+     * kind of rule. */
+    bool blocked = (nlen > 0) &&
+        (blocklist_is_blocked(norm, nlen) || blocklist_custom_is_blocked(norm, nlen));
 
     char safe[384]; html_escape(safe, sizeof(safe), norm);
     char page[768];
@@ -829,6 +1029,77 @@ static esp_err_t handle_reboot(httpd_req_t *r)
     send_html(r, "<!DOCTYPE html><html><body><h2>Rebooting…</h2>"
                  "<p>Reconnecting in ~10s. <a href='/'>Back</a> (once it's up).</p></body></html>");
     vTaskDelay(pdMS_TO_TICKS(300));   /* let the response flush before the reset */
+    dns_sink_reboot();
+    return ESP_OK;
+}
+
+/* ── POST /ota/update — browser-driven firmware update (#1) ─────────
+ * Mirrors upstream ESP32_AdBlocker's "OTA Upload" tab: no toolchain needed
+ * to update a device already in the field. Raw firmware bytes as the POST
+ * body (the UI form sends the picked File object directly via fetch, not
+ * multipart — the simplest thing that streams straight into esp_ota_write
+ * with no parsing on this side). Written to whichever OTA slot ISN'T
+ * currently running (esp_ota_get_next_update_partition), then that slot is
+ * marked bootable and the board reboots into it. If it never comes back up
+ * cleanly, CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE auto-reverts to the slot
+ * that was running before this request — the load-bearing safety net, since
+ * this device has no display for a stuck-boot indicator. */
+static esp_err_t handle_ota_update(httpd_req_t *r)
+{
+    if (!csrf_ok(r)) { httpd_resp_send_err(r, HTTPD_403_FORBIDDEN, "CSRF"); return ESP_FAIL; }
+    if (r->content_len <= 0) {
+        httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST, "empty body"); return ESP_FAIL;
+    }
+
+    const esp_partition_t *update_part = esp_ota_get_next_update_partition(nullptr);
+    if (!update_part) {
+        httpd_resp_send_err(r, HTTPD_500_INTERNAL_SERVER_ERROR, "no OTA partition available");
+        return ESP_FAIL;
+    }
+    ESP_LOGI(TAG, "OTA: writing %d bytes to %s", (int)r->content_len, update_part->label);
+
+    esp_ota_handle_t ota;
+    if (esp_ota_begin(update_part, (size_t)r->content_len, &ota) != ESP_OK) {
+        httpd_resp_send_err(r, HTTPD_500_INTERNAL_SERVER_ERROR, "esp_ota_begin failed");
+        return ESP_FAIL;
+    }
+
+    static char buf[1536];
+    int remaining = r->content_len;
+    bool ok = true;
+    while (remaining > 0) {
+        int want = remaining < (int)sizeof(buf) ? remaining : (int)sizeof(buf);
+        int got = httpd_req_recv(r, buf, want);
+        if (got <= 0) { ok = false; break; }
+        if (esp_ota_write(ota, buf, got) != ESP_OK) { ok = false; break; }
+        remaining -= got;
+    }
+    if (!ok) {
+        esp_ota_abort(ota);
+        httpd_resp_send_err(r, HTTPD_500_INTERNAL_SERVER_ERROR, "upload interrupted — old firmware still running");
+        return ESP_FAIL;
+    }
+
+    esp_err_t end_err = esp_ota_end(ota);
+    if (end_err != ESP_OK) {
+        httpd_resp_send_err(r, HTTPD_500_INTERNAL_SERVER_ERROR,
+            end_err == ESP_ERR_OTA_VALIDATE_FAILED
+                ? "image validation failed (bad file?) — old firmware still running"
+                : "esp_ota_end failed — old firmware still running");
+        return ESP_FAIL;
+    }
+    if (esp_ota_set_boot_partition(update_part) != ESP_OK) {
+        httpd_resp_send_err(r, HTTPD_500_INTERNAL_SERVER_ERROR,
+            "esp_ota_set_boot_partition failed — old firmware still running");
+        return ESP_FAIL;
+    }
+
+    send_html(r, "<!DOCTYPE html><html><body><h2>Firmware received</h2>"
+                 "<p>Rebooting into the new image in ~10s. If it doesn't come "
+                 "back up, the previous firmware reboots itself back in "
+                 "automatically.</p><a href='/'>Back</a> (once it's up)."
+                 "</body></html>");
+    vTaskDelay(pdMS_TO_TICKS(300));
     dns_sink_reboot();
     return ESP_OK;
 }
@@ -1156,9 +1427,10 @@ static esp_err_t handle_bl_url_clear(httpd_req_t *r)
 bool web_ui_start(DnsSinkServer *dns)
 {
     s_dns = dns;
+    auth_load_nvs();
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.server_port      = 80;
-    cfg.max_uri_handlers = 28;
+    cfg.max_uri_handlers = 32;
     cfg.stack_size       = 16384;
     /* Recycle the least-recently-used connection instead of refusing new ones
      * once max_open_sockets (7) is reached (#61). Without this a client that
@@ -1172,33 +1444,42 @@ bool web_ui_start(DnsSinkServer *dns)
         ESP_LOGE(TAG, "httpd_start failed"); return false;
     }
 
+    /* Every URI routes through auth_wrap with the real handler stashed in
+     * user_ctx (#1) — see auth_wrap's comment for why this beats a per-handler
+     * check. */
+    #define H(fn) auth_wrap, (void *)(raw_handler_t)(fn)
     static const httpd_uri_t uris[] = {
-        { "/",                    HTTP_GET,  handle_status,        nullptr },
-        { "/metrics",             HTTP_GET,  handle_metrics,       nullptr },
-        { "/metrics/reset",       HTTP_POST, handle_metrics_reset, nullptr },
-        { "/reload",              HTTP_POST, handle_reload,        nullptr },
-        { "/check",               HTTP_POST, handle_check,         nullptr },
-        { "/whitelist/add",       HTTP_POST, handle_wl_add,        nullptr },
-        { "/whitelist/remove",    HTTP_POST, handle_wl_remove,     nullptr },
-        { "/blocklist/url/set",   HTTP_POST, handle_bl_url_set,    nullptr },
-        { "/blocklist/url/clear", HTTP_POST, handle_bl_url_clear,  nullptr },
-        { "/rewrite/set",         HTTP_POST, handle_rw_set,        nullptr },
-        { "/rewrite/clear",       HTTP_POST, handle_rw_clear,      nullptr },
-        { "/log",                 HTTP_GET,  handle_log,           nullptr },
-        { "/top",                 HTTP_GET,  handle_top,           nullptr },
-        { "/custom/rules",        HTTP_POST, handle_custom_rules,  nullptr },
-        { "/acl/add",             HTTP_POST, handle_acl_add,       nullptr },
-        { "/acl/remove",          HTTP_POST, handle_acl_remove,    nullptr },
-        { "/acl/clear",           HTTP_POST, handle_acl_clear,     nullptr },
-        { "/dot/set",             HTTP_POST, handle_dot_set,       nullptr },
-        { "/net/upstream",        HTTP_POST, handle_net_upstream,  nullptr },
-        { "/wifi/scan",           HTTP_POST, handle_wifi_scan_start, nullptr },
-        { "/wifi/scan",           HTTP_GET,  handle_wifi_scan_get,   nullptr },
-        { "/wifi/connect",        HTTP_POST, handle_wifi_connect,  nullptr },
-        { "/net/eth/set",         HTTP_POST, handle_net_eth_set,   nullptr },
-        { "/net/wifi/set",        HTTP_POST, handle_net_wifi_set,  nullptr },
-        { "/reboot",              HTTP_POST, handle_reboot,        nullptr },
+        { "/",                    HTTP_GET,  H(handle_status)        },
+        { "/metrics",             HTTP_GET,  H(handle_metrics)       },
+        { "/metrics/reset",       HTTP_POST, H(handle_metrics_reset) },
+        { "/reload",              HTTP_POST, H(handle_reload)        },
+        { "/blocklist/stop",      HTTP_POST, H(handle_bl_stop)       },
+        { "/pause",               HTTP_POST, H(handle_pause)         },
+        { "/check",               HTTP_POST, H(handle_check)         },
+        { "/auth/set",            HTTP_POST, H(handle_auth_set)      },
+        { "/whitelist/add",       HTTP_POST, H(handle_wl_add)        },
+        { "/whitelist/remove",    HTTP_POST, H(handle_wl_remove)     },
+        { "/blocklist/url/set",   HTTP_POST, H(handle_bl_url_set)    },
+        { "/blocklist/url/clear", HTTP_POST, H(handle_bl_url_clear)  },
+        { "/rewrite/set",         HTTP_POST, H(handle_rw_set)        },
+        { "/rewrite/clear",       HTTP_POST, H(handle_rw_clear)      },
+        { "/log",                 HTTP_GET,  H(handle_log)           },
+        { "/top",                 HTTP_GET,  H(handle_top)           },
+        { "/custom/rules",        HTTP_POST, H(handle_custom_rules)  },
+        { "/acl/add",             HTTP_POST, H(handle_acl_add)       },
+        { "/acl/remove",          HTTP_POST, H(handle_acl_remove)    },
+        { "/acl/clear",           HTTP_POST, H(handle_acl_clear)     },
+        { "/dot/set",             HTTP_POST, H(handle_dot_set)       },
+        { "/net/upstream",        HTTP_POST, H(handle_net_upstream)  },
+        { "/wifi/scan",           HTTP_POST, H(handle_wifi_scan_start) },
+        { "/wifi/scan",           HTTP_GET,  H(handle_wifi_scan_get)   },
+        { "/wifi/connect",        HTTP_POST, H(handle_wifi_connect)  },
+        { "/net/eth/set",         HTTP_POST, H(handle_net_eth_set)   },
+        { "/net/wifi/set",        HTTP_POST, H(handle_net_wifi_set)  },
+        { "/reboot",              HTTP_POST, H(handle_reboot)        },
+        { "/ota/update",          HTTP_POST, H(handle_ota_update)    },
     };
+    #undef H
     for (auto &u : uris) httpd_register_uri_handler(s_server, &u);
 
     ESP_LOGI(TAG, "Web UI on port 80");
