@@ -2,11 +2,10 @@
 
 A native ESP-IDF DNS sinkhole for ESP32-S3 + W5500 SPI Ethernet boards — the
 LilyGO T-ETH-Elite and the Waveshare ESP32-S3-ETH (see Hardware for the
-per-board pin maps). It hosts the full OISD "big" wildcard blocklist plus up to four
-extra feeds (hagezi ad tiers and threat-intelligence presets built in — 700k+
-domains total), sinkholes ad, tracker, and malware domains at the network
-layer, and forwards and caches everything else. Pure ESP-IDF 6.0.1, no
-Arduino.
+per-board pin maps). It hosts the full OISD "big" wildcard blocklist plus up to
+four extra feeds (hagezi ad tiers and threat-intelligence presets built in),
+sinkholes ad, tracker, and malware domains at the network layer, and forwards
+and caches everything else. Pure ESP-IDF v6.0.x, no Arduino.
 
 The name is a nod to s60sc/ESP32_AdBlocker, which inspired it. This is a
 ground-up rewrite: hash-based blocklist storage so the whole list fits in PSRAM,
@@ -22,7 +21,7 @@ L2 fast path that answers blocked queries without going through lwIP.
   buffer capacity binds on the union of all sources, not their sum.
 * SD instant boot. The sorted hash table is written to the MicroSD card and
   reloaded in about a second on reboot, instead of a multi-minute HTTPS
-  download. The daily refresh runs in the background with the old list still
+  download. The 4-hourly refresh runs in the background with the old list still
   serving, so there is no blocking gap.
 * L2 fast path. Both blocked queries AND forward-cache hits are answered
   directly in the Ethernet RX hook (esp_eth_update_input_path_info): the reply
@@ -43,18 +42,22 @@ L2 fast path that answers blocked queries without going through lwIP.
   per-category microsecond latency histograms. GET / is a status page with live
   stat boxes and a clock-sync indicator. GET /log shows the recent query log
   (dated, see below); GET /top shows top domains/clients and a per-minute
-  CSS bar graph. POST endpoints cover blocklist reload, domain check, whitelist
-  add/remove, custom rules, DNS rewrites, client ACL, extra blocklist URLs, DoT
-  config, and metrics reset.
+  CSS bar graph. POST endpoints cover blocklist reload and stop-load, pause,
+  domain check, whitelist add/remove, custom rules, DNS rewrites, client ACL,
+  extra blocklist URLs (set/clear/toggle), DoT config, UI auth, network and
+  Wi-Fi configuration, metrics reset, reboot, and firmware upload. Full route
+  and field reference: [`docs/http-api.md`](docs/http-api.md).
 
 ## Feature set
 
 Beyond the core sinkhole, the device is a fairly complete Pi-hole-class
 appliance — these are all live and verified on hardware:
 
-* **mDNS** — reachable at `esp32adblock.local`, no IP needed.
+* **mDNS** — reachable at `esp32adblock.local` (T-ETH-Elite) or
+  `esp32adblock2.local` (Waveshare), no IP needed.
 * **Multiple blocklist sources** — the built-in OISD primary plus up to four
-  extra URL feeds, each NVS-persisted, with one-click presets for the
+  extra URL feeds, each NVS-persisted and each individually enable/disable-able
+  without clearing its URL, with one-click presets for the
   [hagezi](https://github.com/hagezi/dns-blocklists) wildcard lists (ad tiers
   Light through Ultimate, the TIF-medium threat-intelligence tier — a
   deliberately reduced tier of hagezi's TIF feed, not full TIF, which is too
@@ -68,8 +71,12 @@ appliance — these are all live and verified on hardware:
 * **Whitelist** — exempt domains from blocking, NVS-backed.
 * **DNS rewrites** — map a local domain to a fixed IP (local-zone / split-horizon),
   exact + subdomain match, up to 16 rules.
-* **Client ACL** — restrict which client IPs may use the resolver (empty = allow
-  all), enforced before any lookup.
+* **Client ACL** — restrict which client IPs may use the resolver (up to 8
+  entries; empty = allow all), enforced on the socket path before any lookup.
+  Note the L2 fast path does not consult it: on Ethernet, a non-permitted
+  client still gets sinkhole replies and forward-cache hits, and only its cold
+  queries reach the gate. Wi-Fi clients have no L2 hook and are always gated.
+  See [`CONTRIBUTING.md`](CONTRIBUTING.md).
 * **Query log + analytics** — a 512-entry PSRAM ring with real wall-clock
   timestamps (NTP, below), approximate top-N domains and clients, and a 60-bucket
   per-minute history graph rendered as pure CSS (no JavaScript).
@@ -79,8 +86,30 @@ appliance — these are all live and verified on hardware:
 * **DNS-over-TLS upstream (opt-in)** — forward to an encrypted upstream
   (RFC 7858, e.g. 1.1.1.1 / one.one.one.one) with automatic fallback to plain
   UDP on failure.
+* **TCP/53 listener** — a client that retries over TCP after a TC=1 truncation
+  lands on the device instead of an RST. TCP-origin queries forwarded upstream
+  over UDP get a bare EDNS0 OPT RR appended so the upstream returns the full
+  answer rather than a truncated one; truncated upstream replies are never
+  cached.
+* **Serve-stale with background refresh** — an expired allowed entry is
+  replayed immediately (RFC 8767 / "optimistic cache", TTLs clamped to 30 s,
+  stale window capped at 24 h) while a refresh goes upstream, so a repeat
+  visitor never eats the cold path for a name already resolved once.
+  `/metrics` reports `stale_served`.
+* **Single-flight coalescing** — duplicate in-flight queries for the same
+  question share one upstream request (`coalesced`).
+* **Hedged upstream retransmit** — a second copy of a slow query is sent based
+  on the observed p95 (`hedges_sent` / `hedged_completions`).
+* **Forward-cache warm boot** — the cache is snapshotted to SD (first at
+  +2 min, then every 20 min) and restored on reboot, so a power blip doesn't
+  cost the working set.
+* **CNAME-cloaking inspection** — a tracker hiding behind a CNAME to a
+  first-party-looking name is caught by walking every answer RR's owner name
+  and, for CNAMEs, their target, through the same verdict ladder as the query.
 * **Cache-poisoning hardening** — randomized transaction IDs plus question
   (qname + qtype) validation on every upstream reply before it is cached.
+* **USB recovery console** — a serial console over the S3's native
+  USB-Serial-JTAG, for recovering a box whose network config is wrong.
 * **Pause blocking** — a one-click Dashboard toggle (mirroring upstream
   s60sc/ESP32_AdBlocker's "Enable AdBlocker" switch) that allows every query
   through without touching the loaded blocklist, whitelist, custom rules, or
@@ -233,7 +262,10 @@ dead and the rollback watchdog has to revert it.)
 | TF slot (SPI3) | SCLK 7, MISO 5, MOSI 6, CS 4 |
 
 The SD card is optional on both boards: with no card, boot falls back to the
-HTTPS blocklist download every time instead of the ~1 s SD cache reload.
+HTTPS blocklist download every time instead of the ~1 s SD cache reload. The
+Waveshare TF-slot pin map comes from that board's CircuitPython definition and
+has not been tested with a card in place — a wrong pin there just fails the
+mount and takes the download path.
 
 ## Build and flash
 
@@ -241,35 +273,39 @@ The default build (`sdkconfig`, `build/`) targets the **LilyGO T-ETH-Elite**.
 The **Waveshare ESP32-S3-ETH** builds into its own directory with its own
 sdkconfig, so the two builds never fight over the board choice:
 
-```sh
-idf.py -B build-waveshare "-DSDKCONFIG=sdkconfig.waveshare" \
-  "-DSDKCONFIG_DEFAULTS=sdkconfig.defaults;sdkconfig.board.waveshare-s3-eth" build
+```powershell
+idf.py -B build-waveshare "-DSDKCONFIG=sdkconfig.waveshare" "-DSDKCONFIG_DEFAULTS=sdkconfig.defaults;sdkconfig.board.waveshare-s3-eth" build
 idf.py -B build-waveshare -p PORT flash
 ```
 
 (The `-D` values are cached in the build dir after the first configure, so
 later runs only need `-B build-waveshare`.)
 
-Dual OTA partitions
-(`ota_0`/`ota_1`, 1700K each) — a first flash needs all four regions from the
-build's own `flash_args` (never hand-type offsets):
+The partition table is IDF's `two_ota_large` (`CONFIG_PARTITION_TABLE_TWO_OTA_LARGE`):
+`nvs` 24K, `otadata` 8K, `phy_init` 4K, then `ota_0` and `ota_1` at 1700K
+each — comfortable headroom over the current ~1.16 MB image, and well under
+the board's 16 MB flash. There is no `partitions.csv` in this repo.
 
-```sh
-esptool.py --chip esp32s3 -p PORT -b 460800 write-flash \
-  --flash-mode dio --flash-freq 80m --flash-size 16MB \
-  0x0     bootloader.bin \
-  0x8000  partition-table.bin \
-  0xf000  ota_data_initial.bin \
-  0x20000 dns-sink.bin
+`idf.py -p PORT flash` flashes all four regions for you. If you need to drive
+the flasher directly, take the offsets from the build's own `flash_args`
+rather than hand-typing them — for the default build they are:
+
+```powershell
+esptool --chip esp32s3 -p PORT -b 460800 write-flash --flash-mode dio --flash-freq 80m --flash-size 16MB 0x0 build/bootloader/bootloader.bin 0x8000 build/partition_table/partition-table.bin 0xf000 build/ota_data_initial.bin 0x20000 build/dns-sink.bin
 ```
+
+(ESP-IDF v6.0 ships esptool v5: the command is `esptool`, not `esptool.py`,
+and subcommands are hyphenated — `write-flash`.)
 
 After that first flash, updates don't need a toolchain or serial cable at
 all — use the web UI's **Network → Firmware Update** upload (see Feature set
 above); it auto-reverts if the new image doesn't come up cleanly.
 
-Or build from source (ESP-IDF v6.0.x):
+Or build from source. Toolchain: **ESP-IDF v6.0.x**, natively on Windows,
+with the environment sourced from PowerShell — `. $HOME\esp\esp-idf\export.ps1`.
+Git Bash / MSYS is not a supported build shell for this project.
 
-```sh
+```powershell
 idf.py set-target esp32s3
 idf.py build
 idf.py -p PORT flash monitor
@@ -315,7 +351,15 @@ main/
   http_fetch.c     streaming HTTPS line fetcher
   domain.c         shared domain normalization and TLD detection
   murmur3.c        MurmurHash3_x86_32
+  console.c        USB-Serial-JTAG recovery console
   web_ui.cpp       HTTP status UI, JSON metrics, control endpoints
+```
+
+```
+docs/http-api.md              every HTTP route + every /metrics field
+docs/simd-acceleration-notes.md   SIMD/PIE acceleration study (verdict: no)
+CONTRIBUTING.md               architecture constraints before touching the query path
+ISSUES.md                     running, code-grounded record of findings and fixes
 ```
 
 ## Roadmap
@@ -333,5 +377,9 @@ main/
   the L2 bypass, and blocklist storage may shrink on quad (vs octal) PSRAM.
   Tracked in #49.
 * DoH/DoT *server* (serve secure DNS to clients).
-* Per-list enable/disable toggle (#48 — the whole-device "pause blocking"
-  half of this is now done; see Feature set above).
+* Make `acl_permits()` reachable from the L2 fast path, or document the
+  Ethernet-segment bypass as intended — see Client ACL above.
+
+## License
+
+MIT — see [`LICENSE`](LICENSE).

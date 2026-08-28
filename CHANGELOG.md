@@ -42,6 +42,11 @@ ESP32-S3-ETH.
 - **USB recovery console** over native USB-Serial-JTAG.
 - `docs/simd-acceleration-notes.md`: SIMD/PIE acceleration study (verdict: no;
   three bigger wins identified and since implemented).
+- `docs/http-api.md`: complete HTTP route table and `/metrics` field reference,
+  checked against `web_ui.cpp`'s `uris[]` and `dns_server_metrics_json()`.
+- `CONTRIBUTING.md`: the architecture constraints that have actually bitten —
+  the two verdict paths, shared-cache coherence and the generation bump,
+  single-task httpd, and `IRAM_ATTR` placement.
 
 ### Changed
 
