@@ -994,6 +994,35 @@ static int extract_qname(const uint8_t *pkt, int pkt_len,
     return offset + 4;  /* past QTYPE+QCLASS */
 }
 
+/* A TCP-origin query forwarded upstream over plain UDP with no EDNS gets
+ * classic-truncated by the upstream resolver at 512 B (RFC 1035) exactly as
+ * if it were a UDP client — except this client is already ON TCP, so a TC=1
+ * reply is a dead end: nothing left to retry with. Fix: ask upstream for a
+ * real answer by appending a bare EDNS0 OPT RR advertising a payload size
+ * comfortably inside our own rx[1500] receive buffer, so upstream has no
+ * reason to truncate. Only when the query doesn't already carry one — a
+ * conservative arcount==0 check, since EDNS is normally the sole additional
+ * record. Returns the new length, or the original mlen unchanged if there's
+ * no room or the query already looks EDNS-equipped.
+ * dst must have at least mlen + 11 bytes of room. */
+static int append_bare_edns_opt(uint8_t *dst, const uint8_t *q, int mlen, int cap)
+{
+    auto *qh = reinterpret_cast<const DnsHeader *>(q);
+    if (ntohs(qh->arcount) != 0 || mlen + 11 > cap) {
+        memcpy(dst, q, mlen);
+        return mlen;
+    }
+    memcpy(dst, q, mlen);
+    uint8_t *opt = dst + mlen;
+    opt[0] = 0x00;                                   /* root name */
+    opt[1] = 0x00; opt[2] = 0x29;                     /* TYPE = OPT (41) */
+    opt[3] = 0x04; opt[4] = 0x00;                     /* CLASS = UDP payload size 1024 */
+    opt[5] = 0x00; opt[6] = 0x00; opt[7] = 0x00; opt[8] = 0x00; /* TTL: ext-rcode/version/flags = 0 */
+    opt[9] = 0x00; opt[10] = 0x00;                    /* RDLENGTH = 0 */
+    reinterpret_cast<DnsHeader *>(dst)->arcount = htons(1);
+    return mlen + 11;
+}
+
 /* ── Main loop ───────────────────────────────────────────────────── */
 DnsSinkServer::DnsSinkServer() : _exitSem(xSemaphoreCreateBinary()) {}
 
@@ -1176,9 +1205,18 @@ void DnsSinkServer::run_loop()
             reinterpret_cast<DnsHeader *>(pkt)->id = htons(ue->client_txid);
             /* If the receive filled the buffer exactly, the datagram was larger —
              * we silently truncated it. Set TC=1 so the client knows to retry
-             * over TCP, and skip caching this incomplete response (#36). */
-            bool truncated = (plen == (int)sizeof(rx));
-            if (truncated) pkt[2] |= 0x02;  /* TC bit in flags high byte */
+             * over TCP, and skip caching this incomplete response (#36). Also
+             * treat a reply the UPSTREAM resolver already truncated (TC=1,
+             * typically an empty answer section from a no-EDNS forward) the
+             * same way for caching purposes: it's just as incomplete as one we
+             * cut ourselves, and caching it would serve that empty stub to
+             * every later query for the domain — over UDP or TCP, EDNS or not
+             * — until the entry expires. Found forwarding TCP-origin queries
+             * upstream over plain UDP (#66): the stub cached from one client's
+             * no-EDNS query silently poisoned the answer for every other. */
+            bool our_truncation = (plen == (int)sizeof(rx));
+            if (our_truncation) pkt[2] |= 0x02;  /* TC bit in flags high byte */
+            bool truncated = our_truncation || ((pkt[2] & 0x02) != 0);
             if (ue->refresh_only) {
                 /* Stale-refresh (#68): nobody is waiting — just cache below.
                  * Only the upstream RTT is a real latency measurement here. */
@@ -1211,9 +1249,12 @@ void DnsSinkServer::run_loop()
                          * second close would bump gen out from under the NEXT
                          * connection's in-flight entry and strand its answer. */
                         if (s_tcp.fd != -1 && s_tcp.awaiting && w_gen == s_tcp.gen) {
-                            if (truncated)
+                            if (our_truncation)
                                 ESP_LOGW(TAG, "upstream reply exceeded %d B — relayed TC over TCP",
                                          (int)sizeof(rx));
+                            else if (truncated)
+                                ESP_LOGW(TAG, "upstream truncated its own reply (TC=1) — "
+                                              "relayed as-is over TCP, not cached");
                             tcp_send_dns(s_tcp.fd, pkt, plen);
                             tcp_conn_close();
                         }
@@ -1670,9 +1711,18 @@ void DnsSinkServer::run_loop()
                                     qh->id = htons(our_txid);
                                     ue->upstream_us = esp_timer_get_time();
                                     if (!(dot_is_enabled() && dot_enqueue(q, mlen))) {
+                                        /* (#66) forwarding the client's own EDNS-less
+                                         * query gets it classic-truncated at 512 B by
+                                         * the upstream resolver — a dead end, since
+                                         * this client is already on TCP with nowhere
+                                         * left to retry. Ask upstream for a real
+                                         * answer instead. */
+                                        static uint8_t edns_q[TCP_QUERY_MAX + 11];
+                                        int elen = append_bare_edns_opt(edns_q, q, mlen,
+                                                                        sizeof(edns_q));
                                         upstream_addr.sin_addr.s_addr =
                                             _upstream_addr.load(std::memory_order_acquire);
-                                        sendto(usock, q, mlen, 0,
+                                        sendto(usock, edns_q, elen, 0,
                                                (sockaddr *)&upstream_addr, sizeof(upstream_addr));
                                         /* (#69) same DoT gate as the UDP path;
                                          * a TCP-origin flight still goes
