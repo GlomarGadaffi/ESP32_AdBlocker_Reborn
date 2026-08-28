@@ -55,6 +55,14 @@ static _Atomic bool        s_loading = false;
 static _Atomic uint32_t    s_blocklist_gen = 0;
 static _Atomic bool        s_paused  = false;  /* global block/allow-all switch */
 static _Atomic bool        s_stop_requested = false;  /* #1: mirrors upstream's xStop */
+
+/* Any event that changes what a query SHOULD resolve to — a reload, a pause
+ * flip — must call this so cached verdicts from before the change stop
+ * being trusted (#85). */
+static inline void blocklist_generation_bump(void)
+{
+    atomic_fetch_add_explicit(&s_blocklist_gen, 1, memory_order_release);
+}
 static _Atomic uint32_t    s_dropped = 0;   /* entries lost to capacity on last reload */
 /* Extra feeds that hard-failed (404 / timeout / mid-stream death) on the last
  * reload that actually published a list. Non-zero means the live list is
@@ -674,7 +682,7 @@ uint32_t blocklist_load(void)
     atomic_store_explicit(&s_count, unique, memory_order_relaxed);
     s_active_buf = new_buf;
     atomic_store_explicit(&s_live, s_buf[new_buf], memory_order_release);
-    atomic_fetch_add_explicit(&s_blocklist_gen, 1, memory_order_release);  /* (#85) */
+    blocklist_generation_bump();  /* (#85) */
 
     ESP_LOGI(TAG, "Blocklist live: %" PRIu32 " domains", unique);
     atomic_store(&s_loading, false);
@@ -761,6 +769,17 @@ uint32_t IRAM_ATTR blocklist_generation(void)
 void blocklist_set_paused(bool paused)
 {
     atomic_store_explicit(&s_paused, paused, memory_order_relaxed);
+    /* A query answered ALLOW while paused gets cached with a real TTL like
+     * any other forward. Without this, that entry outlives the pause: once
+     * resumed, it keeps serving ALLOW to every client (not just whoever
+     * queried during the pause) until the TTL expires — the same
+     * shared-cache-vs-transient-state hazard #85 fixed for blocklist
+     * reloads, just triggered by a pause flip instead. Bumping on both
+     * directions (not just resume) is the simpler-to-reason-about choice:
+     * "the classification rules changed" covers pausing too, at the cost
+     * of one avoidable-but-harmless extra re-check for a handful of
+     * queries right after pausing. */
+    blocklist_generation_bump();
     nvs_handle_t h;
     if (nvs_open(NVS_NS, NVS_READWRITE, &h) == ESP_OK) {
         nvs_set_u8(h, "paused", paused ? 1 : 0);
