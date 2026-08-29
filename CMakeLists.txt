@@ -9,6 +9,9 @@ include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 # manifest.json. PROJECT_VER has to be set before project(), i.e. before
 # Kconfig is processed, so the board is read straight from the sdkconfig
 # file (the one -DSDKCONFIG= names, else ./sdkconfig).
+# Re-run configure when version.txt changes, else a bump only lands after a
+# manual `idf.py reconfigure` (the 1.2.1 images were tagged 1.2.0 that way).
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_CURRENT_LIST_DIR}/version.txt")
 file(STRINGS "${CMAKE_CURRENT_LIST_DIR}/version.txt" ADBLOCK_BASE_VER LIMIT_COUNT 1)
 string(STRIP "${ADBLOCK_BASE_VER}" ADBLOCK_BASE_VER)
 set(ADBLOCK_BOARD_TAG "t-eth-elite")
