@@ -121,6 +121,24 @@ function Read-FlashArgs {
     return [pscustomobject]@{ Settings = $settings; Parts = $parts }
 }
 
+# ── Secrets guard ─────────────────────────────────────────────────────────
+# CONFIG_ADBLOCK_WIFI_SSID/PASSWORD are compiled into the image as the
+# first-boot NVS seed. A developer's own sdkconfig usually carries real
+# credentials, and the 1.2.0 LilyGo release shipped with the author's home
+# Wi-Fi password inside the .bin. Refuse to package if either build's
+# sdkconfig has a non-empty value, and grep every app image for the values
+# regardless, so a stale build can't sneak through either.
+$secretPatterns = @()
+foreach ($cfg in @("$RepoRoot\sdkconfig", "$RepoRoot\sdkconfig.waveshare")) {
+    if (-not (Test-Path $cfg)) { continue }
+    foreach ($line in Get-Content $cfg) {
+        if ($line -match '^CONFIG_ADBLOCK_WIFI_(SSID|PASSWORD)="(.+)"$') {
+            throw "$cfg has $($Matches[1]) set to a non-empty value. Blank it (CONFIG_ADBLOCK_WIFI_SSID=`"`" / _PASSWORD=`"`"), rebuild, then package. The boards keep their Wi-Fi in NVS."
+        }
+        if ($line -match '^CONFIG_ADBLOCK_WIFI_PASSWORD="(.+)"' -and $Matches[1].Length -gt 0) { $secretPatterns += $Matches[1] }
+    }
+}
+
 Write-Host "Packaging release $Version" -ForegroundColor Cyan
 Write-Host "  repo:   $RepoRoot"
 Write-Host "  output: $OutDir"

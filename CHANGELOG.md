@@ -13,6 +13,10 @@ firmware's `esp_app_desc` version string comes from `version.txt`.
   DoT is on. Enabling DoT used to make every router-assigned hostname
   NXDOMAIN. Upstream DNS tab → Local zones; `POST /dot/zones`.
 - **Static hosts table**: the rewrite table accepts bare hostnames and holds
+- `tools/make-release.ps1` refuses to package while either sdkconfig carries a
+  non-empty `CONFIG_ADBLOCK_WIFI_SSID/PASSWORD`, and greps the images for the
+  values: the first v1.2.0/v1.2.1 T-ETH-Elite app images were built from a
+  developer sdkconfig and shipped a Wi-Fi seed — pulled and republished clean.
   48 entries (was 16); relabelled "Local hosts & DNS rewrites".
 
 ### Fixed
