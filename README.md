@@ -69,8 +69,13 @@ appliance — these are all live and verified on hardware:
 * **Custom block rules** — an inline textarea (hosts format or bare domains,
   `#` comments), wildcard-style suffix matching, NVS-backed.
 * **Whitelist** — exempt domains from blocking, NVS-backed.
-* **DNS rewrites** — map a local domain to a fixed IP (local-zone / split-horizon),
-  exact + subdomain match, up to 16 rules.
+* **Static hosts / DNS rewrites** — map a bare hostname (`printer`) or a domain
+  (`nas.lan`, subdomains included) to a fixed IPv4, up to 48 entries, NVS-backed.
+* **Local zones (split-horizon)** — names in configurable suffixes (default
+  `lan, local, home, home.arpa, internal, localdomain, intranet`) and any
+  single-label name are forwarded to the router in plain DNS even when DoT is
+  on, so the router's DHCP hostnames keep resolving while everything else
+  goes to the encrypted upstream.
 * **Client ACL** — restrict which client IPs may use the resolver (up to 8
   entries; empty = allow all), enforced on the socket path before any lookup.
   Note the L2 fast path does not consult it: on Ethernet, a non-permitted

@@ -13,8 +13,9 @@ separate 2-socket listener that only 301s to `https://`). Every route
    exists.
 3. Security headers on every response: `Cache-Control: no-store`,
    `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`,
-   `Referrer-Policy: no-referrer`, HSTS, and a CSP that allows only inline
-   script/style and same-origin fetch/form targets.
+   `Referrer-Policy: same-origin`, and a CSP that allows only inline
+   script/style and same-origin fetch/form targets. No HSTS (a self-signed
+   cert plus HSTS would turn `cert-reset` into a year-long browser lockout).
 
 CSRF is *not* in `auth_wrap`: each mutating handler calls `csrf_ok()` itself.
 It requires **both** a same-origin `Origin`/`Referer` (when present) **and**
@@ -22,7 +23,8 @@ the session's CSRF token — `?csrf=<token>` in the query string (the page's JS
 appends it to every form action on submit) or an `X-CSRF: <token>` header
 (the page wraps `fetch()` to add it). The token is in the page as
 `var CSRF='…'`. `/setup` and `/login` POSTs run before a session exists, so
-they check Origin only. All mutating routes are covered — `/net/eth/set` and
+they check Origin only (case-insensitive, port ignored; `Origin: null` falls
+back to Referer). All mutating routes are covered — `/net/eth/set` and
 `/net/wifi/set` inherit the check from the shared `handle_net_static_set()`
 helper rather than calling it directly, so a naive per-handler grep
 undercounts. If you add a POST handler, add the `csrf_ok()` call.
@@ -57,7 +59,7 @@ metrics fields from `dns_server_metrics_json()` in `dns_server.cpp`.
 | POST | `/blocklist/url/set` | Set one of the 4 extra feed URL slots. `https://` only (#90). |
 | POST | `/blocklist/url/clear` | Clear one extra feed slot. |
 | POST | `/blocklist/url/toggle` | Enable/disable one extra feed without clearing its URL. |
-| POST | `/rewrite/set` | Add a DNS rewrite rule (domain → fixed IP). |
+| POST | `/rewrite/set` | Add a static host / rewrite (bare hostname or domain → fixed IPv4; a domain also matches its subdomains; up to 48). |
 | POST | `/rewrite/clear` | Clear the rewrite table. |
 | GET | `/log` | Recent query log (512-entry ring, wall-clock timestamps). |
 | GET | `/top` | Top domains/clients plus the 60-bucket per-minute CSS bar graph. |
@@ -65,6 +67,7 @@ metrics fields from `dns_server_metrics_json()` in `dns_server.cpp`.
 | POST | `/acl/add` | Add a client IP to the ACL. |
 | POST | `/acl/remove` | Remove one ACL entry. |
 | POST | `/acl/clear` | Empty the ACL (empty = allow all). |
+| POST | `/dot/zones` | Save the comma-separated local-zone suffixes (names forwarded to the router in plain DNS, never over DoT; single-label names always are). |
 | POST | `/dot/set` | Configure the DNS-over-TLS upstream (server + SNI), or turn it off. |
 | POST | `/net/upstream` | Choose which interface egresses upstream queries. Applied live. |
 | POST | `/wifi/scan` | Start a Wi-Fi scan on a worker task. |

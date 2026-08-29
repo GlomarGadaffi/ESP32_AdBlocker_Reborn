@@ -3,6 +3,24 @@
 All notable changes to ESP32_AdBlocker_Reborn. Versions follow SemVer; the
 firmware's `esp_app_desc` version string comes from `version.txt`.
 
+## [1.2.1] — 2026-08-28
+
+### Added
+
+- **Local zones (split-horizon for DoT)**: names in configurable suffixes
+  (default `lan, local, home, home.arpa, internal, localdomain, intranet`) and
+  any single-label name are forwarded to the router in plain DNS even when
+  DoT is on. Enabling DoT used to make every router-assigned hostname
+  NXDOMAIN. Upstream DNS tab → Local zones; `POST /dot/zones`.
+- **Static hosts table**: the rewrite table accepts bare hostnames and holds
+  48 entries (was 16); relabelled "Local hosts & DNS rewrites".
+
+### Fixed
+
+- Pre-session Origin check (login/setup) is case-insensitive, ignores an
+  explicit port, and falls back to Referer on `Origin: null`; Referrer-Policy
+  is `same-origin`. A browser login could fail with a bare "CSRF".
+
 ## [1.2.0] — 2026-08-28
 
 ### Security

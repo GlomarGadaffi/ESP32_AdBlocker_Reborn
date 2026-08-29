@@ -7,6 +7,7 @@
 #include "rewrite.h"
 #include "acl.h"
 #include "dot.h"
+#include "localzone.h"
 #include "query_log.h"
 #include "esp_http_server.h"
 #include "esp_https_server.h"
@@ -701,13 +702,16 @@ static esp_err_t handle_status(httpd_req_t *r)
     {
         uint32_t rw_n = rewrite_count();
         page_appendf(page, sizeof(page), &n,
-            "<h3>DNS Rewrites</h3>"
+            "<h3>Local hosts &amp; DNS rewrites</h3>"
+            "<p><small>Static name → IP. A bare hostname (<code>printer</code>) or a "
+            "domain (<code>nas.lan</code>); a domain also covers its subdomains. "
+            "Answered locally for A queries, never forwarded. Up to %d.</small></p>"
             "<form method=post action=/rewrite/set>"
-            "<input name=domain placeholder='domain.local' size=24>"
+            "<input name=domain placeholder='printer or nas.lan' size=24>"
             " → <input name=ip placeholder='192.168.1.x' size=16>"
-            "<button>Add rewrite</button></form>");
+            "<button>Add</button></form>", REWRITE_MAX);
         if (rw_n > 0) {
-            char rw_domains[REWRITE_MAX][64]; uint32_t rw_ips[REWRITE_MAX]; uint32_t rw_cnt = REWRITE_MAX;
+            static EXT_RAM_BSS_ATTR char rw_domains[REWRITE_MAX][64]; static EXT_RAM_BSS_ATTR uint32_t rw_ips[REWRITE_MAX]; uint32_t rw_cnt = REWRITE_MAX;
             rewrite_list(rw_domains, rw_ips, &rw_cnt);
             page_appendf(page, sizeof(page), &n, "<table><tr><th>Domain</th><th>IP</th><th>Action</th></tr>");
             for (uint32_t i = 0; i < rw_cnt && n < (int)sizeof(page) - 256; i++) {
@@ -1070,6 +1074,21 @@ static esp_err_t handle_status(httpd_req_t *r)
             "<small>Default: 1.1.1.1 / one.one.one.one &nbsp; or &nbsp; 9.9.9.9 / dns.quad9.net</small><br>"
             "<button>Save &amp; apply (restart DNS task)</button></form>",
             dot_en ? " checked" : "", dot_srv, dot_sni);
+
+        /* Split-horizon zones: names the router answers, never sent over DoT. */
+        char zones[LOCALZONE_LIST_CAP]; localzone_get(zones, sizeof(zones));
+        char safe_zones[LOCALZONE_LIST_CAP * 2]; html_escape(safe_zones, sizeof(safe_zones), zones);
+        page_appendf(page, sizeof(page), &n,
+            "<h3>Local zones</h3>"
+            "<p><small>Names in these zones &mdash; and any name with no dot at all &mdash; are "
+            "resolved through your router in plain DNS even when DoT is on, because "
+            "a public resolver has never heard of <code>nas.lan</code>. Comma-separated "
+            "suffixes.</small></p>"
+            "<form method=post action=/dot/zones>"
+            "<input name=zones value=\"%s\" size=52 maxlength=%d> "
+            "<button>Save</button></form>"
+            "<p><small>Default: <code>%s</code></small></p>",
+            safe_zones, LOCALZONE_LIST_CAP - 1, localzone_default());
     }
     page_appendf(page, sizeof(page), &n, "</div>");
 
@@ -1272,6 +1291,20 @@ static esp_err_t handle_dot_set(httpd_req_t *r)
     if (pn) { pn += 4; size_t l=0; char raw[64]={0}; for(;pn[l]&&pn[l]!='&'&&pn[l]!='\r'&&l<63;l++) raw[l]=pn[l]; url_decode(sni,sizeof(sni),raw,l); }
     dot_set(enabled, server, sni);
     httpd_resp_set_status(r, "303 See Other"); httpd_resp_set_hdr(r, "Location", "/"); httpd_resp_send(r,nullptr,0); return ESP_OK;
+}
+
+/* ── POST /dot/zones — local zones forwarded to the router, never DoT ── */
+static esp_err_t handle_dot_zones(httpd_req_t *r)
+{
+    if (!csrf_ok(r)) { httpd_resp_send_err(r, HTTPD_403_FORBIDDEN, "CSRF"); return ESP_FAIL; }
+    char body[LOCALZONE_LIST_CAP * 3 + 16] = {}; httpd_req_recv(r, body, sizeof(body) - 1);
+    char zones[LOCALZONE_LIST_CAP]; form_field(body, "zones", zones, sizeof(zones));
+    if (!localzone_set(zones)) {
+        httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST, "Up to 16 suffixes, letters/digits/dots, comma-separated");
+        return ESP_FAIL;
+    }
+    redirect_to(r, "/#upstream");
+    return ESP_OK;
 }
 
 /* ── POST /net/upstream — choose eth/wifi as upstream egress (#53) ── */
@@ -1894,6 +1927,7 @@ bool web_ui_start(DnsSinkServer *dns)
         { "/acl/remove",          HTTP_POST, H(handle_acl_remove)    },
         { "/acl/clear",           HTTP_POST, H(handle_acl_clear)     },
         { "/dot/set",             HTTP_POST, H(handle_dot_set)       },
+        { "/dot/zones",           HTTP_POST, H(handle_dot_zones)     },
         { "/net/upstream",        HTTP_POST, H(handle_net_upstream)  },
         { "/wifi/scan",           HTTP_POST, H(handle_wifi_scan_start) },
         { "/wifi/scan",           HTTP_GET,  H(handle_wifi_scan_get)   },

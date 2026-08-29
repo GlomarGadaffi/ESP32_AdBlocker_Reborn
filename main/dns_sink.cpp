@@ -46,6 +46,7 @@
 #include "rewrite.h"
 #include "acl.h"
 #include "dot.h"
+#include "localzone.h"
 #include "query_log.h"
 #include "timesync.h"
 #include "dns_server.h"
@@ -1369,6 +1370,7 @@ extern "C" void app_main(void)
         halt_or_rollback("PSRAM blocklist init failed");
     }
     rewrite_init();
+    localzone_init_nvs();
     dot_init_nvs();
     acl_init();
     query_log_init();

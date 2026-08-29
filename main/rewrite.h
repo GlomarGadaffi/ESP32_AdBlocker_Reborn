@@ -8,8 +8,9 @@ extern "C" {
 
 /* Local DNS rewrite table — maps domain names to IPv4 addresses (#12).
  * Stored in NVS; checked before upstream forwarding.
- * Matches exact name and all subdomains (*.domain). */
-#define REWRITE_MAX 16
+ * Matches exact name and all subdomains (*.domain). Single-label names
+ * ("printer", "glolab") are fine: this doubles as the static hosts table. */
+#define REWRITE_MAX 48
 
 bool     rewrite_init(void);
 

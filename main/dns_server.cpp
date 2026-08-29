@@ -4,6 +4,7 @@
 #include "rewrite.h"
 #include "acl.h"
 #include "dot.h"
+#include "localzone.h"
 #include "query_log.h"
 #include "timesync.h"
 #include "esp_log.h"
@@ -1631,7 +1632,8 @@ void DnsSinkServer::run_loop()
                                  * target, so nobody can ride its envelope. */
                                 hdr->id = htons(our_txid);
                                 ue->upstream_us = esp_timer_get_time();
-                                if (!(dot_is_enabled() && dot_enqueue(rx, rlen))) {
+                                if (!(dot_is_enabled() && !localzone_match(name, nlen) &&
+                                      dot_enqueue(rx, rlen))) {
                                     upstream_addr.sin_addr.s_addr =
                                         _upstream_addr.load(std::memory_order_acquire);
                                     sendto(usock, rx, rlen, 0,
@@ -1720,7 +1722,11 @@ void DnsSinkServer::run_loop()
                      * so an in-flight query batch can straddle a set_upstream() */
                     hdr->id = htons(our_txid);
                     ue->upstream_us = esp_timer_get_time();
-                    if (!(dot_is_enabled() && dot_enqueue(rx, rlen))) {
+                    /* Local-zone names (split-horizon) skip DoT: the router is
+                     * the only resolver that knows them. Plain UDP to the
+                     * configured upstream, hedged like any UDP flight. */
+                    bool use_dot = dot_is_enabled() && !localzone_match(name, nlen);
+                    if (!(use_dot && dot_enqueue(rx, rlen))) {
                         upstream_addr.sin_addr.s_addr = _upstream_addr.load(std::memory_order_acquire);
                         sendto(usock, rx, rlen, 0,
                                (sockaddr *)&upstream_addr, sizeof(upstream_addr));
@@ -1730,7 +1736,7 @@ void DnsSinkServer::run_loop()
                          * a system already under DoT pressure, where adding
                          * retransmits is the wrong reflex, and skipping keeps
                          * the no-plaintext-hedge-under-DoT proof one line. */
-                        if (!dot_is_enabled())
+                        if (!use_dot)
                             hedge_stash(ue, rx, rlen, (uint32_t)now_ms);
                     }
                     s_cnt_forwarded++;
@@ -1865,7 +1871,8 @@ void DnsSinkServer::run_loop()
                                     ue->tcp_gen  = s_tcp.gen;
                                     qh->id = htons(our_txid);
                                     ue->upstream_us = esp_timer_get_time();
-                                    if (!(dot_is_enabled() && dot_enqueue(q, mlen))) {
+                                    bool use_dot = dot_is_enabled() && !localzone_match(name, nlen);
+                                    if (!(use_dot && dot_enqueue(q, mlen))) {
                                         /* (#66) forwarding the client's own EDNS-less
                                          * query gets it classic-truncated at 512 B by
                                          * the upstream resolver — a dead end, since
@@ -1894,7 +1901,7 @@ void DnsSinkServer::run_loop()
                                          * is 768, +11 for the OPT) — hedge_stash
                                          * then leaves the flight un-hedged,
                                          * same graceful no-op as before. */
-                                        if (!dot_is_enabled())
+                                        if (!use_dot)
                                             hedge_stash(ue, edns_q, elen, (uint32_t)now_ms);
                                     }
                                     s_cnt_forwarded++;
