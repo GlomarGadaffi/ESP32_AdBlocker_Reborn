@@ -3,6 +3,31 @@
 All notable changes to ESP32_AdBlocker_Reborn. Versions follow SemVer; the
 firmware's `esp_app_desc` version string comes from `version.txt`.
 
+## [1.2.2] — 2026-08-28
+
+Three fixes from the post-1.2.1 review pass (21 findings filed as #91–#111;
+the rest are tracked, not blocking).
+
+### Fixed
+
+- **Whitelisting a domain no longer sinkholes it** (#99). Whitelist add/remove
+  held the whitelist mutex across the NVS flash write, and both verdict paths
+  treated a busy mutex as "not whitelisted" (= block) — so for the duration of
+  every whitelist edit a whitelisted-but-blocklisted name answered 0.0.0.0, and
+  the socket path cached that for 10 s. NVS writes now happen outside the lock;
+  the L2 hook treats a busy mutex as "can't decide" and hands the frame to
+  lwIP; the custom-rules check no longer takes the mutex when there are no
+  rules (the main source of contention).
+- **Setup wizard fails closed on an unidentifiable POST** (#96). `/setup` and
+  `/login` refuse requests with neither a usable `Origin` nor a `Referer` —
+  the exact shape of a cross-site auto-submitting form under
+  referrer-policy no-referrer, which could otherwise have claimed the admin
+  account during the setup window.
+- **Ethernet transmit serialized** (#101). `CONFIG_ETH_TRANSMIT_MUTEX=y`: the
+  L2 fast path and lwIP both transmit through the W5500, whose send sequence
+  isn't atomic. The hook now checks `esp_eth_transmit()` and `/metrics` reports
+  `l2_tx_fail`.
+
 ## [1.2.1] — 2026-08-28
 
 ### Added

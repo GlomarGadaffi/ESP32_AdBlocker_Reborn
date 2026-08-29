@@ -124,9 +124,7 @@ static bool origin_host_matches(const char *url, const char *host)
 /* Pre-session POSTs (/setup, /login) have no CSRF token yet, so they lean on
  * Origin. A browser that sends "Origin: null" (some do on POST under a strict
  * referrer policy, or from a privacy mode) gets judged on Referer instead;
- * with neither present the request is allowed, as SameSite can't help before
- * a cookie exists and the only thing these two routes do is *prove* a
- * password. */
+ * with neither present the request is refused (#96). */
 static bool presession_origin_ok(httpd_req_t *r)
 {
     char host[64] = {}, origin[128] = {}, referer[128] = {};
@@ -135,7 +133,12 @@ static bool presession_origin_ok(httpd_req_t *r)
     httpd_req_get_hdr_value_str(r, "Referer", referer, sizeof(referer));
     if (origin[0] && strcmp(origin, "null") != 0) return origin_host_matches(origin, host);
     if (referer[0]) return origin_host_matches(referer, host);
-    return true;
+    /* (#96) Neither identifies the device -> refuse. /setup creates the admin
+     * account, and a cross-site auto-submitting form under referrer-policy
+     * no-referrer arrives exactly as "Origin: null" + no Referer. Our own
+     * pages send Referer (Referrer-Policy: same-origin), so a legitimate
+     * same-origin form always passes one of the two checks above. */
+    return false;
 }
 
 /* ── Session cookie ────────────────────────────────────────────────

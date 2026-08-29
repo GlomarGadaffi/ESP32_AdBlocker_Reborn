@@ -142,9 +142,12 @@ bool blocklist_custom_is_blocked(const char *domain, size_t len)
     /* Bounded take: if the writer is mid-rewrite, treat as no-match and forward
      * (fail-open) rather than stall the dns_task hot path. Same contract as
      * blocklist_whitelist_contains (C1). */
+    /* (#99) No rules -> no lock: this ran on every uncached query and was the
+     * main source of contention against the L2 hook's zero-wait take. */
+    if (s_custom_count == 0) return false;
     if (xSemaphoreTake(s_wl_mutex, pdMS_TO_TICKS(2)) != pdTRUE) return false;
     bool blocked = false;
-    if (s_custom_count != 0) {
+    {
         const char *name = domain;
         while (name < domain + len) {
             size_t rlen = (size_t)((domain + len) - name);
@@ -799,6 +802,11 @@ void blocklist_set_paused(bool paused)
     ESP_LOGW(TAG, "Ad blocking %s", paused ? "PAUSED (all queries allowed)" : "resumed");
 }
 
+/* (#99) The NVS write happens AFTER the mutex is released. Holding it across
+ * a flash commit (5-100 ms) made every whitelist edit a window in which both
+ * verdict paths failed their bounded take and sinkholed whitelisted names —
+ * the socket path even cached that wrong BLOCK for 10 s. Same invariant as
+ * rewrite.c and blocklist_custom_set: NVS commits always outside the lock. */
 bool blocklist_whitelist_add(const char *domain)
 {
     if (strlen(domain) >= sizeof(s_whitelist[0])) return false;  /* #41: reject oversized */
@@ -807,10 +815,10 @@ bool blocklist_whitelist_add(const char *domain)
     if (s_wl_count < WHITELIST_MAX) {
         snprintf(s_whitelist[s_wl_count], sizeof(s_whitelist[0]), "%s", domain);
         s_wl_count++;
-        wl_save_nvs();
         ok = true;
     }
     xSemaphoreGive(s_wl_mutex);
+    if (ok) wl_save_nvs();
     return ok;
 }
 
@@ -823,12 +831,12 @@ bool blocklist_whitelist_remove(const char *domain)
             memmove(s_whitelist[i], s_whitelist[i + 1],
                     (s_wl_count - i - 1) * sizeof(s_whitelist[0]));
             s_wl_count--;
-            wl_save_nvs();
             found = true;
             break;
         }
     }
     xSemaphoreGive(s_wl_mutex);
+    if (found) wl_save_nvs();
     return found;
 }
 
@@ -858,8 +866,13 @@ bool blocklist_whitelist_contains(const char *domain, size_t len)
  * all Ethernet while a whitelist NVS commit is in progress (#37). */
 bool blocklist_whitelist_contains_nb(const char *domain, size_t len)
 {
+    /* (#99) Busy -> report "whitelisted". That makes is_blocked_impl say
+     * "not blocked", so the L2 hook doesn't answer and hands the frame to
+     * lwIP, where the socket path re-decides with its bounded wait. The old
+     * `return false` meant "not whitelisted" = BLOCK, i.e. the exact opposite
+     * of the allow-through this comment always claimed. */
     if (xSemaphoreTake(s_wl_mutex, 0) != pdTRUE)
-        return false;  /* mutex busy — allow-through to avoid stalling eth RX */
+        return true;
     bool found = wl_contains_locked(domain, len);
     xSemaphoreGive(s_wl_mutex);
     return found;

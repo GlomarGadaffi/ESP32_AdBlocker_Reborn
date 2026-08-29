@@ -213,11 +213,13 @@ Notes on the ceiling, for anyone optimizing further. The blocklist lookup is
 limit, not the CPU. A leak gate over ~60k mixed queries shows the internal heap
 flat — no leak or double-free in the L2 path, and a 26k-query soak with
 concurrent cache writes confirmed the cache seqlock never yields a torn read.
-The SPI clock stays at 40 MHz (80 MHz fails the W5500 reset — the chip is on
-GPIO-matrix pins, not the IO_MUX pins the SD card uses; 60 MHz gives no speedup,
-the cost is per-transaction overhead). Flash stays DIO@80MHz: the module's 8 MB
-octal (OPI) PSRAM contends with QIO flash on the S3 MSPI controller, so QIO
-isn't usable here.
+The **W5500 SPI clock** stays at 40 MHz (80 MHz fails the W5500 reset — the
+chip is on GPIO-matrix pins, not the IO_MUX pins the SD card uses; 60 MHz gives
+no speedup, the cost is per-transaction overhead). That is a different bus from
+the **PSRAM**, which runs octal at 80 MHz (raised from the 40 MHz in LilyGO's
+example config; measured stable on both boards). Flash stays DIO@80MHz: the
+module's 8 MB octal (OPI) PSRAM contends with QIO flash on the S3 MSPI
+controller, so QIO isn't usable here.
 
 For comparison, ~1.8 ms typical is about 2.5x dnsmasq's ~0.7 ms — and that gap
 is the Ethernet-over-SPI hardware (the ~405 us/frame SPI floor, two frames per
@@ -303,7 +305,7 @@ The quickest way onto a board, and the one that needs no toolchain at all:
 
 Plug the board into USB, click **Connect**, pick the port. The page reads the
 board's flash to work out which of the two supported boards it is (the firmware
-tags its version string with the board, e.g. `1.1.0+waveshare-s3-eth`) and pulls
+tags its version string with the board, e.g. `1.2.2+waveshare-s3-eth`) and pulls
 the matching images from the latest release. You can override the detection, and
 if the chip is blank or running something else you just pick the board from a
 list.
@@ -382,7 +384,7 @@ feeds the browser flasher, which always reads whichever release is *latest*:
 
 ```powershell
 .\tools\make-release.ps1
-gh release create v1.2.0 (Get-ChildItem release\* | ForEach-Object FullName) --title "v1.2.0" --generate-notes
+gh release create vX.Y.Z (Get-ChildItem release\* | ForEach-Object FullName) --title "vX.Y.Z" --notes-file <notes>
 ```
 
 `make-release.ps1` reads the version from `version.txt`, copies the four images

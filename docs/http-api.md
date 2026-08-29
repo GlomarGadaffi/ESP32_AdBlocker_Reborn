@@ -98,6 +98,7 @@ A single JSON object. Field names are exactly as emitted.
 | `tcp_queries` | int | Queries that arrived on the TCP/53 listener. |
 | `l2_blocked` | int | Blocked replies sent straight from the Ethernet RX hook. |
 | `l2_cached` | int | Forward-cache hits sent straight from the Ethernet RX hook. |
+| `l2_tx_fail` | int | Fast-path replies `esp_eth_transmit()` refused (#101). |
 | `cache_probes` | int | Forward-cache lookups. |
 | `cache_hits` | int | Forward-cache hits. |
 | `cache_hit_rate` | float | `cache_hits / cache_probes` as a percentage, one decimal. |

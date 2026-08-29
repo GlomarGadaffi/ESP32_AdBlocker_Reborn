@@ -1938,6 +1938,7 @@ uint64_t DnsSinkServer::queries_blocked() const { return s_cnt_blocked; }
 
 extern "C" uint32_t dns_sink_l2_blocked(void);  /* L2 fast-path counters (dns_sink.cpp) */
 extern "C" uint32_t dns_sink_l2_cached(void);
+extern "C" uint32_t dns_sink_l2_tx_fail(void);
 
 static void do_metrics_reset(void)
 {
@@ -2000,7 +2001,7 @@ int dns_server_metrics_json(char *out, size_t cap)
         "\"uptime_s\":%lld,"
         "\"queries_total\":%" PRIu32 ",\"blocked\":%" PRIu32 ",\"forwarded\":%" PRIu32 ","
         "\"tcp_queries\":%" PRIu32 ","
-        "\"l2_blocked\":%" PRIu32 ",\"l2_cached\":%" PRIu32 ","
+        "\"l2_blocked\":%" PRIu32 ",\"l2_cached\":%" PRIu32 ",\"l2_tx_fail\":%" PRIu32 ","
         "\"cache_probes\":%" PRIu32 ",\"cache_hits\":%" PRIu32 ",\"cache_hit_rate\":%.1f,"
         "\"cache_evictions\":%" PRIu32 ",\"cache_too_big\":%" PRIu32 ","
         "\"stale_served\":%" PRIu32 ","
@@ -2019,7 +2020,7 @@ int dns_server_metrics_json(char *out, size_t cap)
         (long long)(esp_timer_get_time() / 1000000),
         s_cnt_total, s_cnt_blocked, s_cnt_forwarded,
         s_cnt_tcp,
-        dns_sink_l2_blocked(), dns_sink_l2_cached(),
+        dns_sink_l2_blocked(), dns_sink_l2_cached(), dns_sink_l2_tx_fail(),
         probes, hits, hitrate,
         s_cnt_cache_evict, s_cnt_cache_toobig,
         s_cnt_stale,

@@ -1,5 +1,10 @@
 # SIMD / PIE acceleration study — ESP32-S3 DNS sinkhole
 
+> **Historical note (2026-08):** this study was done with the PSRAM at 40 MHz
+> (`CONFIG_SPIRAM_SPEED_40M`). The shipped config has run octal PSRAM at
+> **80 MHz** since commit a8b2d4c; the bus-bound conclusions below scale
+> accordingly but the verdict (no SIMD) stands.
+
 **Question asked:** can the S3's vector unit (Xtensa LX7 Processor Instruction
 Extensions, the `ee.*` 128-bit SIMD ops that esp-dsp uses, marketed as the "AI
 accelerator") plus hand assembly meaningfully speed up the DNS data path —

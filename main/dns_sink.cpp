@@ -1087,6 +1087,8 @@ static void download_task(void *)
  * cache, allowed queries). Runs single-threaded in the eth RX task. */
 static uint32_t s_l2_blocked = 0;   /* L2-handled blocked queries (bypassed lwIP) */
 static uint32_t s_l2_cached  = 0;   /* L2-handled forward-cache hits (bypassed lwIP) */
+static uint32_t s_l2_tx_fail = 0;   /* esp_eth_transmit() refused a fast-path reply (#101) */
+extern "C" uint32_t dns_sink_l2_tx_fail(void) { return s_l2_tx_fail; }
 extern "C" uint32_t dns_sink_l2_blocked(void) { return s_l2_blocked; }
 extern "C" uint32_t dns_sink_l2_cached(void)  { return s_l2_cached; }
 
@@ -1164,7 +1166,7 @@ static esp_err_t IRAM_ATTR l2_input_cb(esp_eth_handle_t h, uint8_t *buf, uint32_
             for (int i=0;i<ihl;i+=2) csum += (tx[14+i]<<8)|tx[14+i+1];
             while (csum>>16) csum=(csum&0xFFFF)+(csum>>16);
             uint16_t cks=~csum; tx[14+10]=(cks>>8); tx[14+11]=(cks&0xFF);
-            esp_eth_transmit(h, tx, dns + clen);
+            if (esp_eth_transmit(h, tx, dns + clen) != ESP_OK) s_l2_tx_fail++;
             s_l2_cached++;
             free(buf);                                    /* consumed (== eth_l2_free) */
             return ESP_OK;
@@ -1204,7 +1206,7 @@ static esp_err_t IRAM_ATTR l2_input_cb(esp_eth_handle_t h, uint8_t *buf, uint32_
         uint16_t csum=~sum;
         tx[14+10]=(csum>>8); tx[14+11]=(csum&0xFF);
 
-        esp_eth_transmit(h, tx, frame);
+        if (esp_eth_transmit(h, tx, frame) != ESP_OK) s_l2_tx_fail++;
         s_l2_blocked++;
         free(buf);                                       /* we consumed it (== eth_l2_free) */
         return ESP_OK;

@@ -97,6 +97,13 @@ CONFIG_ESP32S3_INSTRUCTION_CACHE_32KB=y
 # — QIO causes a TG0WDT watchdog boot-loop on this board. DIO@80MHz is the
 # hardware ceiling here. Confirmed empirically + in LilyGO's own examples.
 
+# ── Serialize Ethernet transmit (#101) ────────────────────────────────
+# The L2 fast path transmits from the W5500 driver's own RX task while lwIP
+# transmits through the same esp_eth handle from dns_task/httpd. Without this
+# esp_eth_transmit() has no lock and the W5500's read-TX_WR / write-buffer /
+# write-TX_WR / SEND sequence is not atomic — two senders can merge frames.
+CONFIG_ETH_TRANSMIT_MUTEX=y
+
 # ── Static buffers in PSRAM (#89) ─────────────────────────────────────
 # libmain carried ~130 KB of internal .bss, ~40 KB of it web-page render
 # buffers. Internal heap idled at 20-30 KB free / <8 KB largest on the
