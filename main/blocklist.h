@@ -14,24 +14,34 @@ extern "C" {
  * into the sorted prefix as it finishes, so a domain carried by any two feeds
  * costs one slot regardless of which feeds or what order.
  * Sized against hagezi's wildcard/ variants (Pro ~226k, Ultimate ~269k,
- * tif.medium ~326k as of 2026-08) — never the domains/ versions. Two separate
+ * tif.medium ~326k as of 2026-08) - never the domains/ versions. Two separate
  * things are easy to conflate here:
  *   - FORMAT: wildcard/ vs domains/ is the same coverage in fewer entries. Our
  *     suffix-walk matching resolves a wildcard parent, so one entry replaces
  *     every child the domains/ file enumerates. Lossless, purely cheaper.
  *   - TIER: tif.medium is hagezi's deliberately REDUCED threat-intel tier, a
- *     subset — not full TIF in a cheaper encoding. Full wildcard/tif.txt is
+ *     subset - not full TIF in a cheaper encoding. Full wildcard/tif.txt is
  *     ~2.1M entries and cannot fit here at any encoding.
  * OISD big (~266k measured) + AdGuard + Ultimate + tif.medium peaked at 778,569
- * deduped (2026-08-26) — the raw union (~1.04M) would not fit at all. 820k
- * restores real margin over that measured peak; the extra 320KB came out of a
- * measured 1.45MB psram_free, leaving ~1.1MB for mbedTLS (which allocs its TLS
- * buffers from PSRAM since 2e03f2d).
+ * deduped (2026-08-26) - the raw union (~1.04M) would not fit at all.
  * Overflow is counted and surfaced via blocklist_dropped_count(), not silent,
  * and once full the remaining feeds are skipped instead of downloaded to be
- * discarded — so dropped is then a lower bound on what is missing.
- * Cost: 2 ping-pong buffers x CAPACITY x 4B in PSRAM (820k -> 6.56MB of ~8MB). */
-#define BLOCKLIST_CAPACITY  820000u
+ * discarded - so dropped is then a lower bound on what is missing.
+ *
+ * 800,000 rather than the old 820,000, and the 20k is bought back many times
+ * over. The cost model changed with the bucket-split format: what binds is no
+ * longer two equal 4-byte buffers but the 5-byte staging array plus the 3-byte
+ * live image.
+ *
+ *   stage  800k * 5B                    = 3.81 MB
+ *   image  262,148 + 800k * 3B          = 2.54 MB
+ *                                 total = 6.35 MB   (was 6.26 MB at 820k)
+ *
+ * ~100 KB more PSRAM for 8 more hash bits (false positives 1/1,500 -> 1/350,000)
+ * and ~4 probes per lookup instead of ~20. Headroom above the measured 778,569
+ * peak narrows from 41k to 21k, which is the one real cost; Wave 2 (flash) is
+ * where capacity grows. See docs/blocklist-format.md. */
+#define BLOCKLIST_CAPACITY  800000u
 
 /* NVS whitelist — domains that always bypass blocklist (up to 64) */
 #define WHITELIST_MAX  64
@@ -73,6 +83,18 @@ bool blocklist_whitelist_contains(const char *domain, size_t len);
 bool blocklist_whitelist_contains_nb(const char *domain, size_t len);
 uint32_t blocklist_whitelist_count(void);
 void blocklist_whitelist_get(char out[][64], uint32_t *count_inout);
+
+/* Last thing that happened to the SD snapshot, as a short stable token for
+ * /metrics: "unknown", "absent", "bad-magic", "format-mismatch", "bad-count",
+ * "short-read", "invalid-index", "loaded", "saved", "open-failed",
+ * "short-write". Without this the difference between "no SD card in the slot"
+ * and "the snapshot was written but rejected on load" is only visible on a
+ * serial console — which is exactly the information you need when a board
+ * silently stops warm-booting, and exactly what you cannot get remotely. */
+const char *blocklist_sd_status(void);
+
+/* Byte size of the snapshot seen at boot, or 0 if there was none. */
+uint32_t blocklist_sd_bytes(void);
 
 /* SD card persistence — call after blocklist_init(), before download_task */
 bool     blocklist_load_sd(void);   /* returns true if loaded from /sdcard/blocklist.bin */

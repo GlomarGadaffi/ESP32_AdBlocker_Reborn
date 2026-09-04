@@ -1,4 +1,5 @@
 #include "blocklist.h"
+#include "bl_table.h"
 #include "domain.h"
 #include "http_fetch.h"
 #include "esp_heap_caps.h"
@@ -18,32 +19,58 @@
 #include <ctype.h>
 
 #define SD_BL_PATH  "/sdcard/blocklist.bin"
-#define SD_MAGIC    0xB10C1573u  /* identifies our binary format */
+/* Bumped from 0xB10C1573 for the bucket-split 40-bit format. The magic MUST
+ * change: a 32-bit-era file read as an image, or an image read by 32-bit-era
+ * firmware, would be served as a garbage blocklist rather than rejected. Old
+ * firmware now rejects a new file and new firmware rejects an old one, both
+ * falling back to a download. */
+#define SD_MAGIC    0xB10C2840u
 
+/* The file is the live image verbatim: this header, then idx[65537], then the
+ * 3-byte entries. That is exactly the byte layout a flash partition would hold,
+ * so Wave 2 writes the same image with no further format change. The format
+ * parameters are stored rather than assumed, so a future bucket/entry width is
+ * detected and rejected precisely instead of needing another magic bump. */
 typedef struct {
     uint32_t magic;
     uint32_t count;
-    /* [0] = entries dropped to capacity when this snapshot was written. Without
-     * it a truncated list comes back from a warm boot looking healthy
-     * (dropped=0, no banner) and serves silently incomplete until the next
-     * successful reload. Snapshots written before this field existed read 0,
-     * which is exactly the "not truncated" value — no format bump needed.
-     * [1] unused. Header stays 16B: old and new files are interchangeable. */
-    uint32_t reserved[2];
+    uint8_t  hash_bits;     /* BL_HASH_BITS   */
+    uint8_t  bucket_bits;   /* BL_BUCKET_BITS */
+    uint8_t  entry_bytes;   /* BL_ENT_BYTES   */
+    uint8_t  pad;
+    /* Entries dropped to capacity when this snapshot was written. Without it a
+     * truncated list comes back from a warm boot looking healthy (dropped=0, no
+     * banner) and serves silently incomplete until the next successful reload. */
+    uint32_t dropped;
 } bl_sd_header_t;
 
 static const char *TAG = "blocklist";
+
+/* See blocklist_sd_status() in the header for why this exists. */
+static const char *s_sd_status = "unknown";
+static _Atomic uint32_t s_sd_bytes = 0;
+const char *blocklist_sd_status(void) { return s_sd_status; }
+uint32_t    blocklist_sd_bytes(void)  { return atomic_load(&s_sd_bytes); }
 #define NVS_NS  "dns_sink"
+/* PSRAM buffers.
+ * Not a ping-pong pair any more: the two buffers have different shapes and
+ * different jobs, because a staging record (5B, the full 40-bit hash) is wider
+ * than a stored entry (3B remainder — the bucket index carries the top 16 bits
+ * as position, not as data). Both are allocated once at boot, never freed.
+ *
+ *   s_stage  BLOCKLIST_CAPACITY * BL_REC_BYTES   build scratch, sorted in place
+ *   s_image  BL_IMAGE_BYTES(CAPACITY)            the live [ idx | entries ]
+ *
+ * docs/blocklist-format.md has the memory budget and why this beats two equal
+ * buffers: a zero-copy pointer swap would need 10 * CAPACITY bytes, which caps
+ * capacity below the measured 778k peak and would start dropping entries. */
+static uint8_t *s_stage = NULL;
+static uint8_t *s_image = NULL;
 
-/* ── PSRAM ping-pong buffers ─────────────────────────────────────── */
-/* Two fixed-size arrays; never freed after boot (no fragmentation). */
-static uint32_t *s_buf[2];          /* s_buf[0] and s_buf[1] in PSRAM */
-static int       s_active_buf = 0;  /* which buffer is currently live  */
-
-/* Atomic pointer accessed from dns_task (Core 1) and download_task (Core 0).
- * NULL means dns_task forwards all queries upstream — only ever set during the
- * one publish path that must sort THROUGH this buffer (see blocklist_load). */
-static _Atomic(uint32_t *) s_live    = NULL;
+/* Atomic pointer read by dns_task (Core 1) and the L2 hook, written by
+ * download_task (Core 0). NULL means every query fails open and forwards
+ * upstream — set during the publish window while s_image is rewritten. */
+static _Atomic(const uint8_t *) s_live = NULL;
 static _Atomic uint32_t    s_count   = 0;
 static _Atomic bool        s_loading = false;
 /* Bumped every time a reload swaps in a new live list (#85). The forward
@@ -248,29 +275,35 @@ bool blocklist_extra_enabled_set(int idx, bool enabled)
 static char s_whitelist[WHITELIST_MAX][64];
 static uint32_t s_wl_count = 0;
 /* s_wl_mutex declared near the top (shared with custom-rules section). */
-
-/* ── Radix sort (4-pass LSD, in-PSRAM ping-pong) ─────────────────── */
-static void radix_sort(uint32_t *a, uint32_t *b, uint32_t n)
+/* Sorting the 5-byte staging records.
+ *
+ * The algorithms and their buffer geometry live in bl_table.c so they can be
+ * host-tested at a small capacity (tests/bl_table_test.c drives the tail-scratch
+ * path, the near-capacity qsort fallback, and the fold's p + 2m' > cap fallback
+ * against a reference sort). On the real 4-feed reload the fallback paths are
+ * the ones that run, so "it works at 778k on the bench" is not coverage.
+ *
+ * These wrappers exist only to bind 'cap' to BLOCKLIST_CAPACITY: every caller
+ * passes the base of the full staging buffer, which is the precondition the
+ * tail-scratch bound rests on. */
+static inline uint32_t sort_dedup_records(uint8_t *a, uint32_t n)
 {
-    for (int shift = 0; shift < 32; shift += 8) {
-        uint32_t cnt[256] = {0};
-        for (uint32_t i = 0; i < n; i++) cnt[(a[i] >> shift) & 0xFFu]++;
-        uint32_t prefix = 0;
-        for (int j = 0; j < 256; j++) { uint32_t c = cnt[j]; cnt[j] = prefix; prefix += c; }
-        for (uint32_t i = 0; i < n; i++) b[cnt[(a[i] >> shift) & 0xFFu]++] = a[i];
-        uint32_t *tmp = a; a = b; b = tmp;
-    }
-    /* After 4 passes (even), result is back in the original 'a' buffer */
+    return bl_sort_dedup(a, BLOCKLIST_CAPACITY, n);
 }
 
-/* ── Download callback ───────────────────────────────────────────── */
+static inline uint32_t fold_sorted_chunk(uint8_t *a, uint32_t p, uint32_t n)
+{
+    return bl_fold_sorted_chunk(a, BLOCKLIST_CAPACITY, p, n);
+}
+
+/* Download callback */
 typedef struct {
-    uint32_t *buf;
+    uint8_t  *buf;            /* staging records, BL_REC_BYTES each */
     uint32_t  cap;
     uint32_t  n;
     uint32_t  rejected;
     uint32_t  dropped;        /* lost to capacity (surfaced after load) */
-    uint32_t  sorted_prefix;  /* buf[0..sorted_prefix) is sorted+deduped — every
+    uint32_t  sorted_prefix;  /* buf[0..sorted_prefix) is sorted+deduped - every
                                * feed folded in so far, not just the primary;
                                * extras binary-search it, so a repeat from ANY
                                * earlier feed costs no capacity */
@@ -283,8 +316,8 @@ static bool on_domain_line(const char *line, size_t len, void *ctx)
 
     /* #1: user-requested abort (upstream's xStop). Returning false here is
      * exactly http_fetch_lines' documented abort signal, so this reuses the
-     * same failure path a dead/truncated feed already takes — "keeping
-     * previous list" for the primary, feed_failures++ for an extra — rather
+     * same failure path a dead/truncated feed already takes - "keeping
+     * previous list" for the primary, feed_failures++ for an extra - rather
      * than needing a distinct stopped state threaded through blocklist_load. */
     if (atomic_load_explicit(&s_stop_requested, memory_order_relaxed)) return false;
 
@@ -299,114 +332,24 @@ static bool on_domain_line(const char *line, size_t len, void *ctx)
     size_t nlen = domain_normalize(norm, sizeof(norm), tok, tlen);
     if (nlen == 0 || domain_is_bare_tld(norm, nlen)) return true;
 
-    uint32_t h = domain_hash(norm, nlen);
-    if (lc->sorted_prefix) {
-        /* Extra-list entry: binary-search everything already folded into the
-         * sorted prefix so a duplicate costs no capacity. Capacity binds near
-         * the DEDUPED union instead of the raw one — what makes OISD +
-         * Ultimate + TIF fit. */
-        uint32_t lo = 0, hi = lc->sorted_prefix;
-        while (lo < hi) {
-            uint32_t mid = lo + (hi - lo) / 2;
-            if      (lc->buf[mid] < h) lo = mid + 1;
-            else if (lc->buf[mid] > h) hi = mid;
-            else { lc->deduped++; return true; }
-        }
+    uint64_t h = bl_hash40(norm, nlen);
+    /* Extra-list entry: binary-search everything already folded into the sorted
+     * prefix so a duplicate costs no capacity. Capacity binds near the DEDUPED
+     * union instead of the raw one - what makes OISD + Ultimate + TIF fit. */
+    if (lc->sorted_prefix && bl_records_contain(lc->buf, lc->sorted_prefix, h)) {
+        lc->deduped++;
+        return true;
     }
     /* Capacity check belongs HERE, not at entry: everything above can still
      * decide this line stores nothing (junk, bare TLD, already present), and
-     * counting those as drops inflated the figure severalfold — a feed of
+     * counting those as drops inflated the figure severalfold - a feed of
      * comments read as thousands of "lost domains". Only a genuinely storable
      * new hash that has nowhere to go is a drop. */
     if (lc->n >= lc->cap) { lc->dropped++; return true; }  /* surfaced after load, never silent */
-    lc->buf[lc->n++] = h;
+    bl_rec_put(lc->buf + (size_t)lc->n++ * BL_REC_BYTES, h);
     return true;
 }
 
-static int cmp_u32(const void *x, const void *y)
-{
-    uint32_t a = *(const uint32_t *)x, b = *(const uint32_t *)y;
-    return (a > b) - (a < b);
-}
-
-/* Sort a[0..n) ascending without ever touching the OTHER ping-pong buffer —
- * that one is live and must keep answering queries. radix_sort needs n words of
- * scratch, not CAPACITY: when 2n <= CAPACITY the array's own free tail
- * (a+n .. a+2n) is valid, disjoint scratch, and the 4 passes (even) land the
- * result back in a. qsort is only the fallback for n > CAPACITY/2, where no
- * tail is left — it sorts in place but pays an indirect comparator per compare
- * over PSRAM, 2-4x slower than the radix path.
- * PRECONDITION: 'a' is the base of a full BLOCKLIST_CAPACITY buffer. Passing a
- * sub-array would make the tail-scratch bound a lie and corrupt what follows. */
-static void sort_hashes(uint32_t *a, uint32_t n)
-{
-    if (n < 2) return;
-    if (n <= BLOCKLIST_CAPACITY / 2) radix_sort(a, a + n, n);
-    else                             qsort(a, n, sizeof(uint32_t), cmp_u32);
-}
-
-/* Sort + drop equal neighbours in place; returns the surviving count. Equal
- * hashes are either the same domain from two feeds or a genuine hash collision
- * — both resolve to one slot, which is the whole point of the 32-bit encoding. */
-static uint32_t sort_dedup(uint32_t *a, uint32_t n)
-{
-    sort_hashes(a, n);
-    uint32_t u = 0;
-    for (uint32_t i = 0; i < n; i++)
-        if (u == 0 || a[i] != a[u - 1]) a[u++] = a[i];
-    return u;
-}
-
-/* Fold the raw chunk a[p..n) into the sorted, deduped prefix a[0..p) and
- * return the new total. Replaces re-sorting the whole array per feed, whose
- * qsort fallback (n > CAPACITY/2) cost an indirect comparator per compare over
- * PSRAM — on the measured 4-feed mix that was two whole-array qsorts per
- * reload. Here only the m-word chunk is sorted, then merged in O(p+m').
- *
- * The chunk arrived through the prefix binary search in on_domain_line, so
- * chunk ∩ prefix = ∅; equals can only be intra-chunk and die in the chunk
- * dedup. The merge is written to tolerate an equal pair anyway (both copies
- * survive, adjacent — one wasted slot, never a corrupt order).
- *
- * A zero-scratch backward merge of ADJACENT runs is not safe: with the chunk
- * at [p, p+m'), the first write at p+m'-1 lands on the chunk's own unread
- * top. So the deduped chunk is first moved to the buffer's far end,
- * b = a+CAPACITY-m', making destination and chunk disjoint: the highest write
- * is p+m'-1 < CAPACITY-m' exactly when p + 2m' <= CAPACITY. On the prefix
- * side, while chunk elements remain w = i+j > i, so a[--w] never touches an
- * unread a[i-1]; once the chunk is exhausted the remaining prefix is already
- * in place. The one geometry that fails the gate — free space smaller than
- * the chunk, only reachable within a whisker of capacity — falls back to the
- * whole-array sort_dedup. */
-static uint32_t fold_sorted_chunk(uint32_t *a, uint32_t p, uint32_t n)
-{
-    uint32_t m = n - p;
-    if (m == 0) return p;
-    if (p == 0) return sort_dedup(a, n);
-
-    /* Sort the chunk alone: its own tail a[n..n+m) is valid radix scratch
-     * whenever it fits under CAPACITY; otherwise qsort just the m words. */
-    if (n + m <= BLOCKLIST_CAPACITY) radix_sort(a + p, a + n, m);
-    else if (m > 1)                  qsort(a + p, m, sizeof(uint32_t), cmp_u32);
-
-    /* Dedup the chunk in place (intra-feed repeats only). */
-    uint32_t mp = 0;
-    for (uint32_t i = 0; i < m; i++)
-        if (mp == 0 || a[p + i] != a[p + mp - 1]) a[p + mp++] = a[p + i];
-
-    if (p + 2u * mp > BLOCKLIST_CAPACITY)
-        return sort_dedup(a, p + mp);   /* near-capacity fallback, see above */
-
-    uint32_t *b = a + BLOCKLIST_CAPACITY - mp;
-    memmove(b, a + p, (size_t)mp * sizeof(uint32_t));
-
-    uint32_t i = p, j = mp, w = p + mp;
-    while (i > 0 && j > 0)
-        a[--w] = (a[i - 1] > b[j - 1]) ? a[--i] : b[--j];
-    while (j > 0) a[--w] = b[--j];
-    /* i > 0 remainder: already in place (w == i here). */
-    return p + mp;
-}
 
 /* ── NVS whitelist persistence ───────────────────────────────────── */
 static void wl_load_nvs(void)
@@ -462,17 +405,26 @@ bool blocklist_init(void)
     s_wl_mutex = xSemaphoreCreateMutex();
     if (!s_wl_mutex) return false;
 
-    for (int i = 0; i < 2; i++) {
-        s_buf[i] = (uint32_t *)heap_caps_malloc(
-            BLOCKLIST_CAPACITY * sizeof(uint32_t), MALLOC_CAP_SPIRAM);
-        if (!s_buf[i]) {
-            ESP_LOGE(TAG, "PSRAM alloc failed for buf[%d] (%" PRIu32 " bytes)",
-                     i, (uint32_t)(BLOCKLIST_CAPACITY * sizeof(uint32_t)));
-            return false;
-        }
+    s_stage = (uint8_t *)heap_caps_malloc(
+        (size_t)BLOCKLIST_CAPACITY * BL_REC_BYTES, MALLOC_CAP_SPIRAM);
+    s_image = (uint8_t *)heap_caps_malloc(
+        BL_IMAGE_BYTES(BLOCKLIST_CAPACITY), MALLOC_CAP_SPIRAM);
+    if (!s_stage || !s_image) {
+        ESP_LOGE(TAG, "PSRAM alloc failed: stage %" PRIu32 " B, image %" PRIu32 " B",
+                 (uint32_t)((size_t)BLOCKLIST_CAPACITY * BL_REC_BYTES),
+                 (uint32_t)BL_IMAGE_BYTES(BLOCKLIST_CAPACITY));
+        return false;
     }
-    ESP_LOGI(TAG, "PSRAM ping-pong: 2 x %" PRIu32 " KB allocated",
-             (uint32_t)(BLOCKLIST_CAPACITY * 4 / 1024));
+    /* An image with a zeroed index reads as empty from every bucket, so a
+     * lookup landing here before the first list is published returns "not
+     * blocked" rather than walking uninitialised offsets. s_live still gates
+     * that, but the buffer should not depend on the gate for safety. */
+    memset(s_image, 0, BL_IDX_BYTES);
+    ESP_LOGI(TAG, "PSRAM: stage %" PRIu32 " KB + image %" PRIu32 " KB (cap %u entries, "
+             "%d-bit hashes)",
+             (uint32_t)((size_t)BLOCKLIST_CAPACITY * BL_REC_BYTES / 1024),
+             (uint32_t)(BL_IMAGE_BYTES(BLOCKLIST_CAPACITY) / 1024),
+             (unsigned)BLOCKLIST_CAPACITY, BL_HASH_BITS);
 
     extra_urls_load_nvs();
     custom_load_nvs();
@@ -487,28 +439,45 @@ bool blocklist_init(void)
  * against the new sorted array (both ascending, single pass). Runs in the
  * download_task once per reload, never on the query path. Would have caught
  * the 170k-domain stale-cache incident at first boot. */
-static void reload_diff_vs_sd(const uint32_t *neu, uint32_t n_new)
+static void reload_diff_vs_sd(const uint8_t *neu, uint32_t n_new)
 {
     FILE *f = fopen(SD_BL_PATH, "rb");
     if (!f) return;                       /* no SD / first boot: nothing to diff */
     bl_sd_header_t hdr;
-    if (fread(&hdr, sizeof(hdr), 1, f) != 1 || hdr.magic != SD_MAGIC || hdr.count == 0) {
+    if (fread(&hdr, sizeof(hdr), 1, f) != 1 || hdr.magic != SD_MAGIC || hdr.count == 0 ||
+        hdr.hash_bits != BL_HASH_BITS || hdr.bucket_bits != BL_BUCKET_BITS ||
+        hdr.entry_bytes != BL_ENT_BYTES) {
         fclose(f);
         return;
     }
-    uint32_t *chunk = (uint32_t *)heap_caps_malloc(4096, MALLOC_CAP_SPIRAM);
-    if (!chunk) { fclose(f); return; }
-    uint32_t remaining = hdr.count, i = 0, common = 0;
-    while (remaining > 0) {
-        size_t take = remaining > 1024 ? 1024 : remaining;
-        if (fread(chunk, sizeof(uint32_t), take, f) != take) break;
-        for (size_t k = 0; k < take; k++) {
-            uint32_t h = chunk[k];
-            while (i < n_new && neu[i] < h) i++;
-            if (i < n_new && neu[i] == h) { common++; i++; }
-        }
-        remaining -= (uint32_t)take;
+    /* The snapshot stores remainders, not whole hashes, so the bucket has to be
+     * rebuilt from the index to compare against the new records. Both sides are
+     * globally ascending, so one merge-walk still does it. */
+    uint32_t *idx = (uint32_t *)heap_caps_malloc(BL_IDX_BYTES, MALLOC_CAP_SPIRAM);
+    uint8_t *chunk = (uint8_t *)heap_caps_malloc(1024 * BL_ENT_BYTES, MALLOC_CAP_SPIRAM);
+    if (!idx || !chunk) {
+        heap_caps_free(idx); heap_caps_free(chunk); fclose(f);
+        return;
     }
+    if (fread(idx, 1, BL_IDX_BYTES, f) != BL_IDX_BYTES) {
+        heap_caps_free(idx); heap_caps_free(chunk); fclose(f);
+        return;
+    }
+    uint32_t b = 0, k = 0, i = 0, common = 0;
+    while (k < hdr.count) {
+        size_t take = hdr.count - k;
+        if (take > 1024) take = 1024;
+        if (fread(chunk, BL_ENT_BYTES, take, f) != take) break;
+        for (size_t t = 0; t < take; t++, k++) {
+            while (b < BL_BUCKET_COUNT && idx[b + 1] <= k) b++;
+            const uint8_t *e = chunk + t * BL_ENT_BYTES;
+            uint64_t h = ((uint64_t)b << (BL_HASH_BITS - BL_BUCKET_BITS)) |
+                         ((uint32_t)e[0] << 16) | ((uint32_t)e[1] << 8) | e[2];
+            while (i < n_new && bl_rec_get(neu + (size_t)i * BL_REC_BYTES) < h) i++;
+            if (i < n_new && bl_rec_get(neu + (size_t)i * BL_REC_BYTES) == h) { common++; i++; }
+        }
+    }
+    heap_caps_free(idx);
     heap_caps_free(chunk);
     fclose(f);
     ESP_LOGI(TAG, "Reload diff vs previous snapshot: +%" PRIu32 " added, -%" PRIu32
@@ -521,10 +490,9 @@ uint32_t blocklist_load(void)
     atomic_store(&s_loading, true);
     atomic_store_explicit(&s_stop_requested, false, memory_order_relaxed);
 
-    /* Point to the buffer NOT currently live. Download into it while the
-     * OLD list keeps serving — no null-blocking window during the fetch. */
-    int new_buf = 1 - s_active_buf;
-    load_ctx_t lc = { .buf = s_buf[new_buf], .cap = BLOCKLIST_CAPACITY, .n = 0, .rejected = 0 };
+    /* Build in the staging buffer. s_image keeps serving the whole fetch and
+     * the whole sort — nothing here touches it until the publish below. */
+    load_ctx_t lc = { .buf = s_stage, .cap = BLOCKLIST_CAPACITY, .n = 0, .rejected = 0 };
 
     /* Accumulated locally and published only where s_dropped is: until then the
      * OLD list is still the live one, and the count that describes it must not
@@ -553,7 +521,7 @@ uint32_t blocklist_load(void)
      * near the deduped union rather than the raw one.
      * Runs in the download task (Core 0), cold path only. */
     if (have_extras) {
-        uint32_t u = sort_dedup(lc.buf, lc.n);
+        uint32_t u = sort_dedup_records(lc.buf, lc.n);
         ESP_LOGI(TAG, "Primary sorted+deduped in place: %" PRIu32 " -> %" PRIu32, lc.n, u);
         lc.n = u;
         lc.sorted_prefix = u;
@@ -645,61 +613,52 @@ uint32_t blocklist_load(void)
                  "list is incomplete. Remove a source or switch to smaller lists "
                  "(hagezi wildcard/ variants, not domains/).",
                  lc.dropped, (unsigned)BLOCKLIST_CAPACITY);
-    /* Which publish path is legal turns on ONE question: was the new buffer
-     * sorted THROUGH the live buffer? If it never was, the old array is intact,
-     * no reader can observe a torn read of it, and the degraded window buys
-     * nothing — the release-store alone orders every write to the new buffer
-     * ahead of the pointer the reader acquires.
-     * (A Core 1 reader that latched the old pointer microseconds earlier can
-     * pair it with the new count. Both counts are <= CAPACITY and both buffers
-     * are CAPACITY-sized and permanently allocated, so the worst case is one
-     * query answered against a stale tail — bounded, never an OOB read. That
-     * race predates this change; the null window never closed it either.) */
+    /* Publish.
+     *
+     * The sort happened entirely in s_stage, so the old list served the whole
+     * fetch AND the whole sort. What cannot be avoided is the conversion: the
+     * 5-byte records have to become 3-byte entries plus a bucket index, and the
+     * only buffer that can hold that result is s_image, which is live.
+     *
+     * So publishing goes degraded for one conversion pass (~50ms at full
+     * capacity), once per reload, i.e. every 4 hours. Queries fail OPEN during
+     * it — forwarded upstream and answered normally, just unfiltered.
+     *
+     * Be straight about this: it is a NEW cost. The 4-byte predecessor could
+     * pointer-swap two equal ping-pong buffers with no window at all on its
+     * common path, and only went degraded in one near-capacity corner. The
+     * window is the price of the bucket index — which is also what buys 3-byte
+     * entries, 40-bit hashes and ~4 probes. docs/blocklist-format.md has the
+     * alternatives and why a zero-copy swap does not fit in PSRAM.
+     *
+     * The null + yield ahead of the conversion is the same RCU quiescence the
+     * old degraded sort used (#45): a Core 1 reader that latched the pointer
+     * microseconds ago must finish its bucket search before we overwrite what
+     * it is reading. That search is a handful of probes inside one bucket;
+     * 2ms is a thousandfold margin. */
     uint32_t unique;
     if (lc.sorted_prefix == lc.n) {
         /* Every feed was folded in as it completed: already sorted and deduped. */
         unique = lc.n;
-        ESP_LOGI(TAG, "Total %" PRIu32 " domains, already sorted by the per-feed passes "
-                 "— publishing with no degraded window", unique);
-    } else if (lc.n <= BLOCKLIST_CAPACITY / 2) {
-        /* No extras configured, but the array's own free tail is scratch enough
-         * for radix — still no reason to touch the live buffer. */
-        ESP_LOGI(TAG, "Total %" PRIu32 " domains before dedup; sorting on tail scratch "
-                 "(no degraded window)...", lc.n);
-        unique = sort_dedup(lc.buf, lc.n);
-        ESP_LOGI(TAG, "%" PRIu32 " dupes removed", lc.n - unique);
+        ESP_LOGI(TAG, "Total %" PRIu32 " domains, already sorted by the per-feed passes",
+                 unique);
     } else {
-        /* Over half of capacity with no sorted prefix: the only scratch large
-         * enough IS the live buffer, so we must drop to degraded mode for the
-         * ~1-2s sort (not the whole fetch). After nulling s_live, yield for 2ms
-         * so any Core 1 reader that already latched the old arr pointer
-         * completes its binary search before we overwrite that buffer
-         * (#45 — RCU quiescence window). */
-        ESP_LOGI(TAG, "Total %" PRIu32 " domains before dedup; sorting via the live buffer "
-                 "(degraded window)...", lc.n);
-        atomic_store_explicit(&s_live, NULL, memory_order_release);
-        vTaskDelay(pdMS_TO_TICKS(2));
-        uint32_t *a = s_buf[new_buf];
-        uint32_t *b = s_buf[s_active_buf];  /* scratch during sort; live ptr is NULL */
-        radix_sort(a, b, lc.n);
-
-        /* Remove duplicates (hash collisions from different domains) */
-        unique = 0;
-        for (uint32_t i = 0; i < lc.n; i++) {
-            if (unique == 0 || a[i] != a[unique - 1])
-                a[unique++] = a[i];
-        }
+        ESP_LOGI(TAG, "Total %" PRIu32 " domains before dedup; sorting on staging scratch...",
+                 lc.n);
+        unique = sort_dedup_records(lc.buf, lc.n);
+        ESP_LOGI(TAG, "%" PRIu32 " dupes removed", lc.n - unique);
     }
 
-    /* Atomic swap: publish new array */
+    atomic_store_explicit(&s_live, NULL, memory_order_release);
+    vTaskDelay(pdMS_TO_TICKS(2));
+    bl_build_image(s_stage, unique, s_image);
     atomic_store_explicit(&s_count, unique, memory_order_relaxed);
-    s_active_buf = new_buf;
-    atomic_store_explicit(&s_live, s_buf[new_buf], memory_order_release);
+    atomic_store_explicit(&s_live, s_image, memory_order_release);
     blocklist_generation_bump();  /* (#85) */
 
     ESP_LOGI(TAG, "Blocklist live: %" PRIu32 " domains", unique);
     atomic_store(&s_loading, false);
-    reload_diff_vs_sd(s_buf[new_buf], unique);   /* before the snapshot is overwritten */
+    reload_diff_vs_sd(s_stage, unique);   /* before the snapshot is overwritten */
 
     /* A snapshot from a reload with a dead feed would come back at the next warm
      * boot as the list, with no record that a source was missing. Keep the last
@@ -727,10 +686,9 @@ typedef bool (*wl_fn_t)(const char *, size_t);
 static bool IRAM_ATTR is_blocked_impl(const char *domain, size_t len, wl_fn_t wl_check)
 {
     if (atomic_load_explicit(&s_paused, memory_order_relaxed)) return false;
-    uint32_t *arr = atomic_load_explicit(&s_live, memory_order_acquire);
-    if (!arr) return false;
-    uint32_t n = atomic_load_explicit(&s_count, memory_order_relaxed);
-    if (n == 0) return false;
+    const uint8_t *img = atomic_load_explicit(&s_live, memory_order_acquire);
+    if (!img) return false;
+    if (atomic_load_explicit(&s_count, memory_order_relaxed) == 0) return false;
 
     const char *p = domain;
     size_t remaining = len;
@@ -739,14 +697,9 @@ static bool IRAM_ATTR is_blocked_impl(const char *domain, size_t len, wl_fn_t wl
         if (!domain_is_bare_tld(p, remaining)) {
             if (wl_check(p, remaining)) return false;
 
-            uint32_t h = domain_hash(p, remaining);
-            uint32_t lo = 0, hi = n;
-            while (lo < hi) {
-                uint32_t mid = lo + (hi - lo) / 2;
-                if (arr[mid] < h)       lo = mid + 1;
-                else if (arr[mid] > h)  hi = mid;
-                else                    return true;
-            }
+            /* One index read picks the bucket, then a few probes inside it —
+             * against ~20 scattered probes over the whole array before. */
+            if (bl_image_contains(img, bl_hash40(p, remaining))) return true;
         }
         const char *dot = (const char *)memchr(p, '.', remaining);
         if (!dot) break;
@@ -901,91 +854,140 @@ void blocklist_whitelist_get(char out[][64], uint32_t *count_inout)
 bool blocklist_load_sd(void)
 {
     FILE *f = fopen(SD_BL_PATH, "rb");
-    if (!f) { ESP_LOGI(TAG, "No SD blocklist cache"); return false; }
+    if (!f) {
+        ESP_LOGI(TAG, "No SD blocklist cache (no card, or nothing written yet)");
+        s_sd_status = "absent";
+        return false;
+    }
+    if (fseek(f, 0, SEEK_END) == 0) {
+        long sz = ftell(f);
+        if (sz > 0) atomic_store(&s_sd_bytes, (uint32_t)sz);
+        rewind(f);
+    }
 
     bl_sd_header_t hdr;
     if (fread(&hdr, sizeof(hdr), 1, f) != 1 || hdr.magic != SD_MAGIC) {
-        ESP_LOGW(TAG, "SD blocklist: bad header");
+        ESP_LOGW(TAG, "SD blocklist: bad header (pre-40-bit snapshot? it will be "
+                 "replaced by the next reload)");
+        s_sd_status = "bad-magic";
+        fclose(f); return false;
+    }
+    if (hdr.hash_bits != BL_HASH_BITS || hdr.bucket_bits != BL_BUCKET_BITS ||
+        hdr.entry_bytes != BL_ENT_BYTES) {
+        ESP_LOGW(TAG, "SD blocklist: format mismatch (%u/%u/%u, expected %u/%u/%u)",
+                 hdr.hash_bits, hdr.bucket_bits, hdr.entry_bytes,
+                 BL_HASH_BITS, BL_BUCKET_BITS, BL_ENT_BYTES);
+        s_sd_status = "format-mismatch";
         fclose(f); return false;
     }
     if (hdr.count == 0 || hdr.count > BLOCKLIST_CAPACITY) {
         ESP_LOGW(TAG, "SD blocklist: bad count %" PRIu32, hdr.count);
+        s_sd_status = "bad-count";
         fclose(f); return false;
     }
 
-    /* Read via DRAM bounce buffer — same pattern as blocklist_save_sd, avoids
-     * handing the SDSPI/FATFS path a single huge PSRAM-sourced read. */
-    static EXT_RAM_BSS_ATTR uint32_t chunk[1024];   /* SD path only — cold */
-    uint32_t *dst = s_buf[s_active_buf];
-    size_t remaining = hdr.count, total_read = 0;
-    while (remaining > 0) {
-        size_t batch = remaining < 1024 ? remaining : 1024;
-        size_t r = fread(chunk, sizeof(uint32_t), batch, f);
+    /* Read via a DRAM bounce buffer — same pattern as blocklist_save_sd, avoids
+     * handing the SDSPI/FATFS path a single huge PSRAM-destined read. The file
+     * body IS the image, so this is a straight copy with no conversion. */
+    static EXT_RAM_BSS_ATTR uint8_t chunk[4096];   /* SD path only — cold */
+    size_t total = BL_IMAGE_BYTES(hdr.count), done = 0;
+    while (done < total) {
+        size_t batch = total - done;
+        if (batch > sizeof(chunk)) batch = sizeof(chunk);
+        size_t r = fread(chunk, 1, batch, f);
         if (r == 0) break;
-        memcpy(dst + total_read, chunk, r * sizeof(uint32_t));
-        total_read += r; remaining -= r;
+        memcpy(s_image + done, chunk, r);
+        done += r;
     }
     fclose(f);
-    if (total_read != hdr.count) {
+    if (done != total) {
         ESP_LOGW(TAG, "SD blocklist: short read %" PRIu32 "/%" PRIu32,
-                 (uint32_t)total_read, hdr.count);
+                 (uint32_t)done, (uint32_t)total);
+        s_sd_status = "short-read";
+        return false;
+    }
+    /* The bounds bl_image_contains uses come out of this file, so a partial
+     * write or bit rot that leaves the header intact could hand the L2 RX hook
+     * a bucket range of 0..0xFFFFFFFF and send it gigabytes past PSRAM on every
+     * query — a crash loop that survives reboots, because the bad file does.
+     * The old 32-bit format could not fail this way: its search bounds came
+     * from a validated count, so corrupt data only ever meant a wrong verdict.
+     * One 65k-comparison pass at boot buys that immunity back. */
+    if (!bl_image_valid(s_image, hdr.count)) {
+        ESP_LOGW(TAG, "SD blocklist: index failed validation (corrupt snapshot) — "
+                 "refusing and falling back to a download");
+        s_sd_status = "invalid-index";
         return false;
     }
 
     /* Restore the truncation state with the data, before the release-store that
-     * makes the array visible: a reader that sees this list must also see how
+     * makes the image visible: a reader that sees this list must also see how
      * incomplete it is. Without this a truncated snapshot came back from a warm
      * boot reading dropped=0 and served silently short until the next reload.
      * s_feed_failures stays 0 by construction — blocklist_load refuses to write
      * a snapshot from a reload where any feed hard-failed. */
     atomic_store_explicit(&s_count, hdr.count, memory_order_relaxed);
-    atomic_store(&s_dropped, hdr.reserved[0]);
-    atomic_store_explicit(&s_live, s_buf[s_active_buf], memory_order_release);
+    atomic_store(&s_dropped, hdr.dropped);
+    atomic_store_explicit(&s_live, s_image, memory_order_release);
+    s_sd_status = "loaded";
     ESP_LOGI(TAG, "SD blocklist loaded: %" PRIu32 " domains (instant)", hdr.count);
-    if (hdr.reserved[0] > 0)
+    if (hdr.dropped > 0)
         ESP_LOGW(TAG, "Snapshot was TRUNCATED when written: %" PRIu32 " entries had been "
                  "dropped — this warm-boot list is INCOMPLETE until the next reload",
-                 hdr.reserved[0]);
+                 hdr.dropped);
     return true;
 }
 
 void blocklist_save_sd(void)
 {
-    uint32_t n   = atomic_load(&s_count);
-    uint32_t *arr = atomic_load_explicit(&s_live, memory_order_acquire);
-    if (!arr || n == 0) return;
+    uint32_t n = atomic_load(&s_count);
+    const uint8_t *img = atomic_load_explicit(&s_live, memory_order_acquire);
+    if (!img || n == 0) return;
 
     ESP_LOGI(TAG, "SD save: opening %s for %" PRIu32 " domains", SD_BL_PATH, n);
     FILE *f = fopen(SD_BL_PATH, "wb");
-    if (!f) { ESP_LOGW(TAG, "SD blocklist: can't open for write (errno=%d)", errno); return; }
+    if (!f) {
+        ESP_LOGW(TAG, "SD blocklist: can't open for write (errno=%d) — no card mounted?", errno);
+        s_sd_status = "open-failed";
+        return;
+    }
 
-    /* Carry the drop count into the file: the array alone cannot say whether it
+    /* Carry the drop count into the file: the image alone cannot say whether it
      * is the whole list, and the next warm boot serves this file before any
      * download runs (see blocklist_load_sd). */
     uint32_t dropped = atomic_load(&s_dropped);
-    bl_sd_header_t hdr = { .magic = SD_MAGIC, .count = n, .reserved = {dropped, 0} };
+    bl_sd_header_t hdr = { .magic = SD_MAGIC, .count = n,
+                           .hash_bits = BL_HASH_BITS, .bucket_bits = BL_BUCKET_BITS,
+                           .entry_bytes = BL_ENT_BYTES, .pad = 0, .dropped = dropped };
     fwrite(&hdr, sizeof(hdr), 1, f);
 
-    /* Write in chunks from a small DRAM bounce buffer — avoids handing the
+    /* Write in chunks from a small bounce buffer — avoids handing the
      * SDSPI/FATFS path a single huge PSRAM-sourced write. */
-    static EXT_RAM_BSS_ATTR uint32_t chunk[1024];   /* SD path only — cold */
-    size_t written = 0;
-    while (written < n) {
-        size_t batch = n - written;
-        if (batch > 1024) batch = 1024;
-        memcpy(chunk, arr + written, batch * sizeof(uint32_t));
-        size_t w = fwrite(chunk, sizeof(uint32_t), batch, f);
+    static EXT_RAM_BSS_ATTR uint8_t chunk[4096];   /* SD path only — cold */
+    size_t total = BL_IMAGE_BYTES(n), written = 0;
+    while (written < total) {
+        size_t batch = total - written;
+        if (batch > sizeof(chunk)) batch = sizeof(chunk);
+        memcpy(chunk, img + written, batch);
+        size_t w = fwrite(chunk, 1, batch, f);
         if (w != batch) { ESP_LOGW(TAG, "SD write stalled at %u", (unsigned)(written + w)); break; }
         written += batch;
     }
     fflush(f);
     fclose(f);
 
-    if (written == n)
+    if (written == total) {
+        s_sd_status = "saved";
+        atomic_store(&s_sd_bytes, (uint32_t)(total + sizeof(hdr)));
+    } else {
+        s_sd_status = "short-write";
+    }
+    if (written == total)
         ESP_LOGI(TAG, "SD blocklist saved: %" PRIu32 " domains (%" PRIu32 " KB, %" PRIu32
-                 " dropped)", n, (uint32_t)((n * 4 + 16) / 1024), dropped);
+                 " dropped)", n, (uint32_t)((total + sizeof(hdr)) / 1024), dropped);
     else
-        ESP_LOGW(TAG, "SD blocklist: short write %" PRIu32 "/%" PRIu32, (uint32_t)written, n);
+        ESP_LOGW(TAG, "SD blocklist: short write %" PRIu32 "/%" PRIu32,
+                 (uint32_t)written, (uint32_t)total);
 }
 
 uint32_t blocklist_domain_count(void)  { return atomic_load(&s_count); }

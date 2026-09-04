@@ -2014,6 +2014,7 @@ int dns_server_metrics_json(char *out, size_t cap)
         "\"blocklist_paused\":%s,"
         "\"blocklist_dropped\":%" PRIu32 ","
         "\"blocklist_feed_failures\":%" PRIu32 ","
+        "\"sd_status\":\"%s\",\"sd_bytes\":%" PRIu32 ","
         "\"heap_free\":%u,\"heap_largest\":%u,\"psram_free\":%u,\"dns_task_stack_hwm\":%u,",
         upstream_s,
         timesync_state(), timesync_source(),
@@ -2032,6 +2033,7 @@ int dns_server_metrics_json(char *out, size_t cap)
         blocklist_is_paused() ? "true" : "false",
         blocklist_dropped_count(),
         blocklist_feed_failures(),
+        blocklist_sd_status(), blocklist_sd_bytes(),
         (unsigned)free_int, (unsigned)big_int, (unsigned)free_psr, (unsigned)hwm);
 
     struct { const char *name; const Hist *h; } cats[] = {

@@ -3,6 +3,97 @@
 All notable changes to ESP32_AdBlocker_Reborn. Versions follow SemVer; the
 firmware's `esp_app_desc` version string comes from `version.txt`.
 
+## [1.3.0] — 2026-08-31
+
+Blocklist storage moves to a bucket-split 40-bit format. Same memory, wider
+hashes, fewer probes — and it fixes a defect that had been invisible since the
+first release.
+
+### Fixed
+
+- **Phantom blocking from 32-bit hash collisions.** The blocklist stored 32-bit
+  hashes, so a legitimate domain whose hash happened to land in the table was
+  sinkholed with no entry in any feed to explain it. At the measured
+  778,569-entry union that was `n / 2**32` per probe across a 3-4 suffix walk:
+  roughly **one in 1,500 distinct legitimate domains**, i.e. one or two
+  permanently and silently broken sites for a typical household, with no
+  diagnostic that would ever name the cause. Hashes are now 40-bit, putting the
+  rate at ~1 in 350,000.
+
+### Changed
+
+- **Blocklist format: 40-bit bucket-split** (`main/bl_table.c`, new). A
+  65536-slot index carries the top 16 bits of each hash as *position*, and only
+  the low 24 bits are stored, so entries are **3 bytes instead of 4** while the
+  hash gets 8 bits wider. Lookups binary-search inside one bucket (~4 probes,
+  mean occupancy 12.2) rather than the whole array (~20 scattered probes).
+- **Capacity 820,000 -> 800,000.** The binding constraint is now the 5-byte
+  staging array plus the 3-byte live image (6.35 MB, against 6.26 MB for the
+  two 4-byte ping-pong buffers). Headroom over the measured 778,569 peak
+  narrows from 41k to 21k; Wave 2 (flash-resident tables) is where capacity
+  grows. See [`docs/blocklist-format.md`](docs/blocklist-format.md).
+- **`domain_hash()` is unchanged and still 32-bit.** It also keys the forward
+  cache, the L2 cache lookup and the in-flight upstream table; the blocklist
+  now uses a separate `bl_hash40()` so none of those formats move.
+- **SD snapshot format bumped** (`SD_MAGIC` 0xB10C1573 -> 0xB10C2840). The file
+  is the live image verbatim — the same bytes a flash partition would hold. Old
+  and new firmware mutually reject each other's snapshots and fall back to a
+  download, rather than serving a misread list. **First boot after this upgrade
+  re-downloads the blocklist** instead of loading from SD.
+
+### Added
+
+- **SD snapshot index validation.** Lookup bounds now come out of the image
+  file (`idx[b]`/`idx[b+1]`), where before they were derived from a validated
+  count — so a corrupt-but-header-valid snapshot could hand the L2 RX hook a
+  bucket range of 0..0xFFFFFFFF and send it far past PSRAM on every query, a
+  crash loop that would survive reboots because the bad file does. The index is
+  now checked for monotonicity and bounds once at load, and a failing snapshot
+  is refused in favour of a download.
+- **`sd_status` and `sd_bytes` in `/metrics`.** Whether the SD snapshot was
+  loaded, saved, or rejected — and why (`absent`, `bad-magic`,
+  `format-mismatch`, `bad-count`, `short-read`, `invalid-index`, `open-failed`,
+  `short-write`) — was previously only visible on a serial console. That is
+  exactly the information needed when a board silently stops warm-booting, and
+  exactly what is unavailable remotely. Surfacing it immediately paid for
+  itself: it identified that one board has no working SD card (`open-failed`)
+  rather than a broken snapshot format.
+- **`tools/dnsload`** — a DNS load generator that keeps N queries in flight and
+  reports true percentiles against a real domain corpus, plus notes on which
+  path is safe to measure and why an A/B/A is mandatory over Wi-Fi.
+- **Host tests for the storage core** (`tests/bl_table_test.c`). Covers the
+  odd-pass radix landing buffer, the near-capacity merge fallback, bucket
+  occupancy, and the measured false-positive rate against theory. Build and run
+  with `gcc -O2 -I main -o bl_table_test tests/bl_table_test.c main/bl_table.c`.
+
+### Measured
+
+On a T-ETH-Elite carrying 727,509 domains, before/after on the same board:
+`latency_us.lookup` p99 128 -> 64 us and max 126 -> 61 us (p50 unchanged at the
+32 us bucket — the median was never probe-bound); `psram_free` 329,800 ->
+264,268 B; SD snapshot 2,909,500 -> 2,444,691 B, i.e. 465 KB smaller while every
+hash gained 8 bits. Warm boot restores 727,509 domains 21 s after a reboot.
+End-to-end load test against a 60k-name corpus from the device's own feed:
+saturation ~2,150-2,200 qps on both 1.2.2 and 1.3.0, useful ceiling ~2,190 qps
+at concurrency 128 with zero loss, latency identical within noise. The storage
+change is **performance-neutral end to end** — the lookup saving is tens of
+microseconds inside a tens-of-milliseconds budget. Details, method and caveats
+in [`docs/blocklist-format.md`](docs/blocklist-format.md); the generator is
+[`tools/dnsload`](tools/dnsload/).
+
+### Known cost
+
+- **A ~50 ms fail-open window on every reload** (every 4 hours). Converting the
+  sorted records into the live image has to write the buffer that is serving,
+  so `s_live` is nulled for the length of one conversion pass and queries
+  forward upstream unfiltered during it. This is new: the 4-byte predecessor
+  pointer-swapped two equal buffers with no window on its common path. It is
+  the price of the bucket index, and the alternatives are in the design note.
+- **The first boot after upgrading re-downloads the whole blocklist** — measured
+  at 459 s on a four-feed configuration — because the pre-1.3.0 SD snapshot is
+  rejected by design. The device fails open and forwards unfiltered for that
+  window. Subsequent boots are warm (~21 s).
+
 ## [1.2.2] — 2026-08-28
 
 Three fixes from the post-1.2.1 review pass (21 findings filed as #91–#111;
