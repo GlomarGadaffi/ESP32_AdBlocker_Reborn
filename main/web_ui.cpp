@@ -892,9 +892,9 @@ static esp_err_t handle_status(httpd_req_t *r)
         acl_list(acl_ips, &acl_n);
         page_appendf(page, sizeof(page), &n,
             "<h3>Client Access Control</h3>"
-            "<p><small>Empty = allow all. If any IP is listed, only those clients may resolve new names. "
-            "Note: on Ethernet, blocked and already-cached answers are served by the L2 fast path, "
-            "which does not check this list.</small></p>"
+            "<p><small>Empty = allow all. If any IP is listed, only those clients may resolve "
+            "anything — the Ethernet fast path enforces this list too (#87), and hands any query "
+            "it cannot clear to the socket path rather than answering it.</small></p>"
             "<form method=post action=/acl/add>"
             "<input name=ip placeholder='192.168.x.x' size=18>"
             "<button>Add allowed client</button></form>");
