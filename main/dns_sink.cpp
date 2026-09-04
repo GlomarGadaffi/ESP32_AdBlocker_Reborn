@@ -36,6 +36,8 @@
 #include "driver/gpio.h"
 #include "driver/spi_master.h"
 
+#include <atomic>
+
 #include "esp_vfs_fat.h"
 #include "sdmmc_cmd.h"
 #include "driver/sdspi_host.h"
@@ -125,6 +127,11 @@ static const char *TAG = "dns_sink";
 #define WIFI_CONNECTED_BIT  BIT2
 #define WIFI_GOT_IP_BIT     BIT3
 static EventGroupHandle_t s_eth_eg = nullptr;
+/* (#106) The same Ethernet address as s_ip, kept in binary (network byte
+ * order) because the L2 RX hook has to compare it against every frame's
+ * destination and must not parse a string there. 0 = no address yet, which
+ * makes the hook defer everything to lwIP. */
+static std::atomic<uint32_t> s_eth_ip_nbo{0};
 static char               s_ip[16] = {};      /* Ethernet IP — the LAN-facing address, reported to clients/mDNS/web UI */
 static char               s_nm[16] = {};      /* Ethernet netmask */
 static char               s_gw[16] = {};      /* Ethernet DHCP gateway */
@@ -409,6 +416,7 @@ static void publish_static_eth(void)
     snprintf(s_eth_dns, sizeof(s_eth_dns), "%s", s_eth_static.dns);
     ESP_LOGI(TAG, "Ethernet link up — static IP: %s  GW: %s  DNS: %s",
              s_ip, s_gw[0] ? s_gw : "(none)", s_eth_dns[0] ? s_eth_dns : "(none)");
+    s_eth_ip_nbo.store(inet_addr(s_eth_static.ip), std::memory_order_relaxed);
     xEventGroupSetBits(s_eth_eg, ETH_GOT_IP_BIT);
     apply_upstream_iface();
 }
@@ -421,6 +429,7 @@ static void eth_event_handler(void *, esp_event_base_t, int32_t event_id, void *
         publish_static_eth();      /* no-op under DHCP — the lease drives it instead */
     } else if (event_id == ETHERNET_EVENT_DISCONNECTED) {
         xEventGroupClearBits(s_eth_eg, ETH_CONNECTED_BIT | ETH_GOT_IP_BIT);
+        s_eth_ip_nbo.store(0, std::memory_order_relaxed);   /* (#106) hook defers while down */
         if (!s_eth_static.dhcp) { s_ip[0] = '\0'; s_nm[0] = '\0'; s_gw[0] = '\0'; s_eth_dns[0] = '\0'; }
     }
 }
@@ -446,6 +455,7 @@ static void ip_event_handler(void *, esp_event_base_t, int32_t event_id, void *e
     if (event_id == IP_EVENT_ETH_GOT_IP) {
         auto *ev = static_cast<ip_event_got_ip_t *>(event_data);
         esp_ip4addr_ntoa(&ev->ip_info.ip, s_ip, sizeof(s_ip));
+        s_eth_ip_nbo.store(ev->ip_info.ip.addr, std::memory_order_relaxed);   /* (#106) */
         esp_ip4addr_ntoa(&ev->ip_info.netmask, s_nm, sizeof(s_nm));
         esp_ip4addr_ntoa(&ev->ip_info.gw, s_gw, sizeof(s_gw));
         fetch_dhcp_dns(ev->esp_netif, s_eth_dns, sizeof(s_eth_dns));
@@ -878,6 +888,11 @@ extern "C" void dns_sink_setup_ap_passphrase(char *out, size_t cap) { if (cap) o
  * "browse to" hints. */
 extern "C" const char *dns_sink_hostname(void) { return MDNS_HOSTNAME ".local"; }
 
+/* This device's current LAN-facing address, Ethernet preferred (matches the
+ * dashboard's own precedence at line ~1407) — used by the :80 redirect
+ * handler (#112) to validate the Host header before echoing it back. */
+extern "C" const char *dns_sink_lan_ip(void) { return s_ip[0] ? s_ip : s_wifi_ip; }
+
 /* ── W5500 init (board pin map selected above) ───────────────────── */
 static esp_eth_handle_t eth_init_w5500(void)
 {
@@ -1096,7 +1111,11 @@ extern "C" uint32_t dns_sink_l2_cached(void)  { return s_l2_cached; }
  * IRAM_ATTR (#78): called from l2_input_cb, which must never fault to flash. */
 static int IRAM_ATTR l2_qname(const uint8_t *dns, int dns_len, char *out, size_t cap, size_t *outlen)
 {
-    static char raw[256];
+    /* (#114) Was `static`: mutable parser state shared across calls on the
+     * Ethernet RX worker task is a reentrancy hazard even though callers are
+     * currently serialized. Stack-allocated — 256 bytes is cheap next to the
+     * IRAM_ATTR budget this function already accepts. */
+    char raw[256];
     int off = 12; size_t rl = 0;
     while (off < dns_len && dns[off] != 0) {
         uint8_t l = dns[off];
@@ -1127,15 +1146,53 @@ static esp_err_t IRAM_ATTR l2_input_cb(esp_eth_handle_t h, uint8_t *buf, uint32_
     static uint8_t  tx[600];
     static char     name[256];
     do {
+        /* Every `break` below hands the frame to lwIP unchanged, which is what
+         * keeps this hook honest about the two-verdict-path rule: it may only
+         * answer a query it can classify exactly as the socket path would, and
+         * anything it cannot classify — a header it will not vouch for, a lock
+         * it cannot take, a rewrite it must not render — falls through to the
+         * socket path rather than being answered on a guess or dropped here. */
+        uint32_t our_ip = s_eth_ip_nbo.load(std::memory_order_relaxed);
+        if (!our_ip) break;                              /* (#106) no address yet */
         if (len < 14 + 20 + 8 + 13) break;               /* min IPv4/UDP/DNS */
         if (buf[12] != 0x08 || buf[13] != 0x00) break;   /* IPv4 only */
+        if ((buf[14] >> 4) != 4) break;                  /* (#106) IP version nibble */
         int ihl = (buf[14] & 0x0F) * 4;
         if (ihl < 20 || buf[14 + 9] != 17) break;        /* UDP only */
+        /* (#106) Length comes from the IP header, never from the frame: Ethernet
+         * pads short frames to 60 bytes, so `len - dns` counted padding as DNS
+         * payload, and an IP total-length larger than the frame was never
+         * rejected at all. */
+        int iptot = (buf[16] << 8) | buf[17];
+        if (iptot < ihl + 8 || 14 + iptot > (int)len) break;
+        /* (#106) Fragments: MF set or a non-zero offset means this frame is not
+         * a whole datagram, so the bytes at the UDP/DNS offsets are not what
+         * they look like. Reassembly is lwIP's job. */
+        if (((buf[20] << 8) | buf[21]) & 0x3FFF) break;
+        /* (#106) Only answer what is addressed to us. Without this the hook
+         * replied to a query sent to the subnet broadcast — and, since it just
+         * swaps the addresses back, replied FROM the broadcast address TO
+         * whatever the source claimed to be. */
+        uint32_t dst_ip;
+        memcpy(&dst_ip, buf + 14 + 16, 4);
+        if (dst_ip != our_ip) break;
+        /* (#106) A source that cannot receive a unicast reply (0.0.0.0, the
+         * all-ones broadcast, or 224/4 multicast) is not a client. */
+        uint32_t src_hbo = ((uint32_t)buf[26] << 24) | ((uint32_t)buf[27] << 16) |
+                           ((uint32_t)buf[28] << 8)  |  (uint32_t)buf[29];
+        if (src_hbo == 0 || src_hbo == 0xFFFFFFFFu || (buf[26] & 0xF0) == 0xE0) break;
+        /* (#87) The ACL guards the socket path but never this one, so a client
+         * excluded from DNS still got blocked verdicts and cached answers over
+         * Ethernet — the fast path only failed to answer on a cold miss, where
+         * it fell through to the ACL-protected socket. Provable permission is
+         * required to answer here; denied OR unknown defers to that socket,
+         * which drops the query if it really is denied. */
+        if (!acl_permits_nb(src_hbo)) break;
         int udp = 14 + ihl;
-        if (udp + 8 > (int)len) break;
         if (((buf[udp + 2] << 8) | buf[udp + 3]) != 53) break;   /* dst port 53 */
-        int dns = udp + 8, dns_len = (int)len - dns;
-        if (dns_len < 12) break;
+        int udplen = (buf[udp + 4] << 8) | buf[udp + 5];         /* (#106) */
+        if (udplen < 8 + 12 || udp + udplen > 14 + iptot) break;
+        int dns = udp + 8, dns_len = udplen - 8;
         if (buf[dns + 2] & 0x80) break;                  /* must be a query (QR=0) */
         if (((buf[dns + 4] << 8) | buf[dns + 5]) != 1) break;    /* qdcount==1 */
         size_t nlen = 0;
@@ -1143,6 +1200,21 @@ static esp_err_t IRAM_ATTR l2_input_cb(esp_eth_handle_t h, uint8_t *buf, uint32_
         if (qend < 0) break;
         uint16_t qtype = (buf[dns + qend - 4] << 8) | buf[dns + qend - 3];
         if (qtype != 1 && qtype != 28) break;            /* A / AAAA only */
+        uint16_t qclass = (buf[dns + qend - 2] << 8) | buf[dns + qend - 1];
+        if (qclass != 1) break;                          /* (#106) class IN only */
+        /* (#102) The socket path consults the rewrite table before the
+         * blocklist, so a name that is both rewritten and blocklisted answers
+         * with the configured address there — while this path went straight to
+         * the blocklist and answered 0.0.0.0, making the verdict depend on
+         * which transport the client happened to use. Test the same table here
+         * and, on a match, defer: the answer is then built by the one
+         * build_rewrite_a() in the socket path instead of a second copy in
+         * IRAM. `-1` (table busy) defers too — same fail-to-the-slow-path rule
+         * as everywhere else in this hook. */
+        if (qtype == 1) {
+            uint32_t rw = 0;
+            if (rewrite_lookup_nb(name, nlen, &rw) != 0) break;
+        }
         if (!blocklist_is_blocked_nb(name, nlen)) {      /* not blocked → try L2 cache, else lwIP */
             /* Forward-cache hit answered straight from L2, skipping lwIP — the
              * same socket-stack overhead the blocked path already bypasses. Lay
@@ -1194,10 +1266,10 @@ static esp_err_t IRAM_ATTR l2_input_cb(esp_eth_handle_t h, uint8_t *buf, uint32_
         a[4]=0; a[5]=1; a[6]=0; a[7]=0; a[8]=0; a[9]=10;             /* class IN, ttl 10 */
         a[10]=(rdlen>>8); a[11]=(rdlen&0xFF);
         memset(a+12, 0, rdlen);                          /* 0.0.0.0 / :: */
-        int iptot = ihl + 8 + dns_resp;
-        tx[14+2]=(iptot>>8); tx[14+3]=(iptot&0xFF);
-        int udplen = 8 + dns_resp;
-        tx[udp+4]=(udplen>>8); tx[udp+5]=(udplen&0xFF);
+        int iptot_b = ihl + 8 + dns_resp;
+        tx[14+2]=(iptot_b>>8); tx[14+3]=(iptot_b&0xFF);
+        int udplen_b = 8 + dns_resp;
+        tx[udp+4]=(udplen_b>>8); tx[udp+5]=(udplen_b&0xFF);
         tx[udp+6]=0; tx[udp+7]=0;                        /* zero UDP checksum (legal IPv4) */
         tx[14+10]=0; tx[14+11]=0;                        /* IP checksum */
         uint32_t sum=0;

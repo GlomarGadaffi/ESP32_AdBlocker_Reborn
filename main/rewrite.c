@@ -1,4 +1,5 @@
 #include "rewrite.h"
+#include "esp_attr.h"
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "esp_log.h"
@@ -154,6 +155,32 @@ uint32_t rewrite_lookup(const char *domain)
     }
     xSemaphoreGive(s_mutex);
     return result;
+}
+
+/* IRAM_ATTR (#78): called from l2_input_cb, which must never fault to flash.
+ * Same matching rules as rewrite_lookup (exact, or ".rule" suffix); the only
+ * differences are the zero-wait take and the tri-state result. */
+int IRAM_ATTR rewrite_lookup_nb(const char *domain, size_t dlen, uint32_t *out_ip)
+{
+    if (!domain || !out_ip) return 0;
+    if (s_count == 0) return 0;                 /* no rules — lock-free, as above */
+    if (!s_mutex) return -1;
+    if (xSemaphoreTake(s_mutex, 0) != pdTRUE) return -1;   /* busy → caller defers */
+    int found = 0;
+    for (uint32_t i = 0; i < s_count; i++) {
+        const char *rule = s_rules[i].domain;
+        size_t rlen = strlen(rule);
+        if (dlen == rlen && memcmp(domain, rule, dlen) == 0) {
+            *out_ip = s_rules[i].ipv4_hbo; found = 1; break;
+        }
+        if (dlen > rlen + 1 &&
+            domain[dlen - rlen - 1] == '.' &&
+            memcmp(domain + dlen - rlen, rule, rlen) == 0) {
+            *out_ip = s_rules[i].ipv4_hbo; found = 1; break;
+        }
+    }
+    xSemaphoreGive(s_mutex);
+    return found;
 }
 
 void rewrite_list(char out_domains[][64], uint32_t out_ips[], uint32_t *count_inout)

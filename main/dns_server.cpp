@@ -541,7 +541,14 @@ static bool skip_name(const uint8_t *pkt, int len, int *off)
     while (*off < len) {
         uint8_t b = pkt[*off];
         if (b == 0)          { (*off)++;        return true; }
-        if ((b & 0xC0) == 0xC0) { (*off) += 2; return true; }
+        /* (#113) A compression pointer is 2 bytes; at len-1 only its first
+         * byte exists. Advancing by 2 anyway pushed *off one past len — the
+         * caller's own `off > len` guards catch that on the next name, but a
+         * bare call site (dns_resp_min_ttl above) doesn't, so refuse here. */
+        if ((b & 0xC0) == 0xC0) {
+            if (*off + 1 >= len) return false;
+            (*off) += 2; return true;
+        }
         if ((b & 0xC0) != 0) return false;     /* reserved label length */
         *off += 1 + b;
     }
@@ -642,6 +649,9 @@ struct UpstreamEntry {
     bool             in_use;
     bool             via_tcp;        /* reply goes to the TCP conn, not client_addr */
     bool             refresh_only;   /* stale-refresh (#68): cache the reply, deliver to no one */
+    bool             no_cache;       /* (#106) non-IN class: deliver the reply, never cache it,
+                                        and never let an IN flight coalesce onto it — the cache
+                                        and the coalescing key are both class-blind */
     uint8_t          n_wait;         /* coalesced waiters (#76) */
     bool             hedged;         /* (#69) retransmit already fired — at most one per flight */
     uint16_t         hedge_qlen;     /* (#69) stashed wire bytes in s_hedge_q; 0 = not
@@ -709,6 +719,7 @@ static UpstreamEntry *upstream_alloc(uint16_t *our_txid_out)
             s_upstream[i].our_txid     = t;
             s_upstream[i].via_tcp      = false;
             s_upstream[i].refresh_only = false;
+            s_upstream[i].no_cache     = false;   /* (#106) recycled slot */
             s_upstream[i].n_wait       = 0;   /* (#76) a recycled slot must not
                                                  fan out to its predecessor's waiters */
             s_upstream[i].hedged       = false; /* (#69) hedge state is per-flight: a stale
@@ -782,6 +793,7 @@ static UpstreamEntry *upstream_find_joinable(uint32_t qhash, uint16_t qtype,
 {
     for (int i = 0; i < UPSTREAM_TABLE_SIZE; i++)
         if (s_upstream[i].in_use && !s_upstream[i].refresh_only &&
+            !s_upstream[i].no_cache &&                       /* (#106) class-blind key */
             s_upstream[i].qhash == qhash && s_upstream[i].qtype == qtype &&
             s_upstream[i].env_hash == env_hash &&
             s_upstream[i].n_wait < UPSTREAM_WAITERS_MAX &&
@@ -1424,7 +1436,11 @@ void DnsSinkServer::run_loop()
              * fast path's "skip blocked entries" behavior (dns_cache_l2_get)
              * correctly defers to the full dns_task path for this domain
              * instead of ever serving the cloaked chain from L2. */
-            if (cloaked) {
+            if (ue->no_cache) {
+                /* (#106) The cache is keyed on (qname-hash, qtype) with no class,
+                 * so storing a CH/HS reply here would hand it to a later IN query
+                 * for the same name and type. Deliver it and forget it. */
+            } else if (cloaked) {
                 cache_store_blocked(ue->qhash, ue->qtype, BLOCKED_TTL_S, now_ms_);
             } else {
                 uint8_t rcode = pkt[3] & 0x0F;
@@ -1562,13 +1578,31 @@ void DnsSinkServer::run_loop()
                 if (qend < 0) continue;
 
                 uint16_t qtype  = ntohs(*reinterpret_cast<uint16_t *>(rx + qend - 4));
-                /* uint16_t qclass = ntohs(...) -- always IN(1), skip check */
+                /* (#106) QCLASS was assumed to be IN and never read. A CH/HS/ANY
+                 * class query was therefore answered out of the IN-keyed cache,
+                 * or sinkholed with an IN record — neither is ours to give. Non-IN
+                 * classes now skip cache/rewrite/blocklist on both verdict paths
+                 * and are forwarded; the L2 hook's new QCLASS gate defers them
+                 * here for exactly this treatment. */
+                uint16_t qclass = ntohs(*reinterpret_cast<uint16_t *>(rx + qend - 2));
+                bool cls_in = (qclass == 1);
 
                 uint32_t h = domain_hash(name, nlen);
 
+                /* (#100) The rewrite verdict is taken BEFORE the cache, not after
+                 * it. A rule added while an answer for that name sat in the cache
+                 * (or was in flight, and so got stored stamped with the current
+                 * generation) used to stay invisible until the TTL ran out, and
+                 * the serve-stale refresh kept re-storing the pre-rewrite answer.
+                 * Deciding first makes the cache irrelevant to a rewritten name by
+                 * construction; the answer is still built at the original site
+                 * below, so there is only one build_rewrite_a call site. */
+                uint32_t rw_pre = (cls_in && qtype == 1) ? rewrite_lookup(name) : 0;
+
                 /* ── cache hit? ─────────────────────────────── */
                 s_cnt_cache_probe++;
-                CacheEntry *ce = cache_lookup(h, qtype, now_ms);
+                CacheEntry *ce = (rw_pre || !cls_in) ? nullptr
+                                                     : cache_lookup(h, qtype, now_ms);
                 if (ce) {
                     s_cnt_cache_hit++;
                     if (ce->blocked) {
@@ -1595,7 +1629,7 @@ void DnsSinkServer::run_loop()
                  * when enabled — same transport choice as a cold forward).
                  * The L2 path stays fresh-only: its miss falls through to
                  * here at ~1.8 ms, still invisible. */
-                {
+                if (cls_in && !rw_pre) {
                     CacheEntry *se = cache_lookup_stale(h, qtype, now_ms);
                     if (se && se->resp_len <= (int)sizeof(tx)) {
                         memcpy(tx, se->resp, se->resp_len);
@@ -1647,9 +1681,9 @@ void DnsSinkServer::run_loop()
                     }
                 }
 
-                /* ── DNS rewrite check (#12): local zone / domain→IP ── */
-                if (qtype == 1 /* A */) {
-                    uint32_t rw_ip = rewrite_lookup(name);
+                /* ── DNS rewrite answer (#12): verdict taken above (#100) ── */
+                {
+                    uint32_t rw_ip = rw_pre;
                     if (rw_ip) {
                         int tlen = build_rewrite_a(rx, qend, rw_ip, tx, sizeof(tx));
                         if (tlen > 0) {
@@ -1667,8 +1701,8 @@ void DnsSinkServer::run_loop()
                  * local initializations (illegal in C++). */
                 {
                     int64_t t_lk = esp_timer_get_time();
-                    bool is_blk = blocklist_is_blocked(name, nlen) ||
-                                  blocklist_custom_is_blocked(name, nlen);
+                    bool is_blk = cls_in && (blocklist_is_blocked(name, nlen) ||
+                                             blocklist_custom_is_blocked(name, nlen));
                     hist_record(&s_h_lookup, esp_timer_get_time() - t_lk);
                     if (is_blk) {
                         s_cnt_blocked++;
@@ -1698,8 +1732,12 @@ void DnsSinkServer::run_loop()
                      * drop unrelated queries now costs one waiter. No joinable
                      * entry: fall through and allocate normally. */
                     uint32_t eh = query_env_hash(rx, rlen, qend);
-                    UpstreamEntry *fl = upstream_find_joinable(h, qtype, eh,
-                                                               (uint32_t)now_ms);
+                    /* (#106) A non-IN query must not ride an IN flight: the join
+                     * key carries no class, so it would be answered with the IN
+                     * reply (and vice versa). It forwards on its own slot. */
+                    UpstreamEntry *fl = cls_in ? upstream_find_joinable(h, qtype, eh,
+                                                                        (uint32_t)now_ms)
+                                               : nullptr;
                     if (fl && upstream_join(fl, ntohs(hdr->id), &client_addr,
                                             t_recv, false, 0))
                         continue;
@@ -1717,6 +1755,7 @@ void DnsSinkServer::run_loop()
                     ue->qhash       = h;
                     ue->qtype       = qtype;
                     ue->env_hash    = eh;
+                    ue->no_cache    = !cls_in;   /* (#106) */
 
                     /* rewrite txid and forward — read the live upstream address
                      * so an in-flight query batch can straddle a set_upstream() */
@@ -1798,11 +1837,16 @@ void DnsSinkServer::run_loop()
                     } else {
                         s_cnt_total++; s_cnt_tcp++;
                         uint16_t qtype = ntohs(*reinterpret_cast<uint16_t *>(q + qend - 4));
+                        uint16_t qclass = ntohs(*reinterpret_cast<uint16_t *>(q + qend - 2));
+                        bool cls_in = (qclass == 1);              /* (#106), as on UDP */
                         uint32_t h = domain_hash(name, nlen);
                         int tlen = 0;    /* >0: answer in tx; 0: forwarded, conn held */
 
+                        /* (#100) Rewrite verdict before the cache, as on UDP. */
+                        uint32_t rw_pre = (cls_in && qtype == 1) ? rewrite_lookup(name) : 0;
                         s_cnt_cache_probe++;
-                        CacheEntry *ce = cache_lookup(h, qtype, now_ms);
+                        CacheEntry *ce = (rw_pre || !cls_in) ? nullptr
+                                                             : cache_lookup(h, qtype, now_ms);
                         if (ce && (ce->blocked ||
                                    (ce->resp_len > 0 && ce->resp_len <= (int)sizeof(tx)))) {
                             s_cnt_cache_hit++;
@@ -1817,12 +1861,12 @@ void DnsSinkServer::run_loop()
                                 hist_record(&s_h_cached, esp_timer_get_time() - t_recv);
                             }
                         } else {
-                            uint32_t rw_ip = (qtype == 1) ? rewrite_lookup(name) : 0;
+                            uint32_t rw_ip = rw_pre;
                             if (rw_ip) {
                                 tlen = build_rewrite_a(q, qend, rw_ip, tx, sizeof(tx));
                                 query_log_record(name, qtype, s_tcp.peer_ip, false, true);
-                            } else if (blocklist_is_blocked(name, nlen) ||
-                                       blocklist_custom_is_blocked(name, nlen)) {
+                            } else if (cls_in && (blocklist_is_blocked(name, nlen) ||
+                                                  blocklist_custom_is_blocked(name, nlen))) {
                                 s_cnt_blocked++;
                                 tlen = build_blocked_any(q, qend, qtype, tx, sizeof(tx));
                                 cache_store_blocked(h, qtype, BLOCKED_TTL_S, now_ms);
@@ -1843,8 +1887,9 @@ void DnsSinkServer::run_loop()
                                  * the age gate keeps that wait from outliving
                                  * the entry by more than a fraction of it. */
                                 uint32_t eh = query_env_hash(q, mlen, qend);
-                                UpstreamEntry *fl = upstream_find_joinable(h, qtype, eh,
-                                                                           (uint32_t)now_ms);
+                                UpstreamEntry *fl = cls_in                    /* (#106) */
+                                    ? upstream_find_joinable(h, qtype, eh, (uint32_t)now_ms)
+                                    : nullptr;
                                 if (fl && upstream_join(fl, ntohs(qh->id), nullptr,
                                                         t_recv, true, s_tcp.gen)) {
                                     s_tcp.awaiting = true;
@@ -1867,6 +1912,7 @@ void DnsSinkServer::run_loop()
                                     ue->qhash    = h;
                                     ue->qtype    = qtype;
                                     ue->env_hash = eh;
+                                    ue->no_cache = !cls_in;   /* (#106) */
                                     ue->via_tcp  = true;
                                     ue->tcp_gen  = s_tcp.gen;
                                     qh->id = htons(our_txid);
@@ -2014,6 +2060,7 @@ int dns_server_metrics_json(char *out, size_t cap)
         "\"blocklist_paused\":%s,"
         "\"blocklist_dropped\":%" PRIu32 ","
         "\"blocklist_feed_failures\":%" PRIu32 ","
+        "\"sd_status\":\"%s\",\"sd_bytes\":%" PRIu32 ","
         "\"heap_free\":%u,\"heap_largest\":%u,\"psram_free\":%u,\"dns_task_stack_hwm\":%u,",
         upstream_s,
         timesync_state(), timesync_source(),
@@ -2032,6 +2079,7 @@ int dns_server_metrics_json(char *out, size_t cap)
         blocklist_is_paused() ? "true" : "false",
         blocklist_dropped_count(),
         blocklist_feed_failures(),
+        blocklist_sd_status(), blocklist_sd_bytes(),
         (unsigned)free_int, (unsigned)big_int, (unsigned)free_psr, (unsigned)hwm);
 
     struct { const char *name; const Hist *h; } cats[] = {

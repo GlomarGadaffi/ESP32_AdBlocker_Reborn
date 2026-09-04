@@ -22,27 +22,38 @@ A query can be answered from either of two places, in different tasks:
 * the **L2 fast path** — `l2_input_cb` in `main/dns_sink.cpp`, registered via
   `esp_eth_update_input_path_info()` and running in the Ethernet RX task.
 
-The asymmetry that makes this safe is that **the L2 hook may only answer, never
-allow**. It answers a query in exactly two cases — a BLOCK verdict from
+The asymmetry that makes this safe is that **the L2 hook may only answer a query
+it can classify exactly as the socket path would, and must otherwise hand the
+frame over**. It answers in exactly two cases — a BLOCK verdict from
 `blocklist_is_blocked_nb()`, or a live forward-cache hit from
 `dns_cache_l2_get()` — and *every other outcome falls through* to
 `esp_netif_receive()`, where the socket path runs the full ladder
-(`blocklist_is_blocked() || blocklist_custom_is_blocked()`, rewrites, ACL,
+(ACL, rewrites, `blocklist_is_blocked() || blocklist_custom_is_blocked()`,
 upstream forward). So the hook's cheaper check set is not a divergence: it is a
 short-circuit that only fires where the full ladder would agree.
 
+Everything the hook cannot vouch for `break`s, and every `break` means "let lwIP
+have it" — never "drop it". That covers a header it will not trust, a lock it
+cannot take without waiting, and a rule it must not render itself. Concretely,
+before it will answer anything the hook requires: the frame to be a whole,
+unfragmented IPv4/UDP datagram addressed to *our own* Ethernet address from a
+source that could receive a unicast reply; lengths taken from the IP and UDP
+headers rather than the (padded) frame; a single class-IN A/AAAA question; a
+provable ACL pass from `acl_permits_nb()`; and no matching entry in
+`rewrite_lookup_nb()`. The last two are tri-state on purpose — "denied" and
+"lock busy" both defer, so a config edit in flight can never produce a wrong
+answer, only a slower one.
+
 If you add a rule that can turn a BLOCK into an ALLOW — a new whitelist-like
 exemption — it must be visible to `blocklist_is_blocked_nb()`, or the L2 hook
-will sinkhole something the socket path would have let through. Adding a rule
-that only ever creates *more* blocking (like the custom inline rules) is safe
-to leave off the hook; it just doesn't get the fast path.
+will sinkhole something the socket path would have let through. A rule that
+*changes* the answer rather than allowing it (rewrites) must make the hook
+defer, not answer. Adding a rule that only ever creates *more* blocking (like
+the custom inline rules) is safe to leave off the hook; it just doesn't get the
+fast path.
 
-**Known gap, documented not fixed:** the L2 hook does not consult
-`acl_permits()`, which appears only on the socket path. On the Ethernet
-segment, a client not on the ACL still receives sinkhole replies and
-forward-cache hits; only its cold queries reach the ACL gate. Wi-Fi clients
-have no L2 hook and are always gated. Whether that is intended has not been
-established — treat it as unverified rather than as sanctioned behavior.
+The ACL gap this file used to document — a non-ACL client still getting
+sinkhole replies and cache hits over Ethernet — was #87, and is fixed.
 
 ### 2. Shared-cache coherence
 

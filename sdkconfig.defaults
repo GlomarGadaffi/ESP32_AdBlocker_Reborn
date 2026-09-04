@@ -204,3 +204,27 @@ CONFIG_MBEDTLS_HAVE_TIME_DATE=y
 # PSRAM idle. TLS is not on the DNS query path unless DoT is on, and DoT holds
 # one persistent session, so the slower memory costs a handshake, not a query.
 CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y
+
+# ── Stack overflow detection ─────────────────────────────────────────
+# Two different mechanisms, both on deliberately:
+#
+# 1. Compiler stack canaries (-fstack-protector-strong). The DNS wire parser
+#    fills fixed-size stack buffers from remote-controlled bytes all over
+#    dns_server.cpp (char name[256] / target[256] / rname[256] / raw[256] in
+#    the label-decompression walks), and the same pattern repeats in
+#    blocklist.c norm[256], rewrite.c, acl.c, localzone.c. STRONG instruments
+#    any function with a local array or an address-taken local — every site
+#    above — at ~1-2% flash and negligible runtime. Note this DOES put a
+#    canary store+check on the hot per-query path: the wire-parse functions
+#    have array locals, so STRONG covers them. That is the point. ALL was not
+#    chosen because its only addition over STRONG is array-free leaf
+#    functions, which take no untrusted input and can't be overrun this way.
+#
+# 2. A debug watchpoint on the end of each task stack. CHECK_STACKOVERFLOW
+#    CANARY (already on) only notices at the NEXT context switch, so a task
+#    that blows its stack and faults immediately dies with an already-corrupt
+#    backtrace. The watchpoint traps on the storing instruction instead, which
+#    is the difference between a usable panic and a guess. Costs one of the
+#    CPU's debug watchpoint registers.
+CONFIG_COMPILER_STACK_CHECK_MODE_STRONG=y
+CONFIG_FREERTOS_WATCHPOINT_END_OF_STACK=y

@@ -23,6 +23,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstdarg>
+#include <cctype>
 #include <ctime>
 #include <inttypes.h>
 #include "timesync.h"
@@ -57,6 +58,8 @@ extern "C" void dns_sink_net_get_current(const char *iface,
                                           char *dns_ip, size_t dns_cap);
 extern "C" void dns_sink_reboot(void);
 extern "C" bool dns_sink_setup_ap_active(void);
+extern "C" const char *dns_sink_hostname(void);
+extern "C" const char *dns_sink_lan_ip(void);
 
 /* ── helpers ─────────────────────────────────────────────────────── */
 
@@ -629,7 +632,10 @@ static esp_err_t handle_status(httpd_req_t *r)
         "<button>Check</button></form><br>"
         "<form method=post action=/whitelist/add>"
         "<input name=domain placeholder='Add to whitelist' size=40>"
-        "<button>Whitelist</button></form><br>"
+        "<button>Whitelist</button></form>"
+        "<p><small>Blocked but not on any list? Hash collisions false-positive "
+        "roughly 1 domain in 350,000. Whitelisting is the fix &mdash; it is checked "
+        "ahead of the blocklist.</small></p>"
         "<a href='/log'>Query log</a> &nbsp; <a href='/top'>Top lists</a>"
         " &nbsp; <a href='/metrics'>Metrics JSON</a>"
         "<p><small>This tab auto-refreshes every 10s; the other tabs don't, so "
@@ -886,9 +892,9 @@ static esp_err_t handle_status(httpd_req_t *r)
         acl_list(acl_ips, &acl_n);
         page_appendf(page, sizeof(page), &n,
             "<h3>Client Access Control</h3>"
-            "<p><small>Empty = allow all. If any IP is listed, only those clients may resolve new names. "
-            "Note: on Ethernet, blocked and already-cached answers are served by the L2 fast path, "
-            "which does not check this list.</small></p>"
+            "<p><small>Empty = allow all. If any IP is listed, only those clients may resolve "
+            "anything — the Ethernet fast path enforces this list too (#87), and hands any query "
+            "it cannot clear to the socket path rather than answering it.</small></p>"
             "<form method=post action=/acl/add>"
             "<input name=ip placeholder='192.168.x.x' size=18>"
             "<button>Add allowed client</button></form>");
@@ -1068,6 +1074,12 @@ static esp_err_t handle_status(httpd_req_t *r)
     {
         bool dot_en = dot_is_enabled(); char dot_srv[64]="", dot_sni[64]="";
         dot_get(nullptr, dot_srv, dot_sni);
+        /* (#94) Both fields are attacker-settable through POST /dot/set and were
+         * interpolated raw into value="..." — a stored XSS that fired on every
+         * later view of this tab. Escaped like every other value rendered here. */
+        char safe_srv[sizeof(dot_srv) * 6], safe_sni[sizeof(dot_sni) * 6];
+        html_escape(safe_srv, sizeof(safe_srv), dot_srv);
+        html_escape(safe_sni, sizeof(safe_sni), dot_sni);
         page_appendf(page, sizeof(page), &n,
             "<h3>Upstream DNS (DoT)</h3>"
             "<form method=post action=/dot/set>"
@@ -1076,7 +1088,7 @@ static esp_err_t handle_status(httpd_req_t *r)
             "SNI: <input name=sni value=\"%s\" size=28><br>"
             "<small>Default: 1.1.1.1 / one.one.one.one &nbsp; or &nbsp; 9.9.9.9 / dns.quad9.net</small><br>"
             "<button>Save &amp; apply (restart DNS task)</button></form>",
-            dot_en ? " checked" : "", dot_srv, dot_sni);
+            dot_en ? " checked" : "", safe_srv, safe_sni);
 
         /* Split-horizon zones: names the router answers, never sent over DoT. */
         char zones[LOCALZONE_LIST_CAP]; localzone_get(zones, sizeof(zones));
@@ -1292,6 +1304,19 @@ static esp_err_t handle_dot_set(httpd_req_t *r)
     if (ps) { ps += 7; size_t l=0; char raw[64]={0}; for(;ps[l]&&ps[l]!='&'&&ps[l]!='\r'&&l<63;l++) raw[l]=ps[l]; url_decode(server,sizeof(server),raw,l); }
     const char *pn = strstr(body, "sni=");
     if (pn) { pn += 4; size_t l=0; char raw[64]={0}; for(;pn[l]&&pn[l]!='&'&&pn[l]!='\r'&&l<63;l++) raw[l]=pn[l]; url_decode(sni,sizeof(sni),raw,l); }
+    /* (#94) Defence in depth behind the escaping: neither field can legitimately
+     * hold anything but a dotted quad and a hostname, so reject the rest at the
+     * door instead of storing it in NVS and re-rendering it forever. */
+    unsigned o0, o1, o2, o3;
+    if (sscanf(server, "%u.%u.%u.%u", &o0, &o1, &o2, &o3) != 4 ||
+        o0 > 255 || o1 > 255 || o2 > 255 || o3 > 255) {
+        httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST, "bad server IP"); return ESP_FAIL;
+    }
+    for (const char *c = sni; *c; c++) {
+        if (!isalnum((unsigned char)*c) && *c != '.' && *c != '-') {
+            httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST, "bad SNI"); return ESP_FAIL;
+        }
+    }
     dot_set(enabled, server, sni);
     httpd_resp_set_status(r, "303 See Other"); httpd_resp_set_hdr(r, "Location", "/"); httpd_resp_send(r,nullptr,0); return ESP_OK;
 }
@@ -1789,8 +1814,16 @@ static esp_err_t handle_redirect(httpd_req_t *r)
     httpd_req_get_hdr_value_str(r, "Host", host, sizeof(host));
     char *colon = strchr(host, ':');
     if (colon) *colon = '\0';
+    /* (#112) Host is client-supplied and unauthenticated on this listener —
+     * echoing it into Location let an attacker redirect a LAN client to any
+     * origin. Only our own mDNS name or our own current LAN IP are honored;
+     * anything else falls back to the mDNS name, same as an empty Host. */
+    const char *lan_ip = dns_sink_lan_ip();
+    bool host_ok = host[0] &&
+        (strcasecmp(host, dns_sink_hostname()) == 0 ||
+         (lan_ip[0] && strcmp(host, lan_ip) == 0));
     static EXT_RAM_BSS_ATTR char loc[600];
-    snprintf(loc, sizeof(loc), "https://%s%s", host[0] ? host : "esp32adblock.local", r->uri);
+    snprintf(loc, sizeof(loc), "https://%s%s", host_ok ? host : dns_sink_hostname(), r->uri);
     httpd_resp_set_status(r, "301 Moved Permanently");
     httpd_resp_set_hdr(r, "Location", loc);
     httpd_resp_set_hdr(r, "Cache-Control", "no-store");

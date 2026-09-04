@@ -3,6 +3,7 @@ idf_component_register(
         "dns_sink.cpp"
         "dns_server.cpp"
         "blocklist.c"
+        "bl_table.c"
         "rewrite.c"
         "localzone.c"
         "dot.c"
