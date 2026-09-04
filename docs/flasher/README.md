@@ -119,15 +119,15 @@ Asset names are `<board>-<version>-<part>.bin`, where part is one of
 
 ```json
 {
-  "version": "1.1.0",
+  "version": "1.3.0",
   "boards": {
     "t-eth-elite": {
       "name": "LilyGO T-ETH-Elite",
       "parts": [
-        { "offset": 0,      "file": "t-eth-elite-1.1.0-bootloader.bin",       "role": "bootloader",      "size": 19904 },
-        { "offset": 32768,  "file": "t-eth-elite-1.1.0-partition-table.bin",  "role": "partition-table", "size": 3072 },
-        { "offset": 61440,  "file": "t-eth-elite-1.1.0-ota_data_initial.bin", "role": "ota-data",        "size": 8192 },
-        { "offset": 131072, "file": "t-eth-elite-1.1.0-app.bin",              "role": "app",             "size": 1187152 }
+        { "offset": 0,      "file": "t-eth-elite-1.3.0-bootloader.bin",       "role": "bootloader",      "size": 19904 },
+        { "offset": 32768,  "file": "t-eth-elite-1.3.0-partition-table.bin",  "role": "partition-table", "size": 3072 },
+        { "offset": 61440,  "file": "t-eth-elite-1.3.0-ota_data_initial.bin", "role": "ota-data",        "size": 8192 },
+        { "offset": 131072, "file": "t-eth-elite-1.3.0-app.bin",              "role": "app",             "size": 1239008 }
       ]
     },
     "waveshare-s3-eth": { "name": "Waveshare ESP32-S3-ETH", "parts": [ "..." ] }
