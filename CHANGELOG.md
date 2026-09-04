@@ -3,7 +3,7 @@
 All notable changes to ESP32_AdBlocker_Reborn. Versions follow SemVer; the
 firmware's `esp_app_desc` version string comes from `version.txt`.
 
-## [1.3.0] — 2026-08-31
+## [1.3.0] — 2026-09-04
 
 Blocklist storage moves to a bucket-split 40-bit format. Same memory, wider
 hashes, fewer probes — and it fixes a defect that had been invisible since the
