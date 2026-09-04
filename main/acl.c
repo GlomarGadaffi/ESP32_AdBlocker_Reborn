@@ -1,4 +1,5 @@
 #include "acl.h"
+#include "esp_attr.h"
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "esp_log.h"
@@ -121,6 +122,19 @@ void acl_list(char out[][20], uint32_t *count_inout)
             (unsigned)((s_ips[i]>>8)&0xFF),(unsigned)(s_ips[i]&0xFF));
     *count_inout = n;
     xSemaphoreGive(s_mutex);
+}
+
+/* IRAM_ATTR (#78): called from l2_input_cb, which must never fault to flash. */
+bool IRAM_ATTR acl_permits_nb(uint32_t client_ip_hbo)
+{
+    if (s_count == 0) return true;             /* no ACL configured — allow all */
+    if (!s_mutex) return false;
+    if (xSemaphoreTake(s_mutex, 0) != pdTRUE) return false;   /* busy → defer */
+    bool permit = false;
+    for (uint32_t i = 0; i < s_count; i++)
+        if (s_ips[i] == client_ip_hbo) { permit = true; break; }
+    xSemaphoreGive(s_mutex);
+    return permit;
 }
 
 bool acl_permits(uint32_t client_ip_hbo)

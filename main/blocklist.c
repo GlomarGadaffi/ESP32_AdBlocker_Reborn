@@ -147,6 +147,11 @@ bool blocklist_custom_set(const char *text)
     nvs_close(h);
     xSemaphoreTake(s_wl_mutex, portMAX_DELAY);
     custom_parse(text);
+    /* (#88) Custom rules are part of the verdict, so a rules edit has to
+     * invalidate answers cached under the previous set rather than wait them
+     * out. Bumped under the lock, so the new rules and the new generation
+     * become visible to the verdict paths together. */
+    blocklist_generation_bump();
     xSemaphoreGive(s_wl_mutex);
     return true;
 }
@@ -769,6 +774,11 @@ bool blocklist_whitelist_add(const char *domain)
         snprintf(s_whitelist[s_wl_count], sizeof(s_whitelist[0]), "%s", domain);
         s_wl_count++;
         ok = true;
+        /* (#88) A whitelist add flips the verdict for a name that may already
+         * be cached as BLOCKED. Bump the generation so every entry stored under
+         * the old rules re-validates, exactly as a blocklist reload does —
+         * without it the un-block only took effect when the TTL ran out. */
+        blocklist_generation_bump();
     }
     xSemaphoreGive(s_wl_mutex);
     if (ok) wl_save_nvs();
@@ -785,6 +795,7 @@ bool blocklist_whitelist_remove(const char *domain)
                     (s_wl_count - i - 1) * sizeof(s_whitelist[0]));
             s_wl_count--;
             found = true;
+            blocklist_generation_bump();   /* (#88) re-block takes effect now */
             break;
         }
     }

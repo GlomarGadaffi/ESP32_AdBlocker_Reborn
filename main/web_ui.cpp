@@ -23,6 +23,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstdarg>
+#include <cctype>
 #include <ctime>
 #include <inttypes.h>
 #include "timesync.h"
@@ -1073,6 +1074,12 @@ static esp_err_t handle_status(httpd_req_t *r)
     {
         bool dot_en = dot_is_enabled(); char dot_srv[64]="", dot_sni[64]="";
         dot_get(nullptr, dot_srv, dot_sni);
+        /* (#94) Both fields are attacker-settable through POST /dot/set and were
+         * interpolated raw into value="..." — a stored XSS that fired on every
+         * later view of this tab. Escaped like every other value rendered here. */
+        char safe_srv[sizeof(dot_srv) * 6], safe_sni[sizeof(dot_sni) * 6];
+        html_escape(safe_srv, sizeof(safe_srv), dot_srv);
+        html_escape(safe_sni, sizeof(safe_sni), dot_sni);
         page_appendf(page, sizeof(page), &n,
             "<h3>Upstream DNS (DoT)</h3>"
             "<form method=post action=/dot/set>"
@@ -1081,7 +1088,7 @@ static esp_err_t handle_status(httpd_req_t *r)
             "SNI: <input name=sni value=\"%s\" size=28><br>"
             "<small>Default: 1.1.1.1 / one.one.one.one &nbsp; or &nbsp; 9.9.9.9 / dns.quad9.net</small><br>"
             "<button>Save &amp; apply (restart DNS task)</button></form>",
-            dot_en ? " checked" : "", dot_srv, dot_sni);
+            dot_en ? " checked" : "", safe_srv, safe_sni);
 
         /* Split-horizon zones: names the router answers, never sent over DoT. */
         char zones[LOCALZONE_LIST_CAP]; localzone_get(zones, sizeof(zones));
@@ -1297,6 +1304,19 @@ static esp_err_t handle_dot_set(httpd_req_t *r)
     if (ps) { ps += 7; size_t l=0; char raw[64]={0}; for(;ps[l]&&ps[l]!='&'&&ps[l]!='\r'&&l<63;l++) raw[l]=ps[l]; url_decode(server,sizeof(server),raw,l); }
     const char *pn = strstr(body, "sni=");
     if (pn) { pn += 4; size_t l=0; char raw[64]={0}; for(;pn[l]&&pn[l]!='&'&&pn[l]!='\r'&&l<63;l++) raw[l]=pn[l]; url_decode(sni,sizeof(sni),raw,l); }
+    /* (#94) Defence in depth behind the escaping: neither field can legitimately
+     * hold anything but a dotted quad and a hostname, so reject the rest at the
+     * door instead of storing it in NVS and re-rendering it forever. */
+    unsigned o0, o1, o2, o3;
+    if (sscanf(server, "%u.%u.%u.%u", &o0, &o1, &o2, &o3) != 4 ||
+        o0 > 255 || o1 > 255 || o2 > 255 || o3 > 255) {
+        httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST, "bad server IP"); return ESP_FAIL;
+    }
+    for (const char *c = sni; *c; c++) {
+        if (!isalnum((unsigned char)*c) && *c != '.' && *c != '-') {
+            httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST, "bad SNI"); return ESP_FAIL;
+        }
+    }
     dot_set(enabled, server, sni);
     httpd_resp_set_status(r, "303 See Other"); httpd_resp_set_hdr(r, "Location", "/"); httpd_resp_send(r,nullptr,0); return ESP_OK;
 }

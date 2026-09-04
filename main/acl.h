@@ -20,6 +20,13 @@ void     acl_list(char out[][20], uint32_t *count_inout);
 /* Returns true if client should be allowed (ACL empty OR ip in list). */
 bool     acl_permits(uint32_t client_ip_hbo);
 
+/* Non-blocking variant for the L2 Ethernet fast path (#87). Returns true only
+ * when permission can be proven without waiting on the mutex; a denied client
+ * AND a busy lock both return false, and the caller must then defer the frame
+ * to lwIP, where the full acl_permits() runs and drops it if it really is
+ * denied. Never answers on its own authority when it cannot tell. */
+bool     acl_permits_nb(uint32_t client_ip_hbo);
+
 #ifdef __cplusplus
 }
 #endif

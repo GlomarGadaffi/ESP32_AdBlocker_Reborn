@@ -19,6 +19,31 @@ first release.
   permanently and silently broken sites for a typical household, with no
   diagnostic that would ever name the cause. Hashes are now 40-bit, putting the
   rate at ~1 in 350,000.
+- **ACL bypassed on the Ethernet fast path (#87).** A client excluded by the
+  ACL still received blocked verdicts and cached answers over Ethernet; only a
+  cold cache miss reached the ACL-protected socket path. The fast path now
+  requires provable permission and defers anything else to that path.
+- **Rewrite rules invisible to the Ethernet fast path (#102).** A name that was
+  both rewritten and blocklisted answered `0.0.0.0` over Ethernet UDP but the
+  configured address over TCP or Wi-Fi. The fast path now tests the rewrite
+  table in the socket path's order and defers on a match.
+- **Whitelist and custom-rule edits left stale cached verdicts (#88).** Only a
+  blocklist reload and pause/resume bumped the cache generation, so an un-block
+  took effect at TTL expiry rather than immediately. All three mutators now bump.
+- **Rewrite rules lost to the cache (#100).** Both socket paths consulted the
+  cache before the rewrite table, so a rule added after an answer was cached
+  stayed invisible for its whole TTL and the serve-stale refresh kept restoring
+  the pre-rewrite answer. The rewrite verdict is now taken first.
+- **L2 packet parser hardened (#106).** The Ethernet hook now validates the IP
+  version, total length, fragment flags and offset, and UDP length (DNS length
+  comes from the UDP header, not the padded frame), requires the frame to be
+  addressed to the device's own IP — it previously answered subnet-broadcast
+  queries, replying *from* the broadcast address — and rejects unusable source
+  addresses. QCLASS is now checked on all three paths; non-IN queries are
+  forwarded instead of being cached or sinkholed as IN.
+- **Stored XSS in the DoT server / SNI fields (#94).** Both were rendered
+  unescaped into `value="..."` on the Upstream tab. Now escaped, and validated
+  on input.
 - **Open redirect on `:80` via unvalidated `Host` header (#112).**
   `handle_redirect()` echoed the client-supplied `Host` header straight into
   `Location`; a crafted `Host` sent an unauthenticated LAN client to any

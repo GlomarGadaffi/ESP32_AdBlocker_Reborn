@@ -139,6 +139,94 @@ shifting the daily deadline.
 ---
 
 
+## Audit round 4 — the two verdict paths had drifted apart ✅
+
+The firmware answers a query from one of two places: the L2 Ethernet RX hook
+(`dns_sink.cpp`, `l2_input_cb`) or the lwIP socket loop (`dns_server.cpp`,
+dns_task). The rule the design rests on is that the fast path may only produce
+the verdict the socket path would, and must otherwise hand the frame over.
+This round found six places where that had stopped being true, plus the
+lingering web finding. All six are fixed in the same commit.
+
+### V1 — ACL not enforced on the L2 fast path ✅ (#87)
+`dns_sink.cpp` — `acl_permits()` guarded the socket path only. A client the
+ACL excludes still received blocked verdicts and forward-cache hits over
+Ethernet, because those never reached the socket; only a cold miss fell
+through to the ACL-protected path, so the ACL looked like it was working
+whenever the cache was cold.
+**Fix:** new `acl_permits_nb()` — a zero-wait take that returns true only when
+permission is *provable* without blocking. Denied and "lock busy" both return
+false and the hook defers to lwIP, where the full `acl_permits()` runs and
+drops the query if it really is denied.
+
+### V2 — rewrite rules invisible to the L2 fast path ✅ (#102)
+`dns_sink.cpp` — the socket path consults the rewrite table *before* the
+blocklist, so a name that is both rewritten and blocklisted answers with the
+configured address there. The L2 hook went straight to the blocklist and
+answered `0.0.0.0`, making the verdict depend on which transport the client
+happened to use — Ethernet UDP said `0.0.0.0`, TCP or Wi-Fi said the rewrite.
+**Fix:** new `rewrite_lookup_nb()` (zero-wait, tri-state: match / no match /
+can't tell). The hook tests it in the socket path's order and *defers* on a
+match, so the answer is still built by the single `build_rewrite_a()` rather
+than a second copy in IRAM. "Can't tell" defers too.
+
+### V3 — policy edits didn't invalidate cached verdicts ✅ (#88)
+`blocklist.c` — `blocklist_generation_bump()` fired on a blocklist reload and
+on pause/resume, but not on whitelist add/remove or a custom-rules edit. Both
+change the verdict for a name that may already sit in the cache under the
+opposite one, so an un-block (or a re-block) only took effect when the TTL ran
+out. **Fix:** all three mutators bump, under the same lock that publishes the
+new rules, so rules and generation become visible together.
+
+### V4 — rewrite verdict taken after the cache ✅ (#100)
+`dns_server.cpp` — both socket paths looked the name up in the cache first and
+only consulted `rewrite_lookup()` on a miss, so a rule added while an answer
+was cached stayed invisible for the rest of its TTL, and the serve-stale
+refresh kept re-storing the pre-rewrite answer indefinitely. A generation bump
+would *not* have closed this: an in-flight forward stamps its entry with the
+generation current at reply time, so the pre-rewrite answer lands stamped
+valid anyway. **Fix:** the rewrite verdict is taken before the cache lookup on
+both the UDP and TCP paths (`rw_pre`), which makes the cache irrelevant to a
+rewritten name by construction. The answer is still built at the original site,
+so there is still one `build_rewrite_a()` call per path.
+
+### V5 — L2 packet parser too trusting ✅ (#106)
+`dns_sink.cpp` — the hook validated the EtherType, IHL, protocol and dst port
+and then treated everything after as a DNS message. It did not check the IP
+version nibble, the IP total length, the fragment flags/offset, the UDP length,
+or the destination address; DNS length came from the *frame* length, so
+Ethernet's pad-to-60 counted as payload. The destination gap was the worst of
+them: a query sent to the subnet broadcast was answered, and since the hook
+swaps the addresses back, the reply went out *from* the broadcast address.
+**Fix:** version nibble; `iptot` bounds-checked against `ihl+8` and the frame;
+`(flags|offset) & 0x3FFF == 0`; `udplen` bounds-checked and used to derive
+`dns_len`; destination must equal our own Ethernet address (kept in binary as
+`s_eth_ip_nbo`, cleared on link loss so the hook defers while down); source
+must not be 0.0.0.0, 255.255.255.255 or 224/4. Every check `break`s, i.e.
+defers to lwIP — the hook never drops a frame it declines to answer.
+
+### V6 — QCLASS never checked, on either path ✅ (#106)
+`dns_server.cpp` had an explicit `-- always IN(1), skip check` comment. A
+CH/HS/ANY-class query was therefore served out of the IN-keyed cache, or
+sinkholed with an IN answer record. **Fix:** both socket paths read QCLASS and
+skip cache/rewrite/blocklist for anything but IN, forwarding it instead; the L2
+hook gates on class IN and defers the rest here Forwarding alone was not
+enough — the cache key and the single-flight join key are both class-blind, so
+a non-IN flight now carries `no_cache` and is neither cached on reply nor
+joinable; without that a CH answer would still reach a later IN query for the
+same name and type.
+
+### V7 — stored XSS in the DoT server / SNI fields ✅ (#94)
+`web_ui.cpp:1084` — both fields are set through `POST /dot/set` and were
+interpolated raw into `value="%s"` on the Upstream tab, so a payload stored in
+NVS fired on every later view. Every other user-supplied value on the page was
+already escaped; these two were missed. **Fix:** `html_escape()` on both, plus
+input validation in `handle_dot_set` (dotted quad with octets ≤ 255; SNI
+restricted to `[A-Za-z0-9.-]`) so the value never reaches NVS in the first
+place.
+
+---
+
 ## Verified correct during the audit (no change needed)
 - DNS wire parsing bounds — `extract_qname`, `l2_qname`, `skip_name` validate
   label lengths, reserved bits (#42), compression-pointer 2nd-byte bounds (#27),
