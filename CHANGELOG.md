@@ -19,6 +19,18 @@ first release.
   permanently and silently broken sites for a typical household, with no
   diagnostic that would ever name the cause. Hashes are now 40-bit, putting the
   rate at ~1 in 350,000.
+- **Open redirect on `:80` via unvalidated `Host` header (#112).**
+  `handle_redirect()` echoed the client-supplied `Host` header straight into
+  `Location`; a crafted `Host` sent an unauthenticated LAN client to any
+  origin. Now restricted to `dns_sink_hostname()` or the device's own current
+  LAN IP, with the mDNS name as the fallback.
+- **Truncated compression pointer accepted in `skip_name()` (#113).** A
+  pointer byte at `len - 1` was followed 2 bytes anyway, one past the packet.
+  `dns_resp_min_ttl()`'s direct call site had no caller-side bounds check to
+  catch it. Now refused before advancing.
+- **Non-reentrant static parse buffer in `l2_qname()` (#114).** `static char
+  raw[256]` was mutable shared state on the Ethernet RX worker task. Now
+  stack-allocated.
 
 ### Changed
 

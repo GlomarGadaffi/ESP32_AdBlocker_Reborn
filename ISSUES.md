@@ -92,9 +92,9 @@ assumption documented; no change.
 ### M5 — esp_tls handle lifecycle ☑️
 `dot.c` — every error path calls `esp_tls_conn_destroy(tls)`. Verified no leak.
 
-### M6 — Open redirect on port 80 via unvalidated Host header ⬜ (#112)
+### M6 — Open redirect on port 80 via unvalidated Host header ✅ (#112)
 `web_ui.cpp:1790-1802` — `handle_redirect()` reads the HTTP `Host` header directly into `Location: https://%s%s` without validation. A request sent with an arbitrary `Host` header redirects LAN users to an external origin.
-**Fix:** restrict redirect target to `dns_sink_hostname()`, matching `.local` names, or the incoming interface IP.
+**Fix:** `handle_redirect()` now accepts only `dns_sink_hostname()` or the new `dns_sink_lan_ip()` (case-insensitive host match); anything else falls back to the mDNS name, same as an empty Host.
 
 
 ---
@@ -128,13 +128,13 @@ exactly one interval each cycle (`next_us += interval`), so reload duration no
 longer pushes the schedule; a manual `/reload` fires immediately without
 shifting the daily deadline.
 
-### L6 — Truncated 1-byte compression pointer accepted in skip_name ⬜ (#113)
+### L6 — Truncated 1-byte compression pointer accepted in skip_name ✅ (#113)
 `dns_server.cpp:539-549` — when `skip_name()` encounters `(b & 0xC0) == 0xC0` at the very last byte of a packet (`*off == len - 1`), it unconditionally advances `(*off) += 2` without checking `*off + 1 < len` and returns `true`.
-**Fix:** check `if (*off + 1 >= len) return false;` before advancing.
+**Fix:** `if (*off + 1 >= len) return false;` before advancing.
 
-### L7 — Non-reentrant static buffer in l2_qname parser ⬜ (#114)
+### L7 — Non-reentrant static buffer in l2_qname parser ✅ (#114)
 `dns_sink.cpp:1099` — `l2_qname()` declares `static char raw[256]`. While serialized on the Ethernet RX worker task, static mutable parser state in low-level IRAM violates reentrancy.
-**Fix:** allocate `char raw[256]` on the stack.
+**Fix:** `raw[256]` is now stack-allocated.
 
 ---
 

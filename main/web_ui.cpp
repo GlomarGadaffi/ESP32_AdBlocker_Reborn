@@ -57,6 +57,8 @@ extern "C" void dns_sink_net_get_current(const char *iface,
                                           char *dns_ip, size_t dns_cap);
 extern "C" void dns_sink_reboot(void);
 extern "C" bool dns_sink_setup_ap_active(void);
+extern "C" const char *dns_sink_hostname(void);
+extern "C" const char *dns_sink_lan_ip(void);
 
 /* ── helpers ─────────────────────────────────────────────────────── */
 
@@ -1792,8 +1794,16 @@ static esp_err_t handle_redirect(httpd_req_t *r)
     httpd_req_get_hdr_value_str(r, "Host", host, sizeof(host));
     char *colon = strchr(host, ':');
     if (colon) *colon = '\0';
+    /* (#112) Host is client-supplied and unauthenticated on this listener —
+     * echoing it into Location let an attacker redirect a LAN client to any
+     * origin. Only our own mDNS name or our own current LAN IP are honored;
+     * anything else falls back to the mDNS name, same as an empty Host. */
+    const char *lan_ip = dns_sink_lan_ip();
+    bool host_ok = host[0] &&
+        (strcasecmp(host, dns_sink_hostname()) == 0 ||
+         (lan_ip[0] && strcmp(host, lan_ip) == 0));
     static EXT_RAM_BSS_ATTR char loc[600];
-    snprintf(loc, sizeof(loc), "https://%s%s", host[0] ? host : "esp32adblock.local", r->uri);
+    snprintf(loc, sizeof(loc), "https://%s%s", host_ok ? host : dns_sink_hostname(), r->uri);
     httpd_resp_set_status(r, "301 Moved Permanently");
     httpd_resp_set_hdr(r, "Location", loc);
     httpd_resp_set_hdr(r, "Cache-Control", "no-store");

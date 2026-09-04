@@ -541,7 +541,14 @@ static bool skip_name(const uint8_t *pkt, int len, int *off)
     while (*off < len) {
         uint8_t b = pkt[*off];
         if (b == 0)          { (*off)++;        return true; }
-        if ((b & 0xC0) == 0xC0) { (*off) += 2; return true; }
+        /* (#113) A compression pointer is 2 bytes; at len-1 only its first
+         * byte exists. Advancing by 2 anyway pushed *off one past len — the
+         * caller's own `off > len` guards catch that on the next name, but a
+         * bare call site (dns_resp_min_ttl above) doesn't, so refuse here. */
+        if ((b & 0xC0) == 0xC0) {
+            if (*off + 1 >= len) return false;
+            (*off) += 2; return true;
+        }
         if ((b & 0xC0) != 0) return false;     /* reserved label length */
         *off += 1 + b;
     }

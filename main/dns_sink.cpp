@@ -878,6 +878,11 @@ extern "C" void dns_sink_setup_ap_passphrase(char *out, size_t cap) { if (cap) o
  * "browse to" hints. */
 extern "C" const char *dns_sink_hostname(void) { return MDNS_HOSTNAME ".local"; }
 
+/* This device's current LAN-facing address, Ethernet preferred (matches the
+ * dashboard's own precedence at line ~1407) — used by the :80 redirect
+ * handler (#112) to validate the Host header before echoing it back. */
+extern "C" const char *dns_sink_lan_ip(void) { return s_ip[0] ? s_ip : s_wifi_ip; }
+
 /* ── W5500 init (board pin map selected above) ───────────────────── */
 static esp_eth_handle_t eth_init_w5500(void)
 {
@@ -1096,7 +1101,11 @@ extern "C" uint32_t dns_sink_l2_cached(void)  { return s_l2_cached; }
  * IRAM_ATTR (#78): called from l2_input_cb, which must never fault to flash. */
 static int IRAM_ATTR l2_qname(const uint8_t *dns, int dns_len, char *out, size_t cap, size_t *outlen)
 {
-    static char raw[256];
+    /* (#114) Was `static`: mutable parser state shared across calls on the
+     * Ethernet RX worker task is a reentrancy hazard even though callers are
+     * currently serialized. Stack-allocated — 256 bytes is cheap next to the
+     * IRAM_ATTR budget this function already accepts. */
+    char raw[256];
     int off = 12; size_t rl = 0;
     while (off < dns_len && dns[off] != 0) {
         uint8_t l = dns[off];
