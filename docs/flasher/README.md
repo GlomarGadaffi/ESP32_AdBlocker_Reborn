@@ -69,16 +69,23 @@ own machine.
    fails — falls back to the manual picker, and the user can always override the
    detection anyway.
 
-3. **Fetch the release.** The page calls
-   `https://api.github.com/repos/GlomarGadaffi/ESP32_AdBlocker_Reborn/releases/latest`,
-   finds the `manifest.json` asset, and fetches it via `browser_download_url`.
-   Both work as plain unauthenticated `fetch` calls: the API sends CORS headers,
-   and asset downloads redirect to `objects.githubusercontent.com`, which sends
-   `Access-Control-Allow-Origin: *`.
+3. **Fetch the release — from this site, not from the GitHub API.** The page
+   reads `../firmware/index.json`, takes the entry named by its `latest` field,
+   and resolves every image to `../firmware/<version>/<file>`.
 
-   Missing release, missing manifest, and the unauthenticated 60-requests-per-hour
-   rate limit are all handled as explained states that steer the user to the
-   local-file panel, not as a dead page.
+   > **Why not the API?** It used to call `releases/latest` and fetch each image
+   > from its asset's `browser_download_url`, on the stated assumption that
+   > asset downloads redirect to a host sending `Access-Control-Allow-Origin: *`.
+   > **They do not.** The redirect lands on `release-assets.githubusercontent.com`
+   > and carries no CORS headers at all, so every download failed. The API itself
+   > *is* CORS-enabled, so listing the release worked and only the downloads
+   > failed — the page looked healthy right up until someone pressed **Flash**
+   > (#116). `tools/make-release.ps1` now stages each release into
+   > `docs/firmware/<version>/`, which is same-origin with this page.
+
+   A missing index and a missing manifest are handled as explained states that
+   steer the user to the local-file panel, not as a dead page. The API rate limit
+   is no longer reachable, because the page no longer calls the API.
 
 4. **Flash.** Every image is downloaded *before* the first byte is written, so a
    network failure can't leave the board half-written. `writeFlash` is called with
@@ -110,8 +117,14 @@ toolchain's flasher.
 ## Release contract
 
 `tools/make-release.ps1` produces everything the page consumes. Run it after
-building both boards, then attach the whole `release/` directory to a GitHub
-Release; the page always reads whichever release is *latest*.
+building both boards; it writes `release/` for the GitHub Release **and** stages
+the subset the page fetches into `docs/firmware/<version>/`, refreshing
+`docs/firmware/index.json`.
+
+Attach the whole `release/` directory to a GitHub Release, and commit
+`docs/firmware/` — that commit is what makes the version live in the browser
+flasher. The Release stays the source of truth and keeps every asset; Pages
+carries only the `.bin` images and `manifest.json`.
 
 Asset names are `<board>-<version>-<part>.bin`, where part is one of
 `bootloader`, `partition-table`, `ota_data_initial`, `app`. Alongside them,

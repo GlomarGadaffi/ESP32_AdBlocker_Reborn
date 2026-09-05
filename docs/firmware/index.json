@@ -1,0 +1,48 @@
+{
+  "latest": "1.3.0",
+  "releases": [
+    {
+      "version": "1.3.0",
+      "tag": "v1.3.0",
+      "date": "2026-09-04",
+      "files": [
+        {
+          "name": "manifest.json",
+          "size": 1647
+        },
+        {
+          "name": "t-eth-elite-1.3.0-app.bin",
+          "size": 1239008
+        },
+        {
+          "name": "t-eth-elite-1.3.0-bootloader.bin",
+          "size": 19904
+        },
+        {
+          "name": "t-eth-elite-1.3.0-ota_data_initial.bin",
+          "size": 8192
+        },
+        {
+          "name": "t-eth-elite-1.3.0-partition-table.bin",
+          "size": 3072
+        },
+        {
+          "name": "waveshare-s3-eth-1.3.0-app.bin",
+          "size": 1238800
+        },
+        {
+          "name": "waveshare-s3-eth-1.3.0-bootloader.bin",
+          "size": 19904
+        },
+        {
+          "name": "waveshare-s3-eth-1.3.0-ota_data_initial.bin",
+          "size": 8192
+        },
+        {
+          "name": "waveshare-s3-eth-1.3.0-partition-table.bin",
+          "size": 3072
+        }
+      ]
+    }
+  ]
+}

@@ -244,6 +244,54 @@ Get-ChildItem -LiteralPath $OutDir | ForEach-Object {
     Write-Host ("  {0,-44} {1,9:N0} bytes" -f $_.Name, $_.Length)
 }
 
+# ---------------------------------------------------------------------------
+# Same-origin copy for the browser flasher.
+#
+# A browser cannot fetch a GitHub Release asset: browser_download_url 302s to
+# release-assets.githubusercontent.com, and neither the redirect nor the final
+# response sets Access-Control-Allow-Origin, so every download fails CORS.
+# api.github.com *is* CORS-enabled, so listing the release worked and only the
+# downloads failed — the page looked healthy until someone pressed Flash (#116).
+#
+# Publishing the same files under docs/ puts them on the origin that already
+# serves the flasher. The Release stays the source of truth and keeps every
+# asset; Pages carries only what the page actually downloads.
+# ---------------------------------------------------------------------------
+$PagesDir = Join-Path $RepoRoot "docs\firmware\$Version"
+if (Test-Path $PagesDir) { Remove-Item -Recurse -Force $PagesDir }
+New-Item -ItemType Directory -Force -Path $PagesDir | Out-Null
+
+$pagesFiles = @()
+foreach ($f in (Get-ChildItem -LiteralPath $OutDir -File | Sort-Object Name)) {
+    # Only the images and the manifest; nothing else is fetched by the page.
+    if ($f.Extension -notin @('.bin', '.json')) { continue }
+    Copy-Item -LiteralPath $f.FullName -Destination (Join-Path $PagesDir $f.Name) -Force
+    $pagesFiles += [ordered]@{ name = $f.Name; size = $f.Length }
+}
+
+$indexPath = Join-Path (Split-Path -Parent $PagesDir) 'index.json'
+$index = [ordered]@{
+    latest   = $Version
+    releases = @(
+        [ordered]@{
+            version = $Version
+            tag     = "v$Version"
+            date    = (Get-Date -Format 'yyyy-MM-dd')
+            files   = $pagesFiles
+        }
+    )
+}
+# No BOM: the flasher parses this with response.json().
+[System.IO.File]::WriteAllText(
+    $indexPath,
+    ($index | ConvertTo-Json -Depth 8),
+    (New-Object System.Text.UTF8Encoding($false)))
+
+Write-Host ''
+Write-Host "Staged $($pagesFiles.Count) files for the browser flasher:" -ForegroundColor Cyan
+Write-Host "  docs/firmware/$Version/  (+ docs/firmware/index.json)"
+Write-Host '  Commit and push these with the release so the flasher can reach them.'
+
 Write-Host ''
 Write-Host 'Next step — create the GitHub Release (not run for you):' -ForegroundColor Cyan
 Write-Host ''
@@ -251,5 +299,7 @@ Write-Host ''
 # expand them itself, so "release/*" would reach gh literally. Expand it here.
 Write-Host "  gh release create v$Version (Get-ChildItem release\* | ForEach-Object FullName) --title `"v$Version`" --generate-notes" -ForegroundColor White
 Write-Host ''
-Write-Host 'The browser flasher at docs/flasher/ reads manifest.json from whichever'
-Write-Host 'release is "latest", so publishing this release is what makes it live.'
+Write-Host 'The browser flasher reads docs/firmware/index.json from this site, not'
+Write-Host 'from the Release (a browser cannot fetch Release assets — no CORS headers).'
+Write-Host 'Commit and push docs/firmware/ to make this version live in the flasher;'
+Write-Host 'the GitHub Release is still the source of truth and carries every asset.'

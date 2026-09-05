@@ -380,7 +380,20 @@ footer { color: var(--text-dim); font-size: .86rem; text-align: center; margin-t
 // ---------------------------------------------------------------------------
 
 const REPO = "GlomarGadaffi/ESP32_AdBlocker_Reborn";
-const RELEASE_API = `https://api.github.com/repos/${REPO}/releases/latest`;
+
+// Firmware comes from this origin, not from the GitHub Release.
+//
+// A browser cannot fetch a Release asset: browser_download_url 302s to
+// release-assets.githubusercontent.com, and neither the redirect nor the final
+// response sets Access-Control-Allow-Origin. api.github.com *is* CORS-enabled,
+// so listing the release succeeded and only the downloads failed — the page
+// looked healthy right up until someone pressed Flash (#116).
+//
+// tools/make-release.ps1 stages each release into docs/firmware/<version>/ and
+// writes this index, so everything below is same-origin and CORS never applies.
+// Relative to docs/flasher/, hence ../ — the page is one level down from the
+// Pages root.
+const FIRMWARE_INDEX = "../firmware/index.json";
 
 // Board ids must match ADBLOCK_BOARD_TAG in CMakeLists.txt, the keys in
 // tools/make-release.ps1, and the "boards" keys in the release manifest.
@@ -580,23 +593,30 @@ async function loadRelease() {
     // The API sends CORS headers, and release asset downloads redirect to
     // objects.githubusercontent.com which sends Access-Control-Allow-Origin: *,
     // so both of these work as plain unauthenticated fetches.
-    const res = await fetch(RELEASE_API, { headers: { Accept: "application/vnd.github+json" } });
-
+    // no-cache: re-publishing a version overwrites the same paths.
+    const res = await fetch(FIRMWARE_INDEX, { cache: "no-cache" });
     if (res.status === 404) throw new Error("no-release");
-    if (res.status === 403) throw new Error("rate-limited");
-    if (!res.ok) throw new Error(`GitHub API returned ${res.status}`);
+    if (!res.ok) throw new Error(`firmware index returned ${res.status}`);
 
-    const rel = await res.json();
-    const assets = new Map((rel.assets || []).map((a) => [a.name, a.browser_download_url]));
+    const index = await res.json();
+    const rel = (index.releases || []).find((r) => r.version === index.latest)
+                || (index.releases || [])[0];
+    if (!rel) throw new Error("no-release");
+
+    const base = `../firmware/${encodeURIComponent(rel.version)}`;
+    const assets = new Map((rel.files || []).map(
+      (f) => [f.name, `${base}/${encodeURIComponent(f.name)}`]));
 
     const manifestUrl = assets.get("manifest.json");
-    if (!manifestUrl) throw new Error(`Release ${rel.tag_name} has no manifest.json asset.`);
+    if (!manifestUrl) throw new Error(`Release ${rel.tag} has no manifest.json.`);
 
-    const mRes = await fetch(manifestUrl);
+    const mRes = await fetch(manifestUrl, { cache: "no-cache" });
     if (!mRes.ok) throw new Error(`Could not download manifest.json (${mRes.status}).`);
     const manifest = await mRes.json();
 
-    state.release = { tag: rel.tag_name, version: manifest.version, manifest, assets, url: rel.html_url };
+    // The Release page is metadata only; nothing on the flash path needs github.com.
+    state.release = { tag: rel.tag, version: manifest.version, manifest, assets,
+                      url: `https://github.com/${REPO}/releases/tag/${encodeURIComponent(rel.tag)}` };
     renderRelease();
   } catch (err) {
     state.releaseError = err;
@@ -624,14 +644,9 @@ function renderRelease() {
     return;
   } else if (err.message === "no-release") {
     body = `<p style="margin-bottom:6px"><strong>No release published yet.</strong></p>
-            <p class="muted" style="margin-bottom:0">There's nothing to download for this repository yet, so one-click flashing isn't available.
+            <p class="muted" style="margin-bottom:0">No release has been published to this site yet, so one-click flashing isn't available.
             You can still use <em>Flash your own build</em> below with images you built locally.</p>`;
     line.textContent = "No release available.";
-  } else if (err.message === "rate-limited") {
-    body = `<p style="margin-bottom:6px"><strong>GitHub rate-limited this browser.</strong></p>
-            <p class="muted" style="margin-bottom:0">Unauthenticated API requests are capped at 60 per hour per IP. Wait a while and reload,
-            or use <em>Flash your own build</em> below.</p>`;
-    line.textContent = "Couldn't reach GitHub.";
   } else {
     body = `<p style="margin-bottom:6px"><strong>Couldn't load the release.</strong></p>
             <p class="muted" style="margin-bottom:0">${err.message} &mdash; you can still use <em>Flash your own build</em> below.</p>`;
