@@ -1145,9 +1145,19 @@ static void download_task(void *)
 static uint32_t s_l2_blocked = 0;   /* L2-handled blocked queries (bypassed lwIP) */
 static uint32_t s_l2_cached  = 0;   /* L2-handled forward-cache hits (bypassed lwIP) */
 static uint32_t s_l2_tx_fail = 0;   /* esp_eth_transmit() refused a fast-path reply (#101) */
+/* (#77) Every frame the hook hands to lwIP unanswered — DNS or not. Proof the
+ * *link* is alive and frames are arriving, independent of whether dns_task's
+ * own sockets are making any progress: the socket-path watchdog in
+ * dns_server.cpp compares this counter's movement against its own query
+ * counter to tell "link down, nothing to do" apart from "link fine, queries
+ * arriving, dns_task's sockets are wedged." Only incremented on Ethernet
+ * boards (this hook doesn't exist on the Wi-Fi-only build); the getter below
+ * is unconditional so dns_server.cpp needs no #ifdef to call it. */
+static uint32_t s_l2_fallthrough = 0;
 extern "C" uint32_t dns_sink_l2_tx_fail(void) { return s_l2_tx_fail; }
 extern "C" uint32_t dns_sink_l2_blocked(void) { return s_l2_blocked; }
 extern "C" uint32_t dns_sink_l2_cached(void)  { return s_l2_cached; }
+extern "C" uint32_t dns_sink_l2_fallthrough(void) { return s_l2_fallthrough; }
 
 /* Parse question qname → normalized name; return qend offset within DNS msg.
  * IRAM_ATTR (#78): called from l2_input_cb, which must never fault to flash. */
@@ -1333,6 +1343,7 @@ static esp_err_t IRAM_ATTR l2_input_cb(esp_eth_handle_t h, uint8_t *buf, uint32_
         return ESP_OK;
     } while (0);
 
+    s_l2_fallthrough++;   /* (#77) every `break` above lands here — link is alive */
     return esp_netif_receive((esp_netif_t *)priv, buf, len, NULL);
 }
 #endif /* CONFIG_ADBLOCK_NET_ETH — L2 fast-path hook */

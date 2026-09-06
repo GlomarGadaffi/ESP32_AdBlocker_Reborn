@@ -102,6 +102,9 @@ A single JSON object. Field names are exactly as emitted.
 | `l2_blocked` | int | Blocked replies sent straight from the Ethernet RX hook. |
 | `l2_cached` | int | Forward-cache hits sent straight from the Ethernet RX hook. |
 | `l2_tx_fail` | int | Fast-path replies `esp_eth_transmit()` refused (#101). |
+| `l2_fallthrough` | int | Frames the L2 hook handed to lwIP unanswered — DNS or not. Proof the link is alive, independent of whether `dns_task`'s own sockets are progressing (#77). |
+| `wd_restarts` | int | Times the socket-path watchdog (#77) recreated `csock`/`usock` because wire traffic was arriving with no query progress for ~2s. Not reset by `/metrics/reset` (same convention as the `l2_*` counters). |
+| `case_mismatch` | int | DNS 0x20 (#72): replies whose question section didn't echo the exact case we sent. Observability only — never rejected; see `process_reply()`'s H2 check for why a hard reject isn't safe without first proving this stays ~0 against the real configured upstream. |
 | `cache_probes` | int | Forward-cache lookups. |
 | `cache_hits` | int | Forward-cache hits. |
 | `cache_hit_rate` | float | `cache_hits / cache_probes` as a percentage, one decimal. |
