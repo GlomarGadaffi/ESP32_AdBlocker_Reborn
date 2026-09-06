@@ -1018,3 +1018,25 @@ the bypass entry immediately restored blocking for the first client too;
 randomization (this same session's #72 work) composed correctly with the
 bypass-forwarded queries with no interaction issues (visible randomized case
 in the bypassed client's own resolved names).
+
+**Bug found live on real production hardware: #77's watchdog false-tripped on its
+very first real-world boot.** Flashed today's build to the LilyGo (household
+board) for the first time — a full reflash, its own first exposure to the new
+partition table — and `wd_restarts` read `1` moments after boot, with DNS
+otherwise working correctly. Root cause: right after boot, ordinary household
+broadcast/ARP/mDNS traffic from other LAN devices keeps `l2_fallthrough`
+moving before this board's own first DNS query happens to land; with
+`s_cnt_total` still at its initial `0`, that reads identically to "traffic
+arriving, no query progress" and fires the watchdog on a board that was never
+actually wedged. Harmless in itself — the create-before-close design made the
+false recreate a no-op, confirmed by queries immediately after still
+resolving correctly — but not the failure mode this check exists to catch.
+**Fix:** gate the whole stall-detection on having served at least one query
+since boot (`s_wd_ever_served`, set the first time `s_cnt_total > 0`). A
+stall on a socket that has never successfully answered anything isn't the
+"was fine, now stuck" case #77 targets; once the first real query lands, full
+sensitivity to a genuine later stall is unchanged. The Waveshare test-boots
+(an isolated bench setup with much less ambient broadcast traffic) never
+tripped this — a good argument for testing resilience features against
+genuinely noisy production conditions, not just a quiet test board, before
+calling them done.
