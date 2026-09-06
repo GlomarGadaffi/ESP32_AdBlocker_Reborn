@@ -777,6 +777,11 @@ globally paused. The lesson is that "the answer did not change" and "the code
 did not run" are not the same claim, and the latency was the only evidence that
 separated them.
 
+**H-new-2 — H-new's fix only covered a paused client's own name being blocked, not a CNAME chain that cloaks to one. ✅ (2026-09-05, #74 Part 2)**
+`dns_server.cpp` — `ue->paused` was set from `fwd_no_cache`, and `fwd_no_cache` only went true when `is_blk && paused_client`: the *direct* queried name was on the blocklist while the client was paused. If the direct name is allowed but its upstream answer CNAMEs to a blocklisted target, `is_blk` is false, so `ue->paused` never went true, and the cloaking check (`cloaked = !ue->paused && cname_chain_is_blocked(...)`) fired anyway — reproducible with one client, no coalescing, and independent of #117's rule-exception work. Found while rewriting the roadmap epic (#64) against current code, verified directly by reading `process_reply()`.
+**Fix:** `fwd_no_cache`/`tcp_no_cache` are now set from `paused_client` alone, unconditionally, at the top of each request — not gated on the direct-block verdict. The remaining `if (paused_client) { if (is_blk) cache_store_blocked(...); is_blk = false; }` only decides whether to record a BLOCKED verdict for everyone else's benefit; it no longer decides isolation. The TCP path had a second instance of the same bug reachable even on a cache hit: routing into the "recompute" branch via `ce->blocked && paused_client` (a cached CNAME-cloaked block) recomputed `is_blk` from the direct name alone and never set `tcp_no_cache`; fixed the same way, by forcing `is_blk = false` whenever `paused_client` is true regardless of which path led there.
+**Not yet fixed, tracked separately (#74 Part 2 / #117):** `UpstreamEntry.paused` is one flag on the shared flight, not per-waiter — a paused client's query never joins or is joined by another flight (this fix keeps that true unconditionally), so today's fix is correct for the single-client and coalesced-with-other-paused-clients cases, but per-waiter state for a *mixed* paused/non-paused coalescing group still does not exist.
+
 **Feature: generic ESP32-S3 Wi-Fi-only target (closes #49).** A third
 `ADBLOCK_BOARD` choice with a derived `ADBLOCK_NET_ETH` symbol gating the W5500
 bring-up, the L2 RX hook and the SD mount. `BLOCKLIST_CAPACITY` becomes a
