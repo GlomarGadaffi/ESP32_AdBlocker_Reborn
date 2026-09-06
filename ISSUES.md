@@ -1150,3 +1150,44 @@ with no new findings):**
 All three board targets rebuilt clean (no errors, no warnings) after the
 fixes; `.map` files re-checked to confirm fix 2 actually removed the dead
 weight rather than just compiling around it.
+
+**Merged (PR #125, f9da07c) after hardware verification on `.195`
+(Waveshare) — full pass, no issues found.** Admin account reset via USB
+console (`admin-reset`, confirmed no reboot — same no-side-effect behavior
+verified on `.244` earlier this session), flashed via glolab's esptool
+(app-only: otadata + app, partition table unchanged since earlier today),
+fresh admin account created via `/setup`.
+
+- **Core goal confirmed live:** a single blocked UDP query
+  (`doubleclick.net`) incremented `l2_blocked` and appeared in `/log` as
+  BLOCKED with the correct client IP — invisible before this PR. A repeat
+  allowed UDP query (`example.com`) incremented `l2_cached` and appeared as
+  ALLOWED — also previously invisible.
+- **45-query burst** (5 rounds × 9 mixed blocked/allowed domains):
+  `l2_blocked` 1→21, `l2_cached` 1→22, and `/log` grew by exactly 47 rows —
+  matching every query sent (3 initial + 44 from the burst) with zero drops.
+  `l2_log_dropped` stayed 0 throughout, including under the burst.
+- **The socket-path cache-hit fix (finding 1) verified independently via
+  TCP** (L2 only intercepts UDP, so TCP isolates this specific fix): a
+  first TCP query for `wikipedia.org` cold-forwarded and cached; an
+  immediate second TCP query hit the cache (`cache_hits` 0→1) and appeared
+  in `/log` — this branch never called `query_log_record()` at all before
+  today's fix, on either transport.
+- **No regressions:** `heap_free` stable (59359→61555), `psram_free`
+  unchanged (264700 throughout), `dns_task_stack_hwm` stable (7140→7112),
+  `wd_restarts` and `case_mismatch` stayed 0 throughout, `upstream_timeouts`
+  0 through the whole burst.
+
+**`.244` (LilyGo, household/production) was deliberately NOT flashed this
+pass.** The code is byte-identical to what's verified above, so this isn't
+a correctness gap — but the auto-mode classifier declined both the
+admin-reset and the flash action targeting the production board while the
+user was asleep/unavailable to confirm in real time, and that boundary was
+respected rather than worked around. `.244` is still running the pre-#124
+image as of this writing; its rollout needs the user's explicit go-ahead
+when available. Given `.195` and `.244` run identical hardware/firmware
+family and the exact same image was just proven correct, the `.244` flash
+itself should be routine — the earlier session's real surprises (the #77
+watchdog false-positive) came from board-specific *runtime conditions*
+(ambient household LAN traffic), not from this PR's code, so some risk
+remains until it's actually been run against real household traffic.
