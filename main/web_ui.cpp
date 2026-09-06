@@ -6,6 +6,7 @@
 #include "domain.h"
 #include "rewrite.h"
 #include "acl.h"
+#include "bypass.h"
 #include "pause.h"
 #include "dot.h"
 #include "localzone.h"
@@ -1000,6 +1001,36 @@ static esp_err_t handle_status(httpd_req_t *r)
         }
     }
 
+    /* Per-client bypass list (#74 Part 2) */
+    {
+        char byp_ips[BYPASS_MAX][20]; uint32_t byp_n = BYPASS_MAX;
+        bypass_list(byp_ips, &byp_n);
+        page_appendf(page, sizeof(page), &n,
+            "<h3>Per-Client Bypass</h3>"
+            "<p><small>Listed clients always resolve unfiltered — no blocklist, no "
+            "custom rules, applied the same way the timed pause is (delivery-time, "
+            "never cached), over both Ethernet and Wi-Fi.</small></p>"
+            "<form method=post action=/bypass/add>"
+            "<input name=ip placeholder='192.168.x.x' size=18>"
+            "<button>Add bypassed client</button></form>");
+        if (byp_n > 0) {
+            page_appendf(page, sizeof(page), &n, "<table><tr><th>Bypassed client IP</th><th>Action</th></tr>");
+            for (uint32_t i = 0; i < byp_n && n < (int)sizeof(page) - 256; i++) {
+                char safe_ip[48]; html_escape(safe_ip, sizeof(safe_ip), byp_ips[i]);
+                char safe_ipv[48]; html_escape(safe_ipv, sizeof(safe_ipv), byp_ips[i]);
+                page_appendf(page, sizeof(page), &n,
+                    "<tr><td>%s</td><td>"
+                    "<form method=post action=/bypass/remove>"
+                    "<input type=hidden name=ip value=\"%s\">"
+                    "<button>Remove</button></form></td></tr>",
+                    safe_ip, safe_ipv);
+            }
+            page_appendf(page, sizeof(page), &n, "</table>"
+                "<form method=post action=/bypass/clear style='margin-top:.5em'>"
+                "<button>Clear all</button></form>");
+        }
+    }
+
     /* Admin account (#89) — always on; changing it signs every session out. */
     {
         char user[WEB_AUTH_USER_MAX + 1]; web_auth_get_user(user, sizeof(user));
@@ -1728,6 +1759,35 @@ static esp_err_t handle_acl_clear(httpd_req_t *r)
     httpd_resp_set_status(r, "303 See Other"); httpd_resp_set_hdr(r, "Location", "/"); httpd_resp_send(r,nullptr,0); return ESP_OK;
 }
 
+/* ── POST /bypass/add — add a per-client bypass IP (#74 Part 2) ──── */
+static esp_err_t handle_bypass_add(httpd_req_t *r)
+{
+    if (!csrf_ok(r)) { httpd_resp_send_err(r, HTTPD_403_FORBIDDEN, "CSRF"); return ESP_FAIL; }
+    char body[64] = {}; httpd_req_recv(r, body, sizeof(body) - 1);
+    const char *p = strstr(body, "ip=");
+    if (p) { p += 3; char ip[24]={0}; size_t l=0; for(;p[l]&&p[l]!='&'&&p[l]!='\r'&&l<23;l++) ip[l]=p[l]; ip[l]=0; bypass_add(ip); }
+    httpd_resp_set_status(r, "303 See Other"); httpd_resp_set_hdr(r, "Location", "/"); httpd_resp_send(r,nullptr,0); return ESP_OK;
+}
+
+/* ── POST /bypass/remove ──────────────────────────────────────────── */
+static esp_err_t handle_bypass_remove(httpd_req_t *r)
+{
+    if (!csrf_ok(r)) { httpd_resp_send_err(r, HTTPD_403_FORBIDDEN, "CSRF"); return ESP_FAIL; }
+    char body[64] = {}; httpd_req_recv(r, body, sizeof(body) - 1);
+    const char *p = strstr(body, "ip=");
+    if (p) { p += 3; char ip[24]={0}; size_t l=0; for(;p[l]&&p[l]!='&'&&p[l]!='\r'&&l<23;l++) ip[l]=p[l]; ip[l]=0; bypass_remove(ip); }
+    httpd_resp_set_status(r, "303 See Other"); httpd_resp_set_hdr(r, "Location", "/"); httpd_resp_send(r,nullptr,0); return ESP_OK;
+}
+
+/* ── POST /bypass/clear ───────────────────────────────────────────── */
+static esp_err_t handle_bypass_clear(httpd_req_t *r)
+{
+    if (!csrf_ok(r)) { httpd_resp_send_err(r, HTTPD_403_FORBIDDEN, "CSRF"); return ESP_FAIL; }
+    char body[4] = {}; httpd_req_recv(r, body, sizeof(body) - 1); /* consume body */
+    bypass_clear();
+    httpd_resp_set_status(r, "303 See Other"); httpd_resp_set_hdr(r, "Location", "/"); httpd_resp_send(r,nullptr,0); return ESP_OK;
+}
+
 /* ── POST /custom/rules — save inline block rules (#14) ─────────── */
 static esp_err_t handle_custom_rules(httpd_req_t *r)
 {
@@ -2162,6 +2222,9 @@ bool web_ui_start(DnsSinkServer *dns)
         { "/acl/add",             HTTP_POST, H(handle_acl_add)       },
         { "/acl/remove",          HTTP_POST, H(handle_acl_remove)    },
         { "/acl/clear",           HTTP_POST, H(handle_acl_clear)     },
+        { "/bypass/add",          HTTP_POST, H(handle_bypass_add)    },
+        { "/bypass/remove",       HTTP_POST, H(handle_bypass_remove) },
+        { "/bypass/clear",        HTTP_POST, H(handle_bypass_clear)  },
         { "/dot/set",             HTTP_POST, H(handle_dot_set)       },
         { "/dot/zones",           HTTP_POST, H(handle_dot_zones)     },
         { "/net/upstream",        HTTP_POST, H(handle_net_upstream)  },

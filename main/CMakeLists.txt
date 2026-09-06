@@ -8,6 +8,7 @@ idf_component_register(
         "localzone.c"
         "dot.c"
         "acl.c"
+        "bypass.c"
         "pause.c"
         "query_log.c"
         "crashlog.c"

@@ -983,3 +983,38 @@ the change doesn't touch the block path (it never goes upstream) or
 regress it. `heap_free`/`heap_largest`/`dns_task_stack_hwm` all stayed in
 normal range after the change — no leak or stack-pressure signal from
 either #77 or #72 in this pass.
+
+**Feature: per-client bypass list (#74 Part 2), Wave 4.** New `main/bypass.c`/
+`.h` — a direct structural clone of `acl.c` (mutex-guarded array, NVS-backed
+under its own `byp_%d` keys so it can't collide with ACL's `acl_%d` ones,
+`bypass_active_for()` for the socket path and a zero-wait `bypass_active_for_nb()`
+for the L2 hook), because the issue explicitly asked for that shape rather
+than pause's lock-free-atomics one. Storage is genuinely new; the actual
+policy-application code is not — it's wired into the *identical* delivery-time
+points #48's scoped pause already uses, and reuses the exact mechanism this
+same session's PR #119 fixed for pause's CNAME-cloaking interaction:
+`fwd_no_cache`/`tcp_no_cache` are now `paused_client || bypassed_client`, and
+`ue->paused` (still that name — deliberately not renamed to avoid colliding
+with #117's own future `ue->exempt` field, and to keep this diff to the
+policy composition, not a refactor) is set from that combined value, so the
+cloak-skip gate (`!ue->paused && cname_chain_is_blocked(...)`) and the
+coalescing exclusion both cover bypass automatically, with no new code at
+either site. The L2 hook's defer condition became
+`pause_active_for(src_hbo) || bypass_active_for_nb(src_hbo)`. Surfaced on the
+Access tab (add/remove/clear forms, same shape as the existing ACL section)
+and via `bypass_count` in `/metrics`.
+
+**Verified on hardware 2026-09-06 (Waveshare) with a genuine second real
+host, not an assumption — the same rigor the #119 pause test used.** Added
+`192.168.12.161` to the bypass list; `doubleclick.net` (UDP) and
+`googleadservices.com` (TCP) both resolved to real IPs for that client where
+they were `0.0.0.0` before the bypass. **Concurrently, from glolab
+(`192.168.12.110`, never on the list), a hand-built raw UDP query for the
+same domain came back `rcode=0, ancount=1, rdata=0.0.0.0, ttl=10`** —
+genuinely still blocked for a different real client while the first client
+was actively bypassed, not merely "blocking was off for everyone." Removing
+the bypass entry immediately restored blocking for the first client too;
+`bypass_count` correctly tracked 0 → 1 → 0 throughout. 0x20 case
+randomization (this same session's #72 work) composed correctly with the
+bypass-forwarded queries with no interaction issues (visible randomized case
+in the bypassed client's own resolved names).
