@@ -176,6 +176,21 @@ static void test_terminal(void)
     expect_terminal("192.168.1.1", "CIDR reject");
 }
 
+/* ── 7b. real $important lines, transcribed from the AdGuard DNS filter
+ * census (#117 stage d): all 5 hits across the four configured feeds came
+ * from this one feed, and two of the five have no '^' terminator before
+ * '$' — a plain "||domain$modifier" without an anchor-close, which the
+ * grammar table's synthetic rows never exercise. ─────────────────────── */
+static void test_real_important_fixtures(void)
+{
+    printf("real $important fixtures from the feed census\n");
+    expect_rule("||adsrvmedia.adk2.co^$important", RULE_BLOCK, "adsrvmedia.adk2.co", RULE_IMPORTANT, "adguard filter line 960");
+    expect_rule("||deloton.com$important", RULE_BLOCK, "deloton.com", RULE_IMPORTANT, "adguard filter line 57831 (no '^')");
+    expect_rule("||oclasrv.com$important", RULE_BLOCK, "oclasrv.com", RULE_IMPORTANT, "adguard filter line 57833 (no '^')");
+    expect_rule("||pixel.wp.pl^$important", RULE_BLOCK, "pixel.wp.pl", RULE_IMPORTANT, "adguard filter line 159024");
+    expect_rule("||bet.championat.com^$important", RULE_BLOCK, "bet.championat.com", RULE_IMPORTANT, "adguard filter line 167248");
+}
+
 /* ── 7. FEED-only $important policy (rule_apply_feed_policy) ──────── */
 static void test_feed_policy(void)
 {
@@ -215,6 +230,7 @@ int main(void)
     test_modifiers();
     test_malformed();
     test_terminal();
+    test_real_important_fixtures();
     test_feed_policy();
     printf("\n%s (%d failure%s)\n", g_fail ? "FAILED" : "PASSED", g_fail, g_fail == 1 ? "" : "s");
     return g_fail != 0;
