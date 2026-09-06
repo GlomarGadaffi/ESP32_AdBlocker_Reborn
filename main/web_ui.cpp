@@ -670,7 +670,8 @@ static esp_err_t handle_status(httpd_req_t *r)
         "roughly 1 domain in 350,000. Whitelisting is the fix &mdash; it is checked "
         "ahead of the blocklist.</small></p>"
         "<a href='/log'>Query log</a> &nbsp; <a href='/top'>Top lists</a>"
-        " &nbsp; <a href='/metrics'>Metrics JSON</a>"
+        " &nbsp; <a href='/metrics/view'>Metrics</a>"
+        " (<a href='/metrics'>JSON</a>)"
         "<p><small>This tab auto-refreshes every 10s; the other tabs don't, so "
         "they won't reload while you're editing.</small></p>",
         paused ? 0 : 1, paused ? "Resume blocking" : "Pause blocking");
@@ -1241,6 +1242,194 @@ static esp_err_t handle_metrics(httpd_req_t *r)
     httpd_resp_set_type(r, "application/json");
     httpd_resp_set_hdr(r, "Cache-Control", "no-store");
     httpd_resp_send(r, json, n > 0 ? n : 0);
+    return ESP_OK;
+}
+
+/* ── GET /metrics/view ─ rendered dashboard over /metrics (#126) ──── */
+/* The page is a plain `static const char[]` in .rodata and goes out through
+ * send_html() with no format pass: no PSRAM page buffer (§3a), no vsnprintf
+ * over ~7 KB on every request, and CSS percent signs need no doubling.
+ *
+ * It renders nothing server-side. The field map lives in the page's JS and it
+ * polls /metrics, so dns_server_metrics_json() stays the single source of
+ * truth for what a metric is called and what it holds — a second server-side
+ * renderer would be a second list to keep in step, and it would drift. Any key
+ * the map does not claim still appears, under "Other (ungrouped)": adding a
+ * field to the JSON can therefore never make it silently invisible here, and a
+ * non-empty Other section on a live board is the signal to group it.
+ *
+ * Two things the poll has to respect. The httpd is single-task (§3), so a
+ * forgotten background tab must not keep hitting it — the interval skips while
+ * document.hidden and a visibilitychange catches up on return. The very first
+ * fetch is forced past that check, or a page opened in a background tab would
+ * sit empty until it was looked at. And an expired session answers a GET with
+ * a 303 to /login, which fetch follows and hands back as HTML; the response's
+ * `redirected` flag is the reliable tell, so the page navigates to the login
+ * form rather than silently failing to parse it as JSON.
+ *
+ * CSP (set_security_headers) is script-src 'unsafe-inline' with no 'self', so
+ * this cannot become an external .js file; connect-src 'self' is what lets the
+ * fetch through. */
+static esp_err_t handle_metrics_view(httpd_req_t *r)
+{
+    static const char PAGE[] =
+    "<!DOCTYPE html><html><head><meta charset=utf-8>\n"
+    "<title>Metrics</title>\n"
+    "<style>body{font-family:monospace;max-width:900px;margin:1em auto;padding:0 .5em}\n"
+    "table{border-collapse:collapse;width:100%;margin:0 0 1.2em}\n"
+    "td,th{border:1px solid #ccc;padding:.3em .6em;font-size:.85em}\n"
+    "th{background:#222;color:#eee;text-align:left}th.r{text-align:right}\n"
+    "td.k{width:55%;color:#333}td.v{text-align:right;font-weight:bold}\n"
+    ".stats{display:flex;gap:.8em;flex-wrap:wrap;margin:1em 0}\n"
+    ".stat{background:#f4f4f4;border:1px solid #ccc;border-radius:6px;padding:.5em 1em;min-width:100px;text-align:center}\n"
+    ".stat .val{font-size:1.4em;font-weight:bold;color:#1a1a8c}\n"
+    ".stat .lbl{font-size:.7em;color:#555}\n"
+    ".ok{color:green}.warn{color:orange}\n"
+    ".stat .val.ok{color:green}.stat .val.warn{color:orange}\n"
+    "#age{color:#555;font-size:.8em}#age.stale{color:#c00;font-weight:bold}</style>\n"
+    "</head><body>\n"
+    "<h2>Metrics <small>(<a href='/'>home</a> &middot; <a href='/metrics'>raw JSON</a>)</small></h2>\n"
+    "<div id=chips class=stats></div>\n"
+    "<div id=body></div>\n"
+    "<p id=age>waiting for the first sample</p>\n"
+    "<p><small>Refreshes every 10 s while this tab is visible, and pauses when it is not.\n"
+    "p50/p99 come from a log2 histogram and are bucket upper bounds, so they can read\n"
+    "above an exact max. \"open-failed\" is the normal SD reading on a board with no card\n"
+    "fitted. Counters that should stay at zero turn orange when they don't.</small></p>\n"
+    "<script>\n"
+    "var F=[\n"
+    "['Traffic',[\n"
+    " ['queries_total','Queries (socket path)','n',0],\n"
+    " ['blocked','Blocked','n',0],\n"
+    " ['forwarded','Forwarded upstream','n',0],\n"
+    " ['tcp_queries','TCP queries','n',0],\n"
+    " ['coalesced','Coalesced duplicates','n',0],\n"
+    " ['stale_served','Stale answers served','n',0],\n"
+    " ['case_mismatch','0x20 case mismatches','n',1]]],\n"
+    "['Ethernet fast path',[\n"
+    " ['l2_blocked','Blocked in the L2 hook','n',0],\n"
+    " ['l2_cached','Cache hits in the L2 hook','n',0],\n"
+    " ['l2_fallthrough','Handed to lwIP','n',0],\n"
+    " ['l2_tx_fail','Transmit failures','n',1],\n"
+    " ['l2_log_dropped','Query-log entries dropped','n',1],\n"
+    " ['wd_restarts','Watchdog restarts','n',1]]],\n"
+    "['Forward cache',[\n"
+    " ['cache_probes','Probes','n',0],\n"
+    " ['cache_hits','Hits','n',0],\n"
+    " ['cache_hit_rate','Hit rate','p',0],\n"
+    " ['cache_evictions','Evictions','n',0],\n"
+    " ['cache_too_big','Replies too big to cache','n',1]]],\n"
+    "['Upstream',[\n"
+    " ['upstream','Resolver','s',0],\n"
+    " ['upstream_inflight','In flight','n',0],\n"
+    " ['upstream_max','Table size','n',0],\n"
+    " ['upstream_timeouts','Timeouts','n',1],\n"
+    " ['hedges_sent','Hedged retransmits sent','n',0],\n"
+    " ['hedged_completions','Answered by the hedge','n',0],\n"
+    " ['dropped.table_full','Dropped: table full','n',1],\n"
+    " ['dropped.mbox_pressure','Dropped: mailbox pressure','n',1]]],\n"
+    "['Blocklist',[\n"
+    " ['blocklist_count','Domains loaded','n',0],\n"
+    " ['blocklist_loading','Reloading','B',0],\n"
+    " ['blocklist_paused','Blocking paused','B',0],\n"
+    " ['pause_active','Timed pauses active','n',0],\n"
+    " ['bypass_count','Bypass entries','n',0],\n"
+    " ['blocklist_dropped','Domains dropped (overflow)','n',1],\n"
+    " ['blocklist_feed_failures','Feed failures','n',1],\n"
+    " ['flash_status','Flash snapshot','T',0],\n"
+    " ['sd_status','SD snapshot','T',0],\n"
+    " ['sd_bytes','SD snapshot size','b',0]]],\n"
+    "['System',[\n"
+    " ['uptime_s','Uptime','d',0],\n"
+    " ['clock','Clock','s',0],\n"
+    " ['clock_src','Clock source','s',0],\n"
+    " ['heap_free','Internal heap free','b',0],\n"
+    " ['heap_largest','Largest internal block','b',0],\n"
+    " ['psram_free','PSRAM free','b',0],\n"
+    " ['dns_task_stack_hwm','DNS task stack headroom','b',0]]]];\n"
+    "var SOK={loaded:1,saved:1};\n"
+    "var SNEU={unknown:1,absent:1,empty:1,'open-failed':1};\n"
+    "function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}\n"
+    "function nf(v){return String(v).replace(/\\B(?=(\\d{3})+(?!\\d))/g,',');}\n"
+    "function bf(v){v=+v;if(v<1024)return v+' B';if(v<1048576)return (v/1024).toFixed(1)+' KB';\n"
+    " return (v/1048576).toFixed(2)+' MB';}\n"
+    "function df(v){v=+v;var d=Math.floor(v/86400),h=Math.floor(v%86400/3600);\n"
+    " var m=Math.floor(v%3600/60),s=Math.floor(v%60);\n"
+    " return (d?d+'d ':'')+(d||h?h+'h ':'')+m+'m '+s+'s';}\n"
+    "function uf(v){v=+v;if(v<1000)return v+' &micro;s';if(v<1000000)return (v/1000).toFixed(1)+' ms';\n"
+    " return (v/1000000).toFixed(2)+' s';}\n"
+    "function fmt(f,v){\n"
+    " if(v===undefined||v===null)return '&mdash;';\n"
+    " if(f[2]=='n')return nf(v);\n"
+    " if(f[2]=='b')return bf(v);\n"
+    " if(f[2]=='p')return (+v).toFixed(1)+'%';\n"
+    " if(f[2]=='d')return df(v);\n"
+    " if(f[2]=='B')return v?'yes':'no';\n"
+    " return esc(v);}\n"
+    "function cls(f,v){\n"
+    " if(v===undefined||v===null)return '';\n"
+    " if(f[2]=='T')return SOK[v]?'ok':(SNEU[v]?'':'warn');\n"
+    " if(f[2]=='B')return v?'warn':'';\n"
+    " if(f[3])return (+v>0)?'warn':'';\n"
+    " return '';}\n"
+    "function flat(j){var o={};\n"
+    " for(var k in j){var v=j[k];\n"
+    "  if(k=='latency_us')continue;\n"
+    "  if(v&&typeof v=='object'){for(var k2 in v)o[k+'.'+k2]=v[k2];}\n"
+    "  else o[k]=v;}\n"
+    " return o;}\n"
+    "function render(j){\n"
+    " var m=flat(j),seen={},h='',i,s,k;\n"
+    " var tot=+m.queries_total||0,blk=+m.blocked||0;\n"
+    " var st=m.blocklist_loading?['Reloading','warn']:(m.blocklist_paused?['Paused','warn']:\n"
+    "  ((+m.blocklist_dropped>0||+m.blocklist_feed_failures>0)?['Degraded','warn']:['Active','ok']));\n"
+    " var chips=[[nf(m.blocklist_count),'Domains',''],[nf(tot),'Queries',''],[nf(blk),'Blocked',''],\n"
+    "  [(tot?(100*blk/tot).toFixed(1):'0.0')+'%','Block rate',''],[st[0],'Status',st[1]],\n"
+    "  [df(m.uptime_s),'Uptime','']];\n"
+    " var c='';\n"
+    " for(i=0;i<chips.length;i++)\n"
+    "  c+='<div class=stat><div class=\"val '+chips[i][2]+'\">'+chips[i][0]+\n"
+    "     '</div><div class=lbl>'+chips[i][1]+'</div></div>';\n"
+    " document.getElementById('chips').innerHTML=c;\n"
+    " for(s=0;s<F.length;s++){\n"
+    "  h+='<table><tr><th>'+F[s][0]+'</th><th class=r>value</th></tr>';\n"
+    "  for(i=0;i<F[s][1].length;i++){\n"
+    "   var f=F[s][1][i];seen[f[0]]=1;\n"
+    "   h+='<tr><td class=k>'+f[1]+'</td><td class=\"v '+cls(f,m[f[0]])+'\">'+fmt(f,m[f[0]])+'</td></tr>';}\n"
+    "  h+='</table>';}\n"
+    " var L=j.latency_us||{};\n"
+    " h+='<table><tr><th>Latency</th><th class=r>p50</th><th class=r>p99</th>'+\n"
+    "    '<th class=r>max</th><th class=r>count</th></tr>';\n"
+    " for(k in L)h+='<tr><td class=k>'+esc(k)+'</td><td class=v>'+uf(L[k].p50)+'</td><td class=v>'+\n"
+    "    uf(L[k].p99)+'</td><td class=v>'+uf(L[k].max)+'</td><td class=v>'+nf(L[k].count)+'</td></tr>';\n"
+    " h+='</table>';\n"
+    " var o='';\n"
+    " for(k in m)if(!seen[k])o+='<tr><td class=k>'+esc(k)+'</td><td class=v>'+esc(m[k])+'</td></tr>';\n"
+    " if(o)h+='<table><tr><th>Other (ungrouped)</th><th class=r>value</th></tr>'+o+'</table>';\n"
+    " document.getElementById('body').innerHTML=h;}\n"
+    "var LAST=0,FAILS=0,BUSY=false;\n"
+    "function mark(){var a=document.getElementById('age');\n"
+    " if(!LAST){\n"
+    "  a.textContent=FAILS?('could not load /metrics - '+FAILS+' failed attempt'+(FAILS>1?'s':'')):'waiting for the first sample';\n"
+    "  a.className=FAILS?'stale':'';return;}\n"
+    " var s=Math.round((Date.now()-LAST)/1000);\n"
+    " a.textContent='updated '+(s<2?'just now':s+'s ago')+(FAILS?' ('+FAILS+' failed since)':'');\n"
+    " a.className=s>25?'stale':'';}\n"
+    "function tick(force){\n"
+    " if(BUSY||(document.hidden&&!force))return;\n"
+    " BUSY=true;\n"
+    " fetch('/metrics',{cache:'no-store'}).then(function(r){\n"
+    "  if(r.redirected){location.href='/login';return null;}\n"
+    "  return r.json();\n"
+    " }).then(function(j){if(j){render(j);LAST=Date.now();FAILS=0;}BUSY=false;mark();})\n"
+    " .catch(function(e){BUSY=false;FAILS++;console.error('metrics view:',e);mark();});}\n"
+    "setInterval(tick,10000);\n"
+    "setInterval(mark,1000);\n"
+    "document.addEventListener('visibilitychange',function(){if(!document.hidden)tick();});\n"
+    "tick(1);\n"
+    "</script>\n"
+    "</body></html>\n";
+    send_html(r, PAGE);
     return ESP_OK;
 }
 
@@ -2163,7 +2352,7 @@ bool web_ui_start(DnsSinkServer *dns)
     cfg.prvtkey_pem      = (const uint8_t *)key;
     cfg.prvtkey_len      = key_len;
     cfg.port_secure      = 443;
-    cfg.httpd.max_uri_handlers = 48;   /* 38 registered as of #48 — keep headroom */
+    cfg.httpd.max_uri_handlers = 48;   /* 43 registered as of #126 — keep headroom */
     cfg.httpd.max_resp_headers = 16;   /* 5 hardening headers + cookie + Location + type */
     cfg.httpd.stack_size       = 16384;
     /* Recycle the least-recently-used connection instead of refusing new ones
@@ -2200,6 +2389,7 @@ bool web_ui_start(DnsSinkServer *dns)
         { "/logout",              HTTP_POST, H(handle_logout)        },
         { "/",                    HTTP_GET,  H(handle_status)        },
         { "/metrics",             HTTP_GET,  H(handle_metrics)       },
+        { "/metrics/view",        HTTP_GET,  H(handle_metrics_view)  },
         { "/lastwords",           HTTP_GET,  H(handle_lastwords)     },
         { "/metrics/reset",       HTTP_POST, H(handle_metrics_reset) },
         { "/reload",              HTTP_POST, H(handle_reload)        },

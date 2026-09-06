@@ -48,6 +48,7 @@ metrics fields from `dns_server_metrics_json()` in `dns_server.cpp`.
 | POST | `/logout` | Destroy the current session and clear the cookie. |
 | GET | `/` | Status page (Dashboard + tabs). Auto-refreshes every 10 s. |
 | GET | `/metrics` | JSON counters and latency histograms — see below. |
+| GET | `/metrics/view` | Rendered dashboard over `/metrics` (#126). Static page; the grouping lives in its JS and it polls `/metrics` every 10 s, pausing while the tab is hidden. Fields the grouping does not claim are still shown, under "Other (ungrouped)". |
 | GET | `/lastwords` | JSON crash flight recorder (#71) — see below. |
 | POST | `/metrics/reset` | Zero the counters and histograms. |
 | POST | `/reload` | Reload the blocklist now (does not shift the 4 h timer). |
@@ -130,11 +131,13 @@ A single JSON object. Field names are exactly as emitted.
 | `bypass_count` | int | Entries on the standing per-client bypass list (#74 Part 2). |
 | `blocklist_dropped` | int | Entries lost to `BLOCKLIST_CAPACITY` on the last reload. |
 | `blocklist_feed_failures` | int | Extra feeds that hard-failed on the last publishing reload. Non-zero means the live list is missing whole sources, and the SD snapshot is vetoed. |
+| `sd_status` | string | SD-snapshot state: `unknown`, `absent` (no file — no card, or nothing written yet), `bad-magic`, `format-mismatch`, `bad-count`, `short-read`, `invalid-index`, `loaded`, `saved`, `open-failed`, `short-write`. On a board with no card fitted the steady state is `open-failed`: the boot load sets `absent`, then the post-download save fails to open the path. |
+| `sd_bytes` | int | Size of the SD snapshot seen at boot, bytes; 0 if there was none. |
 | `flash_status` | string | Flash-slot persistence state (#70): `unknown`, `absent` (partitions missing — pre-#70 image), `empty` (never written), `bad-count`, `short-read`, `invalid-index`, `loaded`, `saved`, `too-big`, `erase-failed`, `write-failed`. |
 | `heap_free` | int | Free internal heap, bytes. |
 | `heap_largest` | int | Largest *contiguous* internal block. This, not `heap_free`, is what TLS setup fails on. |
 | `psram_free` | int | Free PSRAM, bytes. |
-| `dns_task_stack_hwm` | int | `dns_task` stack headroom, as reported by `uxTaskGetStackHighWaterMark()`. |
+| `dns_task_stack_hwm` | int | `dns_task` stack headroom, **bytes** — ESP-IDF's `uxTaskGetStackHighWaterMark()` returns bytes, not the words stock FreeRTOS documents (`freertos/task.h`). It is a minimum-ever, so a freshly booted board reads high until the task has been exercised. |
 | `latency_us` | object | See below. |
 
 `dropped` is a nested object: `"dropped":{"table_full":N,"mbox_pressure":N}`.
