@@ -7,20 +7,40 @@ menu "ESP32 AdBlocker Reborn"
             Selects the W5500 + SD-card pin map compiled into the firmware,
             and the mDNS hostname (esp32adblock.local for the Elite,
             esp32adblock2.local for the Waveshare, so two units can share a
-            LAN). Both boards are ESP32-S3 with 16MB flash + 8MB octal
-            PSRAM, so everything else is identical. NOTE: a web-UI OTA
+            LAN). Both Ethernet boards are ESP32-S3 with 16MB flash + 8MB
+            octal PSRAM, so everything else is identical. NOTE: a web-UI OTA
             upload of the wrong board's image leaves Ethernet dead until
             the rollback watchdog reverts it — flash the matching build.
+
+            The generic Wi-Fi-only target (#49) compiles out the W5500
+            driver, the L2 Ethernet fast path and the SD card entirely, so
+            the sinkhole runs on any plain ESP32-S3 dev board over its
+            built-in Wi-Fi: same DNS engine, blocklist, cache, web UI and
+            OTA, minus the Ethernet-only latency offload and the SD
+            instant-boot (the blocklist downloads on each cold boot).
 
         config ADBLOCK_BOARD_T_ETH_ELITE
             bool "LilyGO T-ETH-Elite (W5500 on 48/47/21/45)"
 
         config ADBLOCK_BOARD_WAVESHARE_S3_ETH
             bool "Waveshare ESP32-S3-ETH (W5500 on 13/12/11/14)"
+
+        config ADBLOCK_BOARD_GENERIC_S3_WIFI
+            bool "Generic ESP32-S3 dev board (Wi-Fi only — no W5500, no SD card)"
+            select ADBLOCK_NET_WIFI
     endchoice
 
+    config ADBLOCK_NET_ETH
+        bool
+        default y if !ADBLOCK_BOARD_GENERIC_S3_WIFI
+        default n
+        help
+            Derived, not user-set: the board has a W5500 Ethernet controller
+            (and an SD slot). Gates the esp_eth bring-up, the L2 RX fast-path
+            hook and the SD mount in dns_sink.cpp.
+
     config ADBLOCK_NET_WIFI
-        bool "Also bring up Wi-Fi STA alongside W5500 Ethernet (dual-WAN)"
+        bool "Also bring up Wi-Fi STA alongside W5500 Ethernet (dual-WAN)" if ADBLOCK_NET_ETH
         default n
         help
             Join a Wi-Fi network in addition to the W5500 Ethernet link, so
@@ -33,6 +53,8 @@ menu "ESP32 AdBlocker Reborn"
             SD card, blocklist, DNS server, and web UI are unchanged. The L2
             fast-path RX hook is Ethernet-only; Wi-Fi-egressed queries take
             the normal lwIP socket path.
+
+            Forced on (and the only link) for the generic Wi-Fi-only board.
 
     config ADBLOCK_WIFI_SSID
         string "Wi-Fi SSID"

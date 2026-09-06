@@ -8,6 +8,7 @@ idf_component_register(
         "localzone.c"
         "dot.c"
         "acl.c"
+        "pause.c"
         "query_log.c"
         "timesync.c"
         "http_fetch.c"
@@ -38,6 +39,7 @@ idf_component_register(
         esp_app_format
         freertos
         heap
+        esp_psram
         sdmmc
         fatfs
         esp_driver_sdspi

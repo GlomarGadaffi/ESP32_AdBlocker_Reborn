@@ -51,7 +51,9 @@ metrics fields from `dns_server_metrics_json()` in `dns_server.cpp`.
 | POST | `/metrics/reset` | Zero the counters and histograms. |
 | POST | `/reload` | Reload the blocklist now (does not shift the 4 h timer). |
 | POST | `/blocklist/stop` | Abort an in-progress download/reload; the previously loaded list keeps serving. |
-| POST | `/pause` | Toggle global pause (allow every query without unloading anything). |
+| POST | `/pause` | Toggle global pause (allow every query without unloading anything). NVS-persisted, survives reboot. |
+| POST | `/pause/timed` | Suspend blocking for `min` minutes (1–1440, enforced server-side). `scope=me` (default) applies to the requesting connection's own IP, `scope=host` with `ip=<IPv4>` to another host, `scope=all` to every client. A global pause renders a confirmation page unless `confirm=1` is also sent. Never persisted: a reboot resumes blocking. |
+| POST | `/pause/resume` | End a timed pause early. `ip=<IPv4>` for one host, `ip=all` for the every-client entry, `ip=every` to clear the table. |
 | POST | `/check` | Test one domain against the current verdict ladder. |
 | POST | `/auth/set` | Change the admin account (`cur` = current password, `user`, `pass`). Drops every session. |
 | POST | `/whitelist/add` | Add a domain to the whitelist. |
@@ -115,7 +117,8 @@ A single JSON object. Field names are exactly as emitted.
 | `upstream_max` | int | Upstream table size (compile-time). |
 | `blocklist_count` | int | Unique hashes in the live list. |
 | `blocklist_loading` | bool | A reload is in progress. |
-| `blocklist_paused` | bool | Global pause is on. |
+| `blocklist_paused` | bool | Global pause (the persistent on/off switch) is on. |
+| `pause_active` | int | Timed pause entries currently in force, across all scopes. Expired entries are not counted. |
 | `blocklist_dropped` | int | Entries lost to `BLOCKLIST_CAPACITY` on the last reload. |
 | `blocklist_feed_failures` | int | Extra feeds that hard-failed on the last publishing reload. Non-zero means the live list is missing whole sources, and the SD snapshot is vetoed. |
 | `heap_free` | int | Free internal heap, bytes. |

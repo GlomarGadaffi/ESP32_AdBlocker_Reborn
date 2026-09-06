@@ -15,10 +15,12 @@
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_idf_version.h"
+#if CONFIG_ADBLOCK_NET_ETH
 #include "esp_eth.h"
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6, 0, 0)
 #include "esp_eth_mac_w5500.h"
 #include "esp_eth_phy_w5500.h"
+#endif
 #endif
 #if CONFIG_ADBLOCK_NET_WIFI
 #include "esp_wifi.h"
@@ -47,6 +49,7 @@
 #include "domain.h"
 #include "rewrite.h"
 #include "acl.h"
+#include "pause.h"
 #include "dot.h"
 #include "localzone.h"
 #include "query_log.h"
@@ -62,7 +65,18 @@
 
 static const char *TAG = "dns_sink";
 
-#if CONFIG_ADBLOCK_BOARD_WAVESHARE_S3_ETH
+#if CONFIG_ADBLOCK_BOARD_GENERIC_S3_WIFI
+
+/* ── Generic ESP32-S3 dev board, Wi-Fi only (#49) ─────────────────
+ * No W5500, no SD slot: nothing here but the identity. Every Ethernet/SD
+ * pin map, the esp_eth bring-up, the L2 RX hook and the SD mount are
+ * compiled out under !CONFIG_ADBLOCK_NET_ETH. Same default hostname as
+ * the Elite — for a household that has exactly one unit, which is who
+ * this target is for — so the README's esp32adblock.local just works. */
+#define BOARD_NAME    "Generic ESP32-S3 (Wi-Fi)"
+#define MDNS_HOSTNAME "esp32adblock"
+
+#elif CONFIG_ADBLOCK_BOARD_WAVESHARE_S3_ETH
 
 /* ── Pin maps: Waveshare ESP32-S3-ETH (ESP32-S3R8 + W5500) ──────── */
 #define BOARD_NAME    "Waveshare ESP32-S3-ETH"
@@ -236,11 +250,14 @@ static const char *apply_upstream_iface(void)
 extern "C" bool dns_sink_set_upstream_iface(const char *iface)
 {
     if (!iface) return false;
-    if (strcmp(iface, "eth") != 0
-#if CONFIG_ADBLOCK_NET_WIFI
-        && strcmp(iface, "wifi") != 0
+    bool known = false;
+#if CONFIG_ADBLOCK_NET_ETH
+    if (strcmp(iface, "eth") == 0) known = true;
 #endif
-    ) return false;
+#if CONFIG_ADBLOCK_NET_WIFI
+    if (strcmp(iface, "wifi") == 0) known = true;
+#endif
+    if (!known) return false;
 
     snprintf(s_upstream_iface, sizeof(s_upstream_iface), "%s", iface);
 
@@ -258,6 +275,12 @@ static void upstream_iface_init_nvs(void)
 {
 #if CONFIG_ADBLOCK_NET_WIFI
     snprintf(s_upstream_iface, sizeof(s_upstream_iface), "wifi");  /* default when built dual-stack */
+#endif
+#if !CONFIG_ADBLOCK_NET_ETH
+    /* (#49) Wi-Fi is the only link: an NVS value of "eth" (left by an
+     * Ethernet build that ran on this flash before) would select an
+     * interface that does not exist and egress on the fallback resolver. */
+    return;
 #endif
     nvs_handle_t h;
     if (nvs_open(NVS_NS, NVS_READONLY, &h) != ESP_OK) return;
@@ -407,6 +430,7 @@ static void apply_static_ip(esp_netif_t *netif, const NetStaticCfg &cfg)
  * the network ready and pin upstream DNS to the static gateway while the link
  * was still down — observed answering on 192.168.50.10 with the port empty,
  * which leaves every forwarded query timing out on an Ethernet-only build. */
+#if CONFIG_ADBLOCK_NET_ETH
 static void publish_static_eth(void)
 {
     if (s_eth_static.dhcp) return;
@@ -421,7 +445,9 @@ static void publish_static_eth(void)
     apply_upstream_iface();
 }
 
+#endif
 /* ── Ethernet event handlers ─────────────────────────────────────── */
+#if CONFIG_ADBLOCK_NET_ETH
 static void eth_event_handler(void *, esp_event_base_t, int32_t event_id, void *)
 {
     if (event_id == ETHERNET_EVENT_CONNECTED) {
@@ -432,6 +458,16 @@ static void eth_event_handler(void *, esp_event_base_t, int32_t event_id, void *
         s_eth_ip_nbo.store(0, std::memory_order_relaxed);   /* (#106) hook defers while down */
         if (!s_eth_static.dhcp) { s_ip[0] = '\0'; s_nm[0] = '\0'; s_gw[0] = '\0'; s_eth_dns[0] = '\0'; }
     }
+}
+#endif
+
+extern "C" bool dns_sink_eth_built(void)
+{
+#if CONFIG_ADBLOCK_NET_ETH
+    return true;
+#else
+    return false;
+#endif
 }
 
 /* Read the DHCP-provided DNS server (option 6) for a netif, if any. */
@@ -894,6 +930,7 @@ extern "C" const char *dns_sink_hostname(void) { return MDNS_HOSTNAME ".local"; 
 extern "C" const char *dns_sink_lan_ip(void) { return s_ip[0] ? s_ip : s_wifi_ip; }
 
 /* ── W5500 init (board pin map selected above) ───────────────────── */
+#if CONFIG_ADBLOCK_NET_ETH
 static esp_eth_handle_t eth_init_w5500(void)
 {
     ESP_LOGI(TAG, "W5500 %s: SCLK=%d MISO=%d MOSI=%d CS=%d INT=%d RST=%d @ %d MHz",
@@ -986,6 +1023,7 @@ static void sd_mount(void)
     ESP_LOGW(TAG, "SD mount failed after retries — no SD cache");
     spi_bus_free(SD_SPI_HOST);
 }
+#endif /* CONFIG_ADBLOCK_NET_ETH — W5500 + SD bring-up */
 
 /* ── Blocklist download task (Core 0, priority 2) ────────────────── */
 static void download_task(void *)
@@ -1109,6 +1147,7 @@ extern "C" uint32_t dns_sink_l2_cached(void)  { return s_l2_cached; }
 
 /* Parse question qname → normalized name; return qend offset within DNS msg.
  * IRAM_ATTR (#78): called from l2_input_cb, which must never fault to flash. */
+#if CONFIG_ADBLOCK_NET_ETH
 static int IRAM_ATTR l2_qname(const uint8_t *dns, int dns_len, char *out, size_t cap, size_t *outlen)
 {
     /* (#114) Was `static`: mutable parser state shared across calls on the
@@ -1188,6 +1227,12 @@ static esp_err_t IRAM_ATTR l2_input_cb(esp_eth_handle_t h, uint8_t *buf, uint32_
          * required to answer here; denied OR unknown defers to that socket,
          * which drops the query if it really is denied. */
         if (!acl_permits_nb(src_hbo)) break;
+        /* (#48) A client under a timed pause must get the real answer, which
+         * only the socket path can fetch. Deferring here (rather than
+         * answering "not blocked") keeps this hook's rule intact: it never
+         * forwards, and it never answers on a verdict the socket path would
+         * override. The socket path re-derives the pause from the same table. */
+        if (pause_active_for(src_hbo)) break;
         int udp = 14 + ihl;
         if (((buf[udp + 2] << 8) | buf[udp + 3]) != 53) break;   /* dst port 53 */
         int udplen = (buf[udp + 4] << 8) | buf[udp + 5];         /* (#106) */
@@ -1286,6 +1331,7 @@ static esp_err_t IRAM_ATTR l2_input_cb(esp_eth_handle_t h, uint8_t *buf, uint32_
 
     return esp_netif_receive((esp_netif_t *)priv, buf, len, NULL);
 }
+#endif /* CONFIG_ADBLOCK_NET_ETH — L2 fast-path hook */
 
 /* Init-failure halt, made OTA-rollback-aware (#1). Plain portMAX_DELAY halt
  * loops here would defeat CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE: rollback
@@ -1338,6 +1384,7 @@ extern "C" void app_main(void)
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, ESP_EVENT_ANY_ID,
                                                ip_event_handler, nullptr));
 
+#if CONFIG_ADBLOCK_NET_ETH
     /* Register Ethernet event handler */
     ESP_ERROR_CHECK(esp_event_handler_register(ETH_EVENT, ESP_EVENT_ANY_ID,
                                                eth_event_handler, nullptr));
@@ -1359,6 +1406,11 @@ extern "C" void app_main(void)
     if (!s_eth_static.dhcp)
         apply_static_ip(eth_netif, s_eth_static);
     ESP_ERROR_CHECK(esp_eth_start(eth_handle));
+#else
+    /* (#49) Wi-Fi-only board: no W5500, no L2 hook, no SD. The Wi-Fi STA below
+     * is the LAN-facing interface; every query takes the lwIP socket path. */
+    ESP_LOGI(TAG, "%s: Wi-Fi is the only link (no Ethernet, no SD card)", BOARD_NAME);
+#endif
 
 #if CONFIG_ADBLOCK_NET_WIFI
     /* Wi-Fi STA bring-up alongside Ethernet (#53: dual-WAN). No L2 fast-path
@@ -1447,10 +1499,13 @@ extern "C" void app_main(void)
     localzone_init_nvs();
     dot_init_nvs();
     acl_init();
+    pause_init();
     query_log_init();
 
+#if CONFIG_ADBLOCK_NET_ETH
     /* Mount SD card (SPI3 — separate bus from W5500) */
     sd_mount();
+#endif
 
     /* Start DNS sinkhole (Core 1, priority 10). Upstream = the DHCP-provided
      * DNS server for whichever interface is selected (see pick_upstream /
@@ -1530,7 +1585,11 @@ extern "C" void app_main(void)
     console_start();
 
     ESP_LOGI(TAG, "Startup complete. Ethernet: %s  Wi-Fi: %s — either can be set as your DNS server.",
+#if CONFIG_ADBLOCK_NET_ETH
              s_ip[0] ? s_ip : "(down)",
+#else
+             "(not built)",
+#endif
 #if CONFIG_ADBLOCK_NET_WIFI
              s_wifi_ip[0] ? s_wifi_ip : "(down)");
 #else

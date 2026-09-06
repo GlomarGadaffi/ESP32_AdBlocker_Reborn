@@ -3,6 +3,44 @@
 All notable changes to ESP32_AdBlocker_Reborn. Versions follow SemVer; the
 firmware's `esp_app_desc` version string comes from `version.txt`.
 
+## [Unreleased]
+
+### Added
+
+- **Timed, scoped "pause blocking" (#48).** A pause can now be taken for a set
+  number of minutes, capped at 24 hours and enforced on the device rather than
+  only in the form. The default scope is the device that asked: its address is
+  read from the HTTP connection, never from the submitted form, so one machine
+  can unblock itself without turning filtering off for the household. Pausing
+  another host is explicit, and pausing *every* device requires a second
+  confirmation. Pauses live in RAM only and are deliberately never persisted —
+  a reboot always comes back blocking, unlike the existing on/off switch, which
+  stays NVS-backed by design. `pause_active` is exposed in `/metrics`.
+- **`pause` / `resume` on the USB recovery console.** The web UI needs a login,
+  which is exactly what is unavailable in the situation the console exists for.
+  Same cap and scope rules; a global pause needs no second confirmation there,
+  because physical USB access already implies it.
+- **Generic ESP32-S3 Wi-Fi-only build target (#49).** A third board choice that
+  compiles out the W5500 driver, the Layer 2 fast-path hook and the SD card, so
+  the sinkhole runs on any plain ESP32-S3 dev board with PSRAM over built-in
+  Wi-Fi. Everything else — DNS engine, blocklist, cache, whitelist, rewrites,
+  ACL, DoT, web UI, OTA — is unchanged. Blocklist capacity is now sized from the
+  PSRAM actually fitted, so a 2 MB quad-PSRAM module runs a smaller table
+  instead of failing its boot-time allocation. Release packaging and the browser
+  flasher carry per-board flash settings, since this target addresses 8 MB where
+  the Ethernet boards use 16.
+
+### Fixed
+
+- **A paused client was re-blocked one round trip later by the CNAME-cloaking
+  check.** The pause correctly forwarded the query, but `process_reply` then
+  inspected the answer, found the queried name itself on the blocklist, and
+  synthesized a `0.0.0.0` reply — so the client saw a blocked answer anyway,
+  just ~105 ms later instead of ~3 ms. Flights created for a paused requester
+  now skip that check and are excluded from request coalescing, so no other
+  client can ride or inherit an unfiltered answer. Found on hardware; every
+  host-side check had passed.
+
 ## [1.3.0] — 2026-09-04
 
 Blocklist storage moves to a bucket-split 40-bit format. Same memory, wider

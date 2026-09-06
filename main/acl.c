@@ -18,10 +18,11 @@ static uint32_t s_ips[ACL_MAX];
 static uint32_t s_count = 0;
 static SemaphoreHandle_t s_mutex = NULL;
 
-static uint32_t parse_ip(const char *s)
+uint32_t acl_parse_ip4(const char *s)
 {
-    unsigned b0=0,b1=0,b2=0,b3=0;
-    if (sscanf(s, "%u.%u.%u.%u", &b0, &b1, &b2, &b3) != 4) return 0;
+    unsigned b0=256,b1=256,b2=256,b3=256; char tail=0;
+    if (!s || sscanf(s, "%u.%u.%u.%u%c", &b0, &b1, &b2, &b3, &tail) != 4) return 0;
+    if (b0>255 || b1>255 || b2>255 || b3>255) return 0;
     return ((uint32_t)b0<<24)|((uint32_t)b1<<16)|((uint32_t)b2<<8)|(uint32_t)b3;
 }
 
@@ -55,7 +56,7 @@ bool acl_init(void)
         char key[12]; snprintf(key, sizeof(key), "acl_%d", i);
         char val[24]; size_t vlen = sizeof(val);
         if (nvs_get_str(h, key, val, &vlen) != ESP_OK) continue;
-        uint32_t ip = parse_ip(val);
+        uint32_t ip = acl_parse_ip4(val);
         if (ip) s_ips[s_count++] = ip;
     }
     nvs_close(h);
@@ -67,7 +68,7 @@ bool acl_init(void)
 bool acl_add(const char *ip_str)
 {
     if (!ip_str || s_count >= ACL_MAX) return false;
-    uint32_t ip = parse_ip(ip_str);
+    uint32_t ip = acl_parse_ip4(ip_str);
     if (ip == 0) return false;
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     bool changed = false;
@@ -83,7 +84,7 @@ bool acl_add(const char *ip_str)
 bool acl_remove(const char *ip_str)
 {
     if (!ip_str) return false;
-    uint32_t ip = parse_ip(ip_str);
+    uint32_t ip = acl_parse_ip4(ip_str);
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     bool found = false;
     for (uint32_t i = 0; i < s_count; i++) {

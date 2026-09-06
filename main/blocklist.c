@@ -3,6 +3,7 @@
 #include "domain.h"
 #include "http_fetch.h"
 #include "esp_heap_caps.h"
+#include "esp_psram.h"
 #include "esp_log.h"
 #include "esp_attr.h"
 #include "nvs_flash.h"
@@ -82,6 +83,29 @@ static _Atomic bool        s_loading = false;
  * to an hour after a reload that would have blocked it. */
 static _Atomic uint32_t    s_blocklist_gen = 0;
 static _Atomic bool        s_paused  = false;  /* global block/allow-all switch */
+
+/* (#49) Live capacity. BLOCKLIST_CAPACITY is the ceiling the 8 MB boards
+ * run at; a board with less PSRAM gets a smaller table sized at init from
+ * what is actually fitted, rather than failing the boot-time allocation. */
+static uint32_t            s_cap     = BLOCKLIST_CAPACITY;
+
+static uint32_t capacity_for_psram(size_t psram_bytes)
+{
+    /* Everything else that lives in PSRAM — forward cache, TLS I/O buffers,
+     * the EXT_RAM_BSS scratch pages, the hedge stash — is under 1.5 MB on the
+     * 8 MB boards (measured ~1.5 MB still free there at the full cap). Below
+     * that reserve the table is squeezed, never the rest: a table that fits
+     * and a cache that does not is a box that reboots under load. */
+    const size_t reserve = 1536u * 1024u;
+    const size_t per_entry = BL_REC_BYTES + BL_ENT_BYTES;   /* stage + image */
+    if (psram_bytes <= reserve + BL_IDX_BYTES) return 50000u; /* 2 MB parts: still worth running */
+    size_t cap = (psram_bytes - reserve - BL_IDX_BYTES) / per_entry;
+    if (cap > BLOCKLIST_CAPACITY) cap = BLOCKLIST_CAPACITY;
+    if (cap < 50000u) cap = 50000u;
+    return (uint32_t)cap;
+}
+
+uint32_t blocklist_capacity(void) { return s_cap; }
 static _Atomic bool        s_stop_requested = false;  /* #1: mirrors upstream's xStop */
 
 /* Any event that changes what a query SHOULD resolve to — a reload, a pause
@@ -293,12 +317,12 @@ static uint32_t s_wl_count = 0;
  * tail-scratch bound rests on. */
 static inline uint32_t sort_dedup_records(uint8_t *a, uint32_t n)
 {
-    return bl_sort_dedup(a, BLOCKLIST_CAPACITY, n);
+    return bl_sort_dedup(a, s_cap, n);
 }
 
 static inline uint32_t fold_sorted_chunk(uint8_t *a, uint32_t p, uint32_t n)
 {
-    return bl_fold_sorted_chunk(a, BLOCKLIST_CAPACITY, p, n);
+    return bl_fold_sorted_chunk(a, s_cap, p, n);
 }
 
 /* Download callback */
@@ -410,14 +434,24 @@ bool blocklist_init(void)
     s_wl_mutex = xSemaphoreCreateMutex();
     if (!s_wl_mutex) return false;
 
+    /* (#49) Size the table to the PSRAM actually fitted. esp_psram_get_size()
+     * is 0 when PSRAM failed to initialise — keep the default then and let the
+     * allocation below report it, rather than silently shrinking to a floor. */
+    {
+        size_t psram = esp_psram_get_size();
+        if (psram > 0) s_cap = capacity_for_psram(psram);
+        if (s_cap != BLOCKLIST_CAPACITY)
+            ESP_LOGW(TAG, "PSRAM is %u KB: blocklist capacity %u entries (ceiling %u)",
+                     (unsigned)(psram / 1024), (unsigned)s_cap, (unsigned)BLOCKLIST_CAPACITY);
+    }
     s_stage = (uint8_t *)heap_caps_malloc(
-        (size_t)BLOCKLIST_CAPACITY * BL_REC_BYTES, MALLOC_CAP_SPIRAM);
+        (size_t)s_cap * BL_REC_BYTES, MALLOC_CAP_SPIRAM);
     s_image = (uint8_t *)heap_caps_malloc(
-        BL_IMAGE_BYTES(BLOCKLIST_CAPACITY), MALLOC_CAP_SPIRAM);
+        BL_IMAGE_BYTES(s_cap), MALLOC_CAP_SPIRAM);
     if (!s_stage || !s_image) {
         ESP_LOGE(TAG, "PSRAM alloc failed: stage %" PRIu32 " B, image %" PRIu32 " B",
-                 (uint32_t)((size_t)BLOCKLIST_CAPACITY * BL_REC_BYTES),
-                 (uint32_t)BL_IMAGE_BYTES(BLOCKLIST_CAPACITY));
+                 (uint32_t)((size_t)s_cap * BL_REC_BYTES),
+                 (uint32_t)BL_IMAGE_BYTES(s_cap));
         return false;
     }
     /* An image with a zeroed index reads as empty from every bucket, so a
@@ -427,9 +461,9 @@ bool blocklist_init(void)
     memset(s_image, 0, BL_IDX_BYTES);
     ESP_LOGI(TAG, "PSRAM: stage %" PRIu32 " KB + image %" PRIu32 " KB (cap %u entries, "
              "%d-bit hashes)",
-             (uint32_t)((size_t)BLOCKLIST_CAPACITY * BL_REC_BYTES / 1024),
-             (uint32_t)(BL_IMAGE_BYTES(BLOCKLIST_CAPACITY) / 1024),
-             (unsigned)BLOCKLIST_CAPACITY, BL_HASH_BITS);
+             (uint32_t)((size_t)s_cap * BL_REC_BYTES / 1024),
+             (uint32_t)(BL_IMAGE_BYTES(s_cap) / 1024),
+             (unsigned)s_cap, BL_HASH_BITS);
 
     extra_urls_load_nvs();
     custom_load_nvs();
@@ -497,7 +531,7 @@ uint32_t blocklist_load(void)
 
     /* Build in the staging buffer. s_image keeps serving the whole fetch and
      * the whole sort — nothing here touches it until the publish below. */
-    load_ctx_t lc = { .buf = s_stage, .cap = BLOCKLIST_CAPACITY, .n = 0, .rejected = 0 };
+    load_ctx_t lc = { .buf = s_stage, .cap = s_cap, .n = 0, .rejected = 0 };
 
     /* Accumulated locally and published only where s_dropped is: until then the
      * OLD list is still the live one, and the count that describes it must not
@@ -617,7 +651,7 @@ uint32_t blocklist_load(void)
         ESP_LOGW(TAG, "CAPACITY EXCEEDED: %" PRIu32 " entries dropped (cap %u) — the live "
                  "list is incomplete. Remove a source or switch to smaller lists "
                  "(hagezi wildcard/ variants, not domains/).",
-                 lc.dropped, (unsigned)BLOCKLIST_CAPACITY);
+                 lc.dropped, (unsigned)s_cap);
     /* Publish.
      *
      * The sort happened entirely in s_stage, so the old list served the whole
@@ -891,7 +925,7 @@ bool blocklist_load_sd(void)
         s_sd_status = "format-mismatch";
         fclose(f); return false;
     }
-    if (hdr.count == 0 || hdr.count > BLOCKLIST_CAPACITY) {
+    if (hdr.count == 0 || hdr.count > s_cap) {
         ESP_LOGW(TAG, "SD blocklist: bad count %" PRIu32, hdr.count);
         s_sd_status = "bad-count";
         fclose(f); return false;

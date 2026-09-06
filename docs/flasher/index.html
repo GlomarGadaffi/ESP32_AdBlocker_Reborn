@@ -292,7 +292,7 @@ footer { color: var(--text-dim); font-size: .86rem; text-align: center; margin-t
       <div class="step-num"><span>2</span></div>
       <div>
         <h2>Confirm the board</h2>
-        <p class="muted" style="margin:0" id="detect-summary">Both supported boards are ESP32-S3 with 16&nbsp;MB flash, so the chip alone can't tell them apart &mdash; the installed firmware's version tag can.</p>
+        <p class="muted" style="margin:0" id="detect-summary">All supported boards are ESP32-S3, so the chip alone can't tell them apart &mdash; the installed firmware's version tag can.</p>
       </div>
     </div>
 
@@ -409,6 +409,12 @@ const BOARDS = {
     desc: "ESP32-S3R8 board with an on-board W5500 and PoE header. Reachable at esp32adblock2.local.",
     host: "esp32adblock2.local",
     art: { body: "#1f4f8f", pads: "#d8b84a", chip: "#1d2733", label: "ESP32-S3-ETH" }
+  },
+  "generic-s3-wifi": {
+    name: "Generic ESP32-S3 (Wi-Fi only)",
+    desc: "Any plain ESP32-S3 dev board with PSRAM (e.g. ESP32-S3-DevKitC-1 N8R8 / N16R8). No Ethernet, no SD card; runs over Wi-Fi. Reachable at esp32adblock.local.",
+    host: "esp32adblock.local",
+    art: { body: "#5a3d7a", pads: "#d8b84a", chip: "#1d2733", label: "ESP32-S3 Wi-Fi" }
   }
 };
 const DEFAULT_BOARD = "t-eth-elite";
@@ -915,8 +921,8 @@ async function detectBoard() {
 
     notice("detect-notice", "warn",
       `<p style="margin-bottom:6px"><strong>Pick your board.</strong> ${why}</p>
-       <p class="muted" style="margin-bottom:0">Both boards are ESP32-S3 with 16&nbsp;MB flash, so nothing about the chip itself
-       distinguishes them. Check the silkscreen and choose below.</p>`);
+       <p class="muted" style="margin-bottom:0">All supported boards are ESP32-S3, so nothing about the chip itself
+       distinguishes them. Check the silkscreen and choose below &mdash; a board with no Ethernet jack is the Wi-Fi-only target.</p>`);
     logWarn("Board could not be auto-detected; using the manual picker.");
   }
 
@@ -1012,7 +1018,11 @@ async function doFlash(parts, label) {
       fileArray.push({ data, address: p.offset });
     }
 
-    const flash = state.release?.manifest?.flash || {};
+    // Per-board since the Wi-Fi-only build (#49): it addresses 8 MB of flash
+    // where the Ethernet boards use 16. Older manifests carry only the shared
+    // top-level block, so fall back to that.
+    const flash = state.release?.manifest?.boards?.[state.selectedBoard]?.flash
+               || state.release?.manifest?.flash || {};
 
     await state.loader.writeFlash({
       fileArray,

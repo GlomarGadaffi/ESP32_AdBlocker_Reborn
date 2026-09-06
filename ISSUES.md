@@ -724,3 +724,61 @@ warranted a second opinion over solo judgment. Its three pre-flight items —
 verify the generated partition table rather than trust the offset reasoning,
 keep an untouched rollback kit before migrating, and fix `flash.sh` before
 using it again — are the reason this landed without an outage.
+
+---
+
+## 2026-09-05 — timed/scoped pause (#48) and the generic Wi-Fi build (#49), plus a bug only hardware found
+
+**Feature: timed, scoped pause (closes the second half of #48).** New
+`main/pause.c` holds a fixed 8-entry table of `{ client IP, expiry }`, no
+dynamic allocation, readers lock-free. Duration is capped at 1440 minutes on
+the device. Default scope is the requesting connection's own address, read via
+`getpeername()` and never from the submitted form; another host is explicit and
+"every device" needs a second confirmation page. Nothing is persisted — a
+reboot resumes blocking, deliberately unlike the existing NVS-backed on/off
+switch, which is a different feature and stays as it is.
+
+**Where the check goes was the whole design problem, and the first answer was
+wrong.** The pause cannot live inside `blocklist_is_blocked()`, because that
+function's answer is what `cache_store_*` writes into a cache keyed only by
+domain: one paused client's ALLOW would then be served to everyone until the
+TTL expired. So the blocklist verdict stays global and cacheable, and the pause
+is applied at *delivery* time on each path — the UDP and TCP handlers in
+`dns_server.cpp`, with the L2 hook in `dns_sink.cpp` deferring a paused
+client's frame to the socket path rather than answering it. A flight opened for
+a paused requester is marked `no_cache`, so its answer is delivered and
+forgotten.
+
+**H-new — a paused client was re-blocked one round trip later. ✅**
+`dns_server.cpp` — the request side was right, and the query really was being
+forwarded. But `process_reply()` then ran the CNAME-cloaking inspection (#74)
+over the answer, found the *queried name itself* on the blocklist, and
+synthesized a `0.0.0.0` reply in its place. The client got a blocked answer
+regardless, roughly 105 ms later instead of 3 ms.
+**Fix:** `UpstreamEntry` carries a `paused` flag; flights created for a paused
+requester skip the cloaking check and are excluded from request coalescing in
+both directions, so no other client can ride or inherit an unfiltered answer.
+
+**How it was found, and why nothing else would have found it.** Every
+host-side check passed and both images built clean. On the bench the symptom
+was a *latency* change with no verdict change: 2.6 ms unpaused, 105 ms paused,
+2.6 ms again after resume, and `0.0.0.0` in all three. That pattern was first
+misread as upstream filtering, which was plausible — the board had been
+egressing over a CGNAT link at the time, and its DoT setting made a filtering
+upstream a real possibility. Two things killed that theory: the board's
+upstream was confirmed to be the router, which resolves those names cleanly,
+and a sample drawn from the board's own feed produced twelve domains that are
+alive on a public resolver — `gorillatourrwanda.com` and `jubin-bicycle.com`
+among them — that no ad filter would touch, all still answering `0.0.0.0` while
+globally paused. The lesson is that "the answer did not change" and "the code
+did not run" are not the same claim, and the latency was the only evidence that
+separated them.
+
+**Feature: generic ESP32-S3 Wi-Fi-only target (closes #49).** A third
+`ADBLOCK_BOARD` choice with a derived `ADBLOCK_NET_ETH` symbol gating the W5500
+bring-up, the L2 RX hook and the SD mount. `BLOCKLIST_CAPACITY` becomes a
+ceiling rather than a fixed size: `blocklist_init()` now sizes the table from
+`esp_psram_get_size()`, reserving what the cache and TLS buffers need, so a
+2 MB quad-PSRAM module runs a smaller table instead of failing its allocation.
+Release packaging and the browser flasher moved to per-board flash settings,
+since this target addresses 8 MB where the Ethernet boards use 16.
