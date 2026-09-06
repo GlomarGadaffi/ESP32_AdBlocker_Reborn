@@ -1178,16 +1178,40 @@ fresh admin account created via `/setup`.
   `wd_restarts` and `case_mismatch` stayed 0 throughout, `upstream_timeouts`
   0 through the whole burst.
 
-**`.244` (LilyGo, household/production) was deliberately NOT flashed this
-pass.** The code is byte-identical to what's verified above, so this isn't
-a correctness gap — but the auto-mode classifier declined both the
-admin-reset and the flash action targeting the production board while the
-user was asleep/unavailable to confirm in real time, and that boundary was
-respected rather than worked around. `.244` is still running the pre-#124
-image as of this writing; its rollout needs the user's explicit go-ahead
-when available. Given `.195` and `.244` run identical hardware/firmware
-family and the exact same image was just proven correct, the `.244` flash
-itself should be routine — the earlier session's real surprises (the #77
-watchdog false-positive) came from board-specific *runtime conditions*
-(ambient household LAN traffic), not from this PR's code, so some risk
-remains until it's actually been run against real household traffic.
+**`.244` (LilyGo, household/production) was deliberately NOT flashed in the
+same pass** — the auto-mode classifier declined both the admin-reset and
+the flash action targeting the production board while the user was
+asleep/unavailable to confirm in real time, and that boundary was respected
+rather than worked around.
+
+**Update, same day, user back and said "flash .244 now": flashed and
+verified, full pass, no issues.** Admin account reset via USB console
+(`admin-reset` — first attempt after opening the port got "unknown command"
+on `admin-reset` itself this time, not just a warmup call; a second attempt
+with an explicit `status` warmup first succeeded — same first-command-after-
+open flakiness pattern seen on `.195`, worth expecting on any future console
+session). **Uptime survived the port open both times (40567s → unchanged
+before/after)** — contrary to the general "opening the serial port resets
+the board" note, this pyserial-based approach did not reset either board
+this session; worth re-testing before relying on it as a guarantee either
+way. Flashed via glolab's esptool (app-only, same recipe as `.195`), hash-
+verified against the local build before flashing.
+
+- **Confirmed live**: `l2_log_dropped` field present, `flash_status:
+  "loaded"` (745,797 domains — this board's feed set differs from `.195`'s
+  618,703, as expected), `wd_restarts: 0`, `case_mismatch: 0`.
+- **Same three-query smoke test as `.195`'s first pass**: `doubleclick.net`
+  (blocked) and a repeated `example.com` (allowed) both answered via the L2
+  fast path (`l2_blocked` 0→1, `l2_cached` 0→1) and both appeared in `/log`
+  with the correct client IP — identical result to `.195`.
+- **`wd_restarts` stayed 0 despite real, live household ambient traffic
+  already moving `l2_fallthrough`** (154 at first read, climbing) while
+  `queries_total` was still 0 right after boot — exactly the condition that
+  tripped the watchdog false-positive fixed earlier this session (PR #123).
+  Confirms that fix holds under the real production conditions it was
+  written for, not just a repeat of the original bug.
+- **No regressions**: heap/PSRAM/stack readings in line with `.195`'s,
+  `upstream_timeouts: 0`.
+
+**Both boards now run the same current firmware again** (main @ 412ea15),
+closing the brief divergence noted above.
