@@ -90,14 +90,27 @@ static inline uint8_t rule_rank(uint8_t kind, uint8_t flags)
  * every level (same invariant as domain_is_bare_tld() everywhere else in
  * this codebase — a TLD is never a match, for any source). At each level,
  * consult every source in srcs[0..nsrcs) and keep the highest rank seen.
- * Stops early once the best-possible rank across every source
- * (max_rank_present, computed by the caller from table state — an empty
- * whitelist contributes nothing) has been reached; also skips re-probing
- * an individual source once it has already given the best rank it is
- * capable of (srcs[i].max_rank). In the default configuration — no feed
- * exceptions, empty whitelist, no custom allow rules, max_rank_present==0
- * — the walk is byte-for-byte the cost blocklist_is_blocked() is today:
- * one probe per suffix level, stopping at the first hit.
+ *
+ * The best-possible rank across every source is derived HERE, from
+ * max(srcs[i].max_rank) — never taken as a caller-supplied parameter.
+ * That used to be an argument, and it was a footgun: pass a stale or
+ * merely-wrong 0 for a source that can actually produce 1 (say, "the
+ * whitelist happens to be empty right now" computed once and cached), and
+ * the walk stops at a shallower BLOCK before ever reaching a deeper ALLOW
+ * that source could have produced — a silently wrong verdict, in the
+ * ALLOW-suppressing direction. A caller expressing "this source is
+ * currently empty" does so by constructing that source's rank_source_t
+ * with max_rank == 0 for this call (or simply omitting an empty source
+ * from srcs[] entirely) — never by touching the resolver's stopping
+ * bound directly.
+ *
+ * Stops early once the derived best-possible rank has been reached; also
+ * skips re-probing an individual source once it has already given the
+ * best rank it is capable of (srcs[i].max_rank). In the default
+ * configuration — no feed exceptions, empty whitelist (max_rank == 0),
+ * no custom allow rules — the walk is byte-for-byte the cost
+ * blocklist_is_blocked() is today: one probe per suffix level, stopping
+ * at the first hit.
  * IRAM_ATTR is on the DEFINITION in bl_rank.c only, never here (same rule,
  * same reason, as bl_table.h's bl_hash40): this is the L2 fast-path target
  * once (e) wires blocklist.c's _nb probes through it. Every probe passed
@@ -105,8 +118,7 @@ static inline uint8_t rule_rank(uint8_t kind, uint8_t flags)
  * lives with the caller.
  */
 bl_verdict_t bl_rank_resolve(const char *name, size_t len,
-                              const rank_source_t *srcs, size_t nsrcs,
-                              uint8_t max_rank_present);
+                              const rank_source_t *srcs, size_t nsrcs);
 
 #ifdef __cplusplus
 }

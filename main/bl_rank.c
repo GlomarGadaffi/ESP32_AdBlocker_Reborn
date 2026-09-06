@@ -7,12 +7,15 @@
  * bl_rank.h's comment and bl_table.h's bl_hash40 for why repeating it on
  * the declaration fails under -Werror=attributes. */
 bl_verdict_t IRAM_ATTR bl_rank_resolve(const char *name, size_t len,
-                                        const rank_source_t *srcs, size_t nsrcs,
-                                        uint8_t max_rank_present)
+                                        const rank_source_t *srcs, size_t nsrcs)
 {
     bl_verdict_t v = { .state = BL_NO_MATCH, .rank = 0, .unproven = 0, .src = 0xFF, .depth = 0 };
     bool found = false;
     uint8_t best = 0;
+
+    uint8_t max_rank_present = 0;
+    for (size_t i = 0; i < nsrcs; i++)
+        if (srcs[i].max_rank > max_rank_present) max_rank_present = srcs[i].max_rank;
 
     const char *p = name;
     size_t remaining = len;

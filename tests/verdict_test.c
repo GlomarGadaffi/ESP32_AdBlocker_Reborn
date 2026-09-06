@@ -91,7 +91,7 @@ static void test_single_source(void)
         synth_entry_t feed_e[] = { { "example.com", 0, 0 } };
         synth_ctx_t feed = { feed_e, 1, 0 };
         rank_source_t srcs[] = { mk_src(&feed, 0) };
-        bl_verdict_t v = bl_rank_resolve("a.example.com", strlen("a.example.com"), srcs, 1, 0);
+        bl_verdict_t v = bl_rank_resolve("a.example.com", strlen("a.example.com"), srcs, 1);
         expect_state("feed BLOCK example.com -> a.example.com", v, BL_BLOCK);
     }
 
@@ -102,12 +102,11 @@ static void test_single_source(void)
         synth_entry_t exc_e[]   = { { "a.example.com", 1, 0 } };
         synth_ctx_t block = { block_e, 1, 0 }, exc = { exc_e, 1, 0 };
         rank_source_t srcs[] = { mk_src(&block, 0), mk_src(&exc, 1) };
-        uint8_t maxp = 1;
 
-        bl_verdict_t v1 = bl_rank_resolve("b.example.com", strlen("b.example.com"), srcs, 2, maxp);
+        bl_verdict_t v1 = bl_rank_resolve("b.example.com", strlen("b.example.com"), srcs, 2);
         expect_state("feed exception a.example.com, block example.com -> b.example.com", v1, BL_BLOCK);
 
-        bl_verdict_t v2 = bl_rank_resolve("x.a.example.com", strlen("x.a.example.com"), srcs, 2, maxp);
+        bl_verdict_t v2 = bl_rank_resolve("x.a.example.com", strlen("x.a.example.com"), srcs, 2);
         expect_state("feed exception a.example.com, block example.com -> x.a.example.com", v2, BL_ALLOW);
     }
 }
@@ -123,7 +122,7 @@ static void test_cross_source(void)
         synth_entry_t custom_e[] = { { "example.com", 1, 0 } };
         synth_ctx_t feed = { feed_e, 1, 0 }, custom = { custom_e, 1, 0 };
         rank_source_t srcs[] = { mk_src(&feed, 0), mk_src(&custom, 3) };
-        bl_verdict_t v = bl_rank_resolve("example.com", strlen("example.com"), srcs, 2, 3);
+        bl_verdict_t v = bl_rank_resolve("example.com", strlen("example.com"), srcs, 2);
         expect_state("feed BLOCK + custom @@||", v, BL_ALLOW);
     }
 
@@ -133,7 +132,7 @@ static void test_cross_source(void)
         synth_entry_t custom_e[] = { { "example.com", 3, 0 } };
         synth_ctx_t feed = { feed_e, 1, 0 }, custom = { custom_e, 1, 0 };
         rank_source_t srcs[] = { mk_src(&feed, 0), mk_src(&custom, 3) };
-        bl_verdict_t v = bl_rank_resolve("example.com", strlen("example.com"), srcs, 2, 3);
+        bl_verdict_t v = bl_rank_resolve("example.com", strlen("example.com"), srcs, 2);
         expect_state("feed BLOCK + custom @@||...$important", v, BL_ALLOW);
     }
 
@@ -143,7 +142,7 @@ static void test_cross_source(void)
         synth_entry_t custom_e[] = { { "example.com", 2, 0 } };
         synth_ctx_t feed = { feed_e, 1, 0 }, custom = { custom_e, 1, 0 };
         rank_source_t srcs[] = { mk_src(&feed, 0), mk_src(&custom, 3) };
-        bl_verdict_t v = bl_rank_resolve("example.com", strlen("example.com"), srcs, 2, 3);
+        bl_verdict_t v = bl_rank_resolve("example.com", strlen("example.com"), srcs, 2);
         expect_state("feed BLOCK + custom ||...$important", v, BL_BLOCK);
     }
 
@@ -153,7 +152,7 @@ static void test_cross_source(void)
         synth_entry_t custom_e[] = { { "example.com", 2, 0 } };
         synth_ctx_t exc = { exc_e, 1, 0 }, custom = { custom_e, 1, 0 };
         rank_source_t srcs[] = { mk_src(&exc, 3), mk_src(&custom, 3) };
-        bl_verdict_t v = bl_rank_resolve("example.com", strlen("example.com"), srcs, 2, 3);
+        bl_verdict_t v = bl_rank_resolve("example.com", strlen("example.com"), srcs, 2);
         expect_state("feed EXCEPTION + custom ||...$important", v, BL_BLOCK);
     }
 
@@ -164,7 +163,7 @@ static void test_cross_source(void)
         synth_entry_t custom_e[] = { { "example.com", 2, 0 } };
         synth_ctx_t exc = { exc_e, 1, 0 }, custom = { custom_e, 1, 0 };
         rank_source_t srcs[] = { mk_src(&exc, 3), mk_src(&custom, 3) };
-        bl_verdict_t v = bl_rank_resolve("example.com", strlen("example.com"), srcs, 2, 3);
+        bl_verdict_t v = bl_rank_resolve("example.com", strlen("example.com"), srcs, 2);
         expect_state("feed EXCEPTION $important + custom ||...$important", v, BL_ALLOW);
         CHECK(v.rank == 3, "expected rank 3 to win, got %d", v.rank);
     }
@@ -178,7 +177,7 @@ static void test_cross_source(void)
         };
         synth_ctx_t custom = { custom_e, 2, 0 };
         rank_source_t srcs[] = { mk_src(&custom, 3) };
-        bl_verdict_t v = bl_rank_resolve("ads.example.com", strlen("ads.example.com"), srcs, 1, 3);
+        bl_verdict_t v = bl_rank_resolve("ads.example.com", strlen("ads.example.com"), srcs, 1);
         expect_state("custom @@|| + custom || deeper block -> rank beats depth", v, BL_ALLOW);
     }
 
@@ -191,7 +190,7 @@ static void test_cross_source(void)
         };
         synth_ctx_t custom = { custom_e, 2, 0 };
         rank_source_t srcs[] = { mk_src(&custom, 3) };
-        bl_verdict_t v = bl_rank_resolve("ads.example.com", strlen("ads.example.com"), srcs, 1, 3);
+        bl_verdict_t v = bl_rank_resolve("ads.example.com", strlen("ads.example.com"), srcs, 1);
         expect_state("custom @@|| + custom ||...$important deeper -> important wins", v, BL_BLOCK);
     }
 
@@ -202,7 +201,7 @@ static void test_cross_source(void)
         synth_entry_t feed_e[] = { { "ads.example.com", 0, 0 } };
         synth_ctx_t wl = { wl_e, 1, 0 }, feed = { feed_e, 1, 0 };
         rank_source_t srcs[] = { mk_src(&feed, 0), mk_src(&wl, 1) };
-        bl_verdict_t v = bl_rank_resolve("ads.example.com", strlen("ads.example.com"), srcs, 2, 1);
+        bl_verdict_t v = bl_rank_resolve("ads.example.com", strlen("ads.example.com"), srcs, 2);
         expect_state("whitelist example.com + feed BLOCK ads.example.com (behaviour change)", v, BL_ALLOW);
     }
 
@@ -213,7 +212,7 @@ static void test_cross_source(void)
         synth_entry_t custom_e[] = { { "ads.example.com", 2, 0 } };
         synth_ctx_t wl = { wl_e, 1, 0 }, custom = { custom_e, 1, 0 };
         rank_source_t srcs[] = { mk_src(&wl, 1), mk_src(&custom, 3) };
-        bl_verdict_t v = bl_rank_resolve("ads.example.com", strlen("ads.example.com"), srcs, 2, 3);
+        bl_verdict_t v = bl_rank_resolve("ads.example.com", strlen("ads.example.com"), srcs, 2);
         expect_state("whitelist example.com + custom escape hatch $important", v, BL_BLOCK);
     }
 }
@@ -231,10 +230,10 @@ static void test_exact_scoping(void)
         synth_ctx_t feed = { feed_e, 1, 0 }, custom = { custom_e, 1, 0 };
         rank_source_t srcs[] = { mk_src(&feed, 0), mk_src(&custom, 3) };
 
-        bl_verdict_t v1 = bl_rank_resolve("example.com", strlen("example.com"), srcs, 2, 3);
+        bl_verdict_t v1 = bl_rank_resolve("example.com", strlen("example.com"), srcs, 2);
         expect_state("feed BLOCK + custom @@example.com (exact) -> example.com", v1, BL_ALLOW);
 
-        bl_verdict_t v2 = bl_rank_resolve("a.example.com", strlen("a.example.com"), srcs, 2, 3);
+        bl_verdict_t v2 = bl_rank_resolve("a.example.com", strlen("a.example.com"), srcs, 2);
         expect_state("feed BLOCK + custom @@example.com (exact) -> a.example.com", v2, BL_BLOCK);
     }
 
@@ -244,7 +243,7 @@ static void test_exact_scoping(void)
         synth_entry_t custom_e[] = { { "example.com", 1, 0 } };   /* sub-inclusive, not exact */
         synth_ctx_t feed = { feed_e, 1, 0 }, custom = { custom_e, 1, 0 };
         rank_source_t srcs[] = { mk_src(&feed, 0), mk_src(&custom, 3) };
-        bl_verdict_t v = bl_rank_resolve("a.example.com", strlen("a.example.com"), srcs, 2, 3);
+        bl_verdict_t v = bl_rank_resolve("a.example.com", strlen("a.example.com"), srcs, 2);
         expect_state("feed BLOCK + custom @@||example.com^ (sub) -> a.example.com", v, BL_ALLOW);
     }
 
@@ -255,10 +254,10 @@ static void test_exact_scoping(void)
         synth_ctx_t custom = { custom_e, 1, 0 };
         rank_source_t srcs[] = { mk_src(&custom, 3) };
 
-        bl_verdict_t v1 = bl_rank_resolve("ads.example.com", strlen("ads.example.com"), srcs, 1, 3);
+        bl_verdict_t v1 = bl_rank_resolve("ads.example.com", strlen("ads.example.com"), srcs, 1);
         expect_state("custom |ads.example.com^ (exact) -> ads.example.com", v1, BL_BLOCK);
 
-        bl_verdict_t v2 = bl_rank_resolve("x.ads.example.com", strlen("x.ads.example.com"), srcs, 1, 3);
+        bl_verdict_t v2 = bl_rank_resolve("x.ads.example.com", strlen("x.ads.example.com"), srcs, 1);
         expect_state("custom |ads.example.com^ (exact) -> x.ads.example.com not matched by this rule", v2, BL_NO_MATCH);
     }
 }
@@ -274,7 +273,7 @@ static void test_walk_cost(void)
         synth_entry_t feed_e[] = { { "example.com", 0, 0 } };
         synth_ctx_t feed = { feed_e, 1, 0 };
         rank_source_t srcs[] = { mk_src(&feed, 0) };
-        bl_verdict_t v = bl_rank_resolve("example.com", strlen("example.com"), srcs, 1, 0);
+        bl_verdict_t v = bl_rank_resolve("example.com", strlen("example.com"), srcs, 1);
         expect_state("feed-only depth-0 hit", v, BL_BLOCK);
         CHECK(feed.probe_calls == 1, "expected exactly 1 probe, got %u", feed.probe_calls);
     }
@@ -288,11 +287,37 @@ static void test_walk_cost(void)
         synth_ctx_t feed = { feed_e, 1, 0 };
         synth_ctx_t wl   = { NULL, 0, 0 };   /* empty: never matches */
         rank_source_t srcs[] = { mk_src(&feed, 0), mk_src(&wl, 1) };
-        bl_verdict_t v = bl_rank_resolve("a.example.com", strlen("a.example.com"), srcs, 2, 1);
+        bl_verdict_t v = bl_rank_resolve("a.example.com", strlen("a.example.com"), srcs, 2);
         expect_state("feed depth-0 hit, empty whitelist walks on", v, BL_BLOCK);
         CHECK(feed.probe_calls == 1, "feed: expected exactly 1 probe (bound 3), got %u", feed.probe_calls);
         /* two non-bare-TLD suffixes in "a.example.com": itself, and "example.com" */
         CHECK(wl.probe_calls == 2, "whitelist: expected 2 probes (one per remaining level), got %u", wl.probe_calls);
+    }
+
+    /* max_rank is derived from the sources, not passed in — the caller's
+     * only lever is what max_rank it puts on EACH source for THIS call.
+     * Declaring an empty table's max_rank as 0 (its true capability right
+     * now, not its structural ceiling of 1) must give the identical
+     * verdict as the conservative 1, just cheaper: the walk can stop
+     * probing it the moment a rank-0 hit elsewhere is found. Same tables
+     * both times, only the whitelist source's declared max_rank differs. */
+    {
+        synth_entry_t feed_e[] = { { "a.example.com", 0, 0 } };
+
+        synth_ctx_t feed_a = { feed_e, 1, 0 }, wl_a = { NULL, 0, 0 };
+        rank_source_t srcs_a[] = { mk_src(&feed_a, 0), mk_src(&wl_a, 1) };
+        bl_verdict_t va = bl_rank_resolve("a.example.com", strlen("a.example.com"), srcs_a, 2);
+
+        synth_ctx_t feed_b = { feed_e, 1, 0 }, wl_b = { NULL, 0, 0 };
+        rank_source_t srcs_b[] = { mk_src(&feed_b, 0), mk_src(&wl_b, 0) };   /* accurately empty */
+        bl_verdict_t vb = bl_rank_resolve("a.example.com", strlen("a.example.com"), srcs_b, 2);
+
+        CHECK(va.state == vb.state && va.rank == vb.rank,
+              "declaring an empty whitelist's true max_rank changed the verdict: %s/%d vs %s/%d",
+              state_name(va.state), va.rank, state_name(vb.state), vb.rank);
+        CHECK(wl_b.probe_calls < wl_a.probe_calls,
+              "max_rank=0 should cost strictly fewer whitelist probes than the conservative 1 (got %u vs %u)",
+              wl_b.probe_calls, wl_a.probe_calls);
     }
 }
 
