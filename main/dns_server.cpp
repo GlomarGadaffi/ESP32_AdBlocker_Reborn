@@ -4,6 +4,7 @@
 #include "rewrite.h"
 #include "acl.h"
 #include "pause.h"
+#include "bypass.h"
 #include "dot.h"
 #include "localzone.h"
 #include "query_log.h"
@@ -1752,20 +1753,22 @@ void DnsSinkServer::run_loop()
 
                 uint32_t h = domain_hash(name, nlen);
 
-                /* (#48/#74) Timed/scoped pause. This is a DELIVERY-time override,
-                 * not a verdict: the blocklist answer stays global and cacheable
-                 * (see pause.h for why it must not live inside
-                 * blocklist_is_blocked()). fwd_no_cache is true for the WHOLE
-                 * query whenever the client is paused — not only when the
-                 * direct name turns out to be blocked — because pause must
+                /* (#48/#74) Timed/scoped pause, and the standing per-client
+                 * bypass list (#74 Part 2) — both are DELIVERY-time overrides,
+                 * not a verdict: the blocklist answer stays global and
+                 * cacheable (see pause.h / bypass.h for why neither lives
+                 * inside blocklist_is_blocked()). fwd_no_cache is true for the
+                 * WHOLE query whenever either applies — not only when the
+                 * direct name turns out to be blocked — because both must
                  * also cover a name that is itself allowed but CNAME-cloaks to
                  * a blocked target (#74): that can't be known until the
                  * upstream reply arrives, so the isolation has to be
-                 * unconditional up front. Decided once per query; both flags
+                 * unconditional up front. Decided once per query; all flags
                  * are declared ahead of the `goto forward` below so no
                  * initialisation is jumped over. */
-                bool paused_client = cls_in && pause_active_for(ntohl(client_addr.sin_addr.s_addr));
-                bool fwd_no_cache  = paused_client;
+                bool paused_client   = cls_in && pause_active_for(ntohl(client_addr.sin_addr.s_addr));
+                bool bypassed_client = cls_in && bypass_active_for(ntohl(client_addr.sin_addr.s_addr));
+                bool fwd_no_cache    = paused_client || bypassed_client;
 
                 /* (#100) The rewrite verdict is taken BEFORE the cache, not after
                  * it. A rule added while an answer for that name sat in the cache
@@ -1783,11 +1786,11 @@ void DnsSinkServer::run_loop()
                                                      : cache_lookup(h, qtype, now_ms);
                 if (ce) {
                     s_cnt_cache_hit++;
-                    if (ce->blocked && paused_client) {
-                        /* (#48) The cached BLOCK is still right for everyone
-                         * else — leave it — but this client is paused, so this
-                         * delivery forwards, uncached. fwd_no_cache is already
-                         * true (set from paused_client above). */
+                    if (ce->blocked && (paused_client || bypassed_client)) {
+                        /* (#48/#74) The cached BLOCK is still right for
+                         * everyone else — leave it — but this client is
+                         * paused or bypassed, so this delivery forwards,
+                         * uncached. fwd_no_cache is already true (set above). */
                         s_cnt_cache_hit--;
                         goto forward;
                     } else if (ce->blocked) {
@@ -1891,10 +1894,10 @@ void DnsSinkServer::run_loop()
                     bool is_blk = cls_in && (blocklist_is_blocked(name, nlen) ||
                                              blocklist_custom_is_blocked(name, nlen));
                     hist_record(&s_h_lookup, esp_timer_get_time() - t_lk);
-                    if (paused_client) {
+                    if (paused_client || bypassed_client) {
                         /* (#48/#74) If the verdict is BLOCKED, that is what the
-                         * cache learns — the next unpaused client's hit must be
-                         * right. Only this delivery is overridden: forward
+                         * cache learns — the next unaffected client's hit must
+                         * be right. Only this delivery is overridden: forward
                          * (fwd_no_cache is already true), and never cache the
                          * answer as blocked for this client's own sake. If the
                          * direct name isn't blocked, is_blk is already false —
@@ -2048,22 +2051,23 @@ void DnsSinkServer::run_loop()
                         bool cls_in = (qclass == 1);              /* (#106), as on UDP */
                         uint32_t h = domain_hash(name, nlen);
                         int tlen = 0;    /* >0: answer in tx; 0: forwarded, conn held */
-                        /* (#48/#74) Same delivery-time pause override as UDP —
-                         * tcp_no_cache is true for the whole query whenever the
-                         * client is paused, not only when the direct name is
-                         * blocked (see the UDP declaration for why). */
-                        bool paused_client = cls_in && pause_active_for(s_tcp.peer_ip);
-                        bool tcp_no_cache  = paused_client;
+                        /* (#48/#74) Same delivery-time pause + bypass override
+                         * as UDP — tcp_no_cache is true for the whole query
+                         * whenever either applies, not only when the direct
+                         * name is blocked (see the UDP declaration for why). */
+                        bool paused_client   = cls_in && pause_active_for(s_tcp.peer_ip);
+                        bool bypassed_client = cls_in && bypass_active_for(s_tcp.peer_ip);
+                        bool tcp_no_cache    = paused_client || bypassed_client;
 
                         /* (#100) Rewrite verdict before the cache, as on UDP. */
                         uint32_t rw_pre = (cls_in && qtype == 1) ? rewrite_lookup(name) : 0;
                         s_cnt_cache_probe++;
                         CacheEntry *ce = (rw_pre || !cls_in) ? nullptr
                                                              : cache_lookup(h, qtype, now_ms);
-                        /* (#48) A cached BLOCK is skipped for a paused client:
-                         * the verdict branch below re-derives it, stores it, and
-                         * forwards this one delivery. */
-                        if (ce && !(ce->blocked && paused_client) &&
+                        /* (#48/#74) A cached BLOCK is skipped for a paused or
+                         * bypassed client: the verdict branch below re-derives
+                         * it, stores it, and forwards this one delivery. */
+                        if (ce && !(ce->blocked && (paused_client || bypassed_client)) &&
                             (ce->blocked ||
                              (ce->resp_len > 0 && ce->resp_len <= (int)sizeof(tx)))) {
                             s_cnt_cache_hit++;
@@ -2082,17 +2086,18 @@ void DnsSinkServer::run_loop()
                             bool is_blk = !rw_ip && cls_in &&
                                           (blocklist_is_blocked(name, nlen) ||
                                            blocklist_custom_is_blocked(name, nlen));
-                            if (paused_client) {
+                            if (paused_client || bypassed_client) {
                                 /* (#48/#74) As on UDP: if the direct name is
                                  * BLOCKED, the cache learns it and this
                                  * delivery forwards uncached (tcp_no_cache is
                                  * already true). This branch is also reached
                                  * when the cached verdict was BLOCKED via
-                                 * CNAME-cloaking (`ce->blocked && paused_client`
-                                 * above) rather than a direct hit — is_blk here
-                                 * only ever reflects the direct name, so it
-                                 * must not be trusted to decide whether to
-                                 * cache_store_blocked in that case either. */
+                                 * CNAME-cloaking (the `ce->blocked && (...)`
+                                 * check above) rather than a direct hit —
+                                 * is_blk here only ever reflects the direct
+                                 * name, so it must not be trusted to decide
+                                 * whether to cache_store_blocked in that case
+                                 * either. */
                                 if (is_blk) cache_store_blocked(h, qtype, BLOCKED_TTL_S, now_ms);
                                 is_blk = false;
                             }
@@ -2297,6 +2302,7 @@ int dns_server_metrics_json(char *out, size_t cap)
         "\"blocklist_count\":%" PRIu32 ",\"blocklist_loading\":%s,"
         "\"blocklist_paused\":%s,"
         "\"pause_active\":%" PRIu32 ","
+        "\"bypass_count\":%" PRIu32 ","
         "\"blocklist_dropped\":%" PRIu32 ","
         "\"blocklist_feed_failures\":%" PRIu32 ","
         "\"sd_status\":\"%s\",\"sd_bytes\":%" PRIu32 ","
@@ -2320,6 +2326,7 @@ int dns_server_metrics_json(char *out, size_t cap)
         blocklist_domain_count(), blocklist_is_loading() ? "true" : "false",
         blocklist_is_paused() ? "true" : "false",
         pause_count(),
+        bypass_count(),
         blocklist_dropped_count(),
         blocklist_feed_failures(),
         blocklist_sd_status(), blocklist_sd_bytes(),

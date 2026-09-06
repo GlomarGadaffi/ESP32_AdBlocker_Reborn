@@ -70,6 +70,9 @@ metrics fields from `dns_server_metrics_json()` in `dns_server.cpp`.
 | POST | `/acl/add` | Add a client IP to the ACL. |
 | POST | `/acl/remove` | Remove one ACL entry. |
 | POST | `/acl/clear` | Empty the ACL (empty = allow all). |
+| POST | `/bypass/add` | Add a client IP to the per-client bypass list (#74 Part 2) — that client always resolves unfiltered. |
+| POST | `/bypass/remove` | Remove one bypass entry. |
+| POST | `/bypass/clear` | Empty the bypass list. |
 | POST | `/dot/zones` | Save the comma-separated local-zone suffixes (names forwarded to the router in plain DNS, never over DoT; single-label names always are). |
 | POST | `/dot/set` | Configure the DNS-over-TLS upstream (server + SNI), or turn it off. |
 | POST | `/net/upstream` | Choose which interface egresses upstream queries. Applied live. |
@@ -123,6 +126,7 @@ A single JSON object. Field names are exactly as emitted.
 | `blocklist_loading` | bool | A reload is in progress. |
 | `blocklist_paused` | bool | Global pause (the persistent on/off switch) is on. |
 | `pause_active` | int | Timed pause entries currently in force, across all scopes. Expired entries are not counted. |
+| `bypass_count` | int | Entries on the standing per-client bypass list (#74 Part 2). |
 | `blocklist_dropped` | int | Entries lost to `BLOCKLIST_CAPACITY` on the last reload. |
 | `blocklist_feed_failures` | int | Extra feeds that hard-failed on the last publishing reload. Non-zero means the live list is missing whole sources, and the SD snapshot is vetoed. |
 | `flash_status` | string | Flash-slot persistence state (#70): `unknown`, `absent` (partitions missing — pre-#70 image), `empty` (never written), `bad-count`, `short-read`, `invalid-index`, `loaded`, `saved`, `too-big`, `erase-failed`, `write-failed`. |

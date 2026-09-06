@@ -49,6 +49,7 @@
 #include "domain.h"
 #include "rewrite.h"
 #include "acl.h"
+#include "bypass.h"
 #include "pause.h"
 #include "dot.h"
 #include "localzone.h"
@@ -1241,12 +1242,13 @@ static esp_err_t IRAM_ATTR l2_input_cb(esp_eth_handle_t h, uint8_t *buf, uint32_
          * required to answer here; denied OR unknown defers to that socket,
          * which drops the query if it really is denied. */
         if (!acl_permits_nb(src_hbo)) break;
-        /* (#48) A client under a timed pause must get the real answer, which
-         * only the socket path can fetch. Deferring here (rather than
-         * answering "not blocked") keeps this hook's rule intact: it never
-         * forwards, and it never answers on a verdict the socket path would
-         * override. The socket path re-derives the pause from the same table. */
-        if (pause_active_for(src_hbo)) break;
+        /* (#48/#74) A client under a timed pause, or on the standing bypass
+         * list, must get the real answer, which only the socket path can
+         * fetch. Deferring here (rather than answering "not blocked") keeps
+         * this hook's rule intact: it never forwards, and it never answers
+         * on a verdict the socket path would override. The socket path
+         * re-derives both from the same tables. */
+        if (pause_active_for(src_hbo) || bypass_active_for_nb(src_hbo)) break;
         int udp = 14 + ihl;
         if (((buf[udp + 2] << 8) | buf[udp + 3]) != 53) break;   /* dst port 53 */
         int udplen = (buf[udp + 4] << 8) | buf[udp + 5];         /* (#106) */
@@ -1519,6 +1521,7 @@ extern "C" void app_main(void)
     localzone_init_nvs();
     dot_init_nvs();
     acl_init();
+    bypass_init();
     pause_init();
     query_log_init();
 
