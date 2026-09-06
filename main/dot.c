@@ -7,9 +7,11 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
+#include "freertos/semphr.h"
 #include <string.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <stdatomic.h>
 
 static const char *TAG = "dot";
 #define NVS_NS  "dns_sink"
@@ -30,11 +32,13 @@ typedef struct { uint16_t len; uint8_t failed; uint8_t data[DOT_REP_MAX]; } dot_
 static bool s_enabled    = false;
 static char s_server[64] = "1.1.1.1";
 static char s_sni[64]    = "one.one.one.one";
+static SemaphoreHandle_t s_cfg_mutex = NULL;   /* guards s_server/s_sni */
 
-static QueueHandle_t s_req_q = NULL;
-static QueueHandle_t s_rep_q = NULL;
-static bool          s_worker_up = false;
-static esp_tls_t    *s_conn = NULL;      /* worker-task-only */
+static QueueHandle_t  s_req_q = NULL;
+static QueueHandle_t  s_rep_q = NULL;
+static bool           s_worker_up = false;
+static esp_tls_t     *s_conn = NULL;      /* worker-task-only */
+static _Atomic bool   s_reconnect = false; /* config changed; worker must drop s_conn */
 
 bool dot_is_enabled(void) { return s_enabled && s_worker_up; }
 
@@ -49,24 +53,29 @@ static bool conn_ensure(void)
 {
     if (s_conn) return true;
 
+    char host[80], sni[64];
+    xSemaphoreTake(s_cfg_mutex, portMAX_DELAY);
+    snprintf(host, sizeof(host), "%s", s_server);
+    snprintf(sni,  sizeof(sni),  "%s", s_sni);
+    xSemaphoreGive(s_cfg_mutex);
+
     esp_tls_cfg_t cfg = {
         .timeout_ms          = DOT_TIMEOUT_MS,
         .crt_bundle_attach   = esp_crt_bundle_attach,
         .skip_common_name    = false,
-        .common_name         = s_sni[0] ? s_sni : NULL,
+        .common_name         = sni[0] ? sni : NULL,
         .use_secure_element  = false,
         .use_global_ca_store = false,
     };
     esp_tls_t *tls = esp_tls_init();
     if (!tls) return false;
-    char host[80]; snprintf(host, sizeof(host), "%s", s_server);
     if (esp_tls_conn_new_sync(host, strlen(host), DOT_PORT, &cfg, tls) != 1) {
-        ESP_LOGW(TAG, "TLS connect failed (%s:%d)", s_server, DOT_PORT);
+        ESP_LOGW(TAG, "TLS connect failed (%s:%d)", host, DOT_PORT);
         esp_tls_conn_destroy(tls);
         return false;
     }
     s_conn = tls;
-    ESP_LOGI(TAG, "persistent DoT session up (%s, SNI %s)", s_server, s_sni);
+    ESP_LOGI(TAG, "persistent DoT session up (%s, SNI %s)", host, sni);
     return true;
 }
 
@@ -109,6 +118,10 @@ static void dot_task(void *arg)
 {
     (void)arg;
     for (;;) {
+        if (atomic_load_explicit(&s_reconnect, memory_order_relaxed)) {
+            conn_drop();
+            atomic_store_explicit(&s_reconnect, false, memory_order_relaxed);
+        }
         dot_req_t req;
         if (xQueueReceive(s_req_q, &req, pdMS_TO_TICKS(1000)) != pdTRUE) {
             /* idle: nothing to do. The session stays parked; a server-side
@@ -180,10 +193,18 @@ int dot_reply_get(uint8_t *out, int cap, bool *failed)
 
 void dot_set(bool enabled, const char *server_ip, const char *sni)
 {
+    xSemaphoreTake(s_cfg_mutex, portMAX_DELAY);
+    bool changed = (enabled != s_enabled)
+        || (server_ip && strcmp(server_ip, s_server) != 0)
+        || (sni       && strcmp(sni,       s_sni)    != 0);
     s_enabled = enabled;
     if (server_ip) snprintf(s_server, sizeof(s_server), "%s", server_ip);
     if (sni)       snprintf(s_sni,    sizeof(s_sni),    "%s", sni);
+    xSemaphoreGive(s_cfg_mutex);
 
+    /* NVS write outside the lock (acl.c/rewrite.c convention) — the single
+     * httpd task is the only writer, so reading s_server/s_sni back here
+     * can't race a second dot_set(). */
     nvs_handle_t h;
     if (nvs_open(NVS_NS, NVS_READWRITE, &h) == ESP_OK) {
         nvs_set_u8(h,  "dot_en",  enabled ? 1 : 0);
@@ -192,6 +213,7 @@ void dot_set(bool enabled, const char *server_ip, const char *sni)
         nvs_commit(h);
         nvs_close(h);
     }
+    if (changed) atomic_store_explicit(&s_reconnect, true, memory_order_relaxed);
     if (enabled) worker_start_once();
 }
 
@@ -204,6 +226,7 @@ void dot_get(bool *en, char *srv, char *sni)
 
 bool dot_init_nvs(void)
 {
+    if (!s_cfg_mutex) s_cfg_mutex = xSemaphoreCreateMutex();
     nvs_handle_t h;
     if (nvs_open(NVS_NS, NVS_READONLY, &h) != ESP_OK) return true;
     uint8_t en = 0;
