@@ -51,6 +51,7 @@ static const char *reason_str(esp_reset_reason_t r)
     case ESP_RST_DEEPSLEEP: return "deepsleep";
     case ESP_RST_BROWNOUT:  return "brownout";
     case ESP_RST_SDIO:      return "sdio";
+    case ESP_RST_USB:       return "usb";
     default:                return "unknown";
     }
 }

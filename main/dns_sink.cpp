@@ -783,12 +783,26 @@ static void wifi_scan_task(void *)
         const size_t cap = sizeof(s_scan_json);
         int n = snprintf(s_scan_json, cap, "[");
         for (uint16_t i = 0; i < got && n < (int)cap - 128; i++) {
-            char ssid[64]; size_t sl = 0;   /* minimal JSON-string escape */
+            /* #104: an SSID is an opaque octet string (802.11), not text — it
+             * may legitimately contain bytes < 0x20. RFC 8259 forbids those
+             * unescaped in a JSON string; the old loop copied them raw, which
+             * broke r.json() client-side and reported as a generic "scan
+             * failed" for every viewer for as long as that AP stayed in
+             * range. \u00XX is 6 bytes, so the per-iteration bound has to
+             * cover the widest escape this loop can emit, not just \" / \\'s
+             * 2 bytes — an exotic SSID now truncates instead of overflowing,
+             * same truncate-on-overflow policy as before. */
+            char ssid[64]; size_t sl = 0;
             for (size_t j = 0; recs[i].ssid[j] != 0 && j < sizeof(recs[i].ssid)
-                               && sl < sizeof(ssid) - 2; j++) {
-                char c = (char)recs[i].ssid[j];
-                if (c == '"' || c == '\\') ssid[sl++] = '\\';
-                ssid[sl++] = c;
+                               && sl < sizeof(ssid) - 6; j++) {
+                unsigned char c = (unsigned char)recs[i].ssid[j];
+                if (c == '"' || c == '\\') {
+                    ssid[sl++] = '\\'; ssid[sl++] = (char)c;
+                } else if (c < 0x20 || c == 0x7F) {
+                    sl += snprintf(&ssid[sl], 7, "\\u%04x", (unsigned)c);
+                } else {
+                    ssid[sl++] = (char)c;
+                }
             }
             ssid[sl] = '\0';
             n += snprintf(s_scan_json + n, cap - n,
