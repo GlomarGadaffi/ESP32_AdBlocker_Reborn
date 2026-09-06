@@ -2,8 +2,8 @@
 
 Small repo, no ceremony: read the constraints below before touching the query
 path, keep comments factual, and don't leave a number in a doc you can't point
-at in source. `ISSUES.md` is the running, code-grounded record of findings and
-fixes — add to it rather than starting a new file.
+at in source. Findings and fixes are tracked in GitHub Issues — open one
+there rather than starting a tracking file in the repo.
 
 Build and flash instructions are in the README. ESP-IDF v6.0.x, native
 Windows, PowerShell `export.ps1` (Git Bash / MSYS is not a supported build
