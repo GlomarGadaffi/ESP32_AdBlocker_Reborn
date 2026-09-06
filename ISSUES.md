@@ -871,8 +871,44 @@ Surfaced at `GET /lastwords` (`web_ui.cpp`, JSON, same `auth_wrap` gate and
 access-control mechanism, reuses what every other admin page already
 requires.
 
-**Not yet verified on hardware** — builds clean; needs a real forced panic
-(e.g. an intentional `abort()` behind a debug console command) to confirm
-`/lastwords` shows the right pre-crash query history after reboot, and
-ideally confirmation that RTC memory actually survives a real watchdog reset
-on this board, not just a software `esp_restart()`.
+**Verified on hardware 2026-09-06 (Waveshare, this PR's image), full reflash
+via serial:**
+- `flash_status` progressed `empty` → `saved` → `loaded` exactly as designed:
+  first boot on the new partition table had no valid slot, a cold reload
+  (618,703 domains) wrote it, and a reboot loaded from flash at **11 s
+  uptime** instead of the ~5 minute cold download this board used to need
+  every single boot (it has no SD card). `sd_status` correctly read
+  `open-failed` throughout (no card — expected, harmless, unchanged from
+  before this PR).
+- `/lastwords` correctly read `available:false` on the very first boot of
+  this image (RTC memory held a previous, unrelated firmware's bits, magic
+  didn't match), then `available:true` on every boot after, including across
+  both a `usb_reset`-triggered hard reset from esptool (`reset_reason:
+  "unknown"` — a real quirk of that specific reset path, not a classification
+  bug: see below) and a software `/reboot` (`reset_reason: "sw"`, correctly
+  distinct). A real DNS query for an *allowed* name (`example.com`) showed up
+  in the ring after a reboot with the right domain/qtype/blocked/timestamp.
+
+**A real limitation found by this testing, not previously anticipated:** a
+query for a *blocked* name (`doubleclick.net`) on this Ethernet board never
+appeared in `/lastwords` at all. Root cause: `crashlog_record()` is called
+from inside `query_log_record()`, which only `dns_task` calls — but the L2
+Ethernet fast-path hook (`l2_input_cb` in `dns_sink.cpp`) answers BLOCK
+verdicts directly from the Ethernet RX task and never touches `dns_task` or
+`query_log_record()` at all (this is the documented, correct two-verdict-path
+design, `CONTRIBUTING.md` §1 — not a bug in that path). Net effect: on an
+Ethernet board, the crash-log ring is blind to exactly the queries the L2
+hook exists to answer fastest, which on a typical blocklist-heavy workload is
+a large fraction of blocked traffic. Not fixed here — recording from inside
+an `IRAM_ATTR` hot path is a separate design question (the same RTC write
+that's cheap from `dns_task` needs the same "never fault, never allocate"
+scrutiny CONTRIBUTING.md §4 already applies to that path) — tracked as a
+follow-up, not silently left looking more complete than it is.
+
+**Not yet verified on hardware:** a real forced panic (e.g. an intentional
+`abort()` behind a debug console command) to confirm `/lastwords` survives an
+actual crash, not just a clean `/reboot`; a genuine power-cut mid-flash-write
+to confirm the A/B fallback in `blocklist_load_flash()` actually recovers
+(the logic was verified by code review — see the bug already caught and
+fixed above — but not by fault injection); and both features on the Wi-Fi-only
+board's smaller partition sizing / no-L2-hook configuration.

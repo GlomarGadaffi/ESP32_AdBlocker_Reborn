@@ -48,6 +48,7 @@ metrics fields from `dns_server_metrics_json()` in `dns_server.cpp`.
 | POST | `/logout` | Destroy the current session and clear the cookie. |
 | GET | `/` | Status page (Dashboard + tabs). Auto-refreshes every 10 s. |
 | GET | `/metrics` | JSON counters and latency histograms — see below. |
+| GET | `/lastwords` | JSON crash flight recorder (#71) — see below. |
 | POST | `/metrics/reset` | Zero the counters and histograms. |
 | POST | `/reload` | Reload the blocklist now (does not shift the 4 h timer). |
 | POST | `/blocklist/stop` | Abort an in-progress download/reload; the previously loaded list keeps serving. |
@@ -121,6 +122,7 @@ A single JSON object. Field names are exactly as emitted.
 | `pause_active` | int | Timed pause entries currently in force, across all scopes. Expired entries are not counted. |
 | `blocklist_dropped` | int | Entries lost to `BLOCKLIST_CAPACITY` on the last reload. |
 | `blocklist_feed_failures` | int | Extra feeds that hard-failed on the last publishing reload. Non-zero means the live list is missing whole sources, and the SD snapshot is vetoed. |
+| `flash_status` | string | Flash-slot persistence state (#70): `unknown`, `absent` (partitions missing — pre-#70 image), `empty` (never written), `bad-count`, `short-read`, `invalid-index`, `loaded`, `saved`, `too-big`, `erase-failed`, `write-failed`. |
 | `heap_free` | int | Free internal heap, bytes. |
 | `heap_largest` | int | Largest *contiguous* internal block. This, not `heap_free`, is what TLS setup fails on. |
 | `psram_free` | int | Free PSRAM, bytes. |
@@ -135,3 +137,19 @@ each `{"p50":N,"p99":N,"max":N,"count":N}` in microseconds.
 
 The whole response is built into a fixed 2048 B buffer and clamped to it;
 worst case today is roughly 1.3 KB.
+
+## `GET /lastwords`
+
+The crash flight recorder (#71) — whatever `main/crashlog.c`'s `RTC_NOINIT_ATTR`
+struct held at the moment of the *previous* boot's reset, snapshotted by
+`crashlog_init()` before the live struct keeps recording for the current boot.
+
+| field | type | meaning |
+| --- | --- | --- |
+| `available` | bool | `false` on the first boot ever, or if the last reset was power-on/brownout (RTC memory doesn't survive those) — nothing else below is meaningful when this is `false`. |
+| `reset_reason` | string | `poweron`, `ext`, `sw`, `panic`, `int_wdt`, `task_wdt`, `wdt`, `deepsleep`, `brownout`, `sdio`, or `unknown`. Always present, even when `available` is `false`. |
+| `queries_total` | int | Queries recorded since the RTC struct was last reinitialized (not since this boot — it survives resets). |
+| `heap_free_min` | int | `esp_get_minimum_free_heap_size()` as of the last recorded query before the reset. |
+| `queries` | array | Up to 8 entries, newest first: `{"domain":"...","qtype":N,"blocked":bool,"ts_s":N}`. `domain` is truncated to 31 characters. `ts_s` is uptime seconds at record time, from the boot that crashed — not wall-clock. |
+
+Built into a fixed 1024 B buffer.
