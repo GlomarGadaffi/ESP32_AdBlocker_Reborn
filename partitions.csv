@@ -1,0 +1,25 @@
+# Custom partition table — LilyGO T-ETH-Elite and Waveshare ESP32-S3-ETH
+# (both 16 MB flash). The first five rows are byte-identical to ESP-IDF's
+# built-in partitions_two_ota_large.csv, verified against the actual
+# gen_esp32part.py output of the pre-#70 build (nvs@0x9000/24K,
+# otadata@0xf000/8K, phy_init@0x11000/4K, ota_0@0x20000/1700K,
+# ota_1@0x1d0000/1700K) — offsets are explicit, not left for the tool to
+# infer, so switching to this custom table cannot shift existing NVS/OTA
+# data on a board being reflashed from a pre-#70 image.
+#
+# bl_a/bl_b (#70): the A/B slot pair for the flash-resident blocklist image.
+# 2700K each covers BLOCKLIST_CAPACITY (800,000 entries -> BL_IMAGE_BYTES =
+# 2,662,148 B, see main/bl_table.h) with headroom; blocklist_save_flash()
+# refuses (logs, skips) rather than overflows if a board's PSRAM-derived
+# capacity ever exceeds what a slot can hold. Custom subtype 0x40 for both —
+# addressed by NAME, not subtype; the tail of a 16 MB chip has ~12.4 MB free,
+# so 5.4 MB for both slots combined is not a tight fit.
+#
+# Name,     Type, SubType,  Offset,   Size,   Flags
+nvs,        data, nvs,      0x9000,   0x6000,
+otadata,    data, ota,      0xf000,   0x2000,
+phy_init,   data, phy,      0x11000,  0x1000,
+ota_0,      app,  ota_0,    0x20000,  1700K,
+ota_1,      app,  ota_1,    0x1d0000, 1700K,
+bl_a,       data, 0x40,     ,         2700K,
+bl_b,       data, 0x40,     ,         2700K,

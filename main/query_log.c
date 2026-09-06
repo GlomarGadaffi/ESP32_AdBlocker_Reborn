@@ -1,5 +1,6 @@
 #include "query_log.h"
 #include "timesync.h"
+#include "crashlog.h"
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
 #include "esp_log.h"
@@ -57,6 +58,11 @@ bool query_log_init(void)
 void query_log_record(const char *domain, uint16_t qtype, uint32_t client_ip_hbo,
                       bool blocked, bool rewritten)
 {
+    /* (#71) Cheap RTC-memory breadcrumb, independent of the PSRAM ring below:
+     * survives a panic/watchdog reset the ring's own PSRAM contents can't be
+     * trusted through. Recorded even if the PSRAM ring failed to allocate. */
+    crashlog_record(domain, qtype, blocked);
+
     if (!s_ring || !s_top_d || !s_top_c) return;
 
     uint32_t idx = atomic_fetch_add(&s_head, 1) % QLOG_SIZE;

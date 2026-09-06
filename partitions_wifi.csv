@@ -1,0 +1,18 @@
+# Custom partition table — generic ESP32-S3 Wi-Fi-only board (#49), 8 MB
+# flash. Same first five rows as partitions.csv (identical offsets — the OTA
+# layout is board-agnostic and already baked into every board's pre-#70
+# image via the stock two_ota_large table), smaller bl_a/bl_b: this board's
+# PSRAM (and therefore capacity_for_psram()'s ceiling) is typically far
+# below the 16 MB boards' 800,000-entry cap — as low as 50,000 on a 2 MB
+# QUAD-PSRAM module (see sdkconfig.board.generic-s3-wifi) — so 1500K/slot
+# (room for ~424,000 entries) is generous, not tight, against the chip's
+# ~4.5 MB of tail space after the base 3.47 MB OTA layout.
+#
+# Name,     Type, SubType,  Offset,   Size,   Flags
+nvs,        data, nvs,      0x9000,   0x6000,
+otadata,    data, ota,      0xf000,   0x2000,
+phy_init,   data, phy,      0x11000,  0x1000,
+ota_0,      app,  ota_0,    0x20000,  1700K,
+ota_1,      app,  ota_1,    0x1d0000, 1700K,
+bl_a,       data, 0x40,     ,         1500K,
+bl_b,       data, 0x40,     ,         1500K,

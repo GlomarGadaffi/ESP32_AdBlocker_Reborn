@@ -53,6 +53,7 @@
 #include "dot.h"
 #include "localzone.h"
 #include "query_log.h"
+#include "crashlog.h"
 #include "timesync.h"
 #include "dns_server.h"
 #include "web_ui.h"
@@ -1028,11 +1029,14 @@ static void sd_mount(void)
 /* ── Blocklist download task (Core 0, priority 2) ────────────────── */
 static void download_task(void *)
 {
-    /* Boot: try SD cache first for instant blocking. If present, DO NOT
-     * re-download on every boot — it wastes ~230s of bandwidth and opens a
-     * sort null-window. The 4h-reload timer (or manual /reload) refreshes. */
-    bool from_sd = blocklist_load_sd();
-    if (!from_sd) {
+    /* Boot: try flash first (#70 — instant, needs no SD card, works on every
+     * board including the Wi-Fi-only #49 target), then SD, before ever
+     * downloading. Either hit means DO NOT re-download on every boot — that
+     * wastes ~230s of bandwidth and opens a sort null-window. The 4h-reload
+     * timer (or manual /reload) refreshes either way. */
+    bool from_flash = blocklist_load_flash();
+    bool from_sd    = from_flash ? false : blocklist_load_sd();
+    if (!from_flash && !from_sd) {
         /* #75: this is the first TLS client on a cold boot, and now that
          * certificate dates are actually checked (CONFIG_MBEDTLS_HAVE_TIME_DATE)
          * it wants real time, not the floor. The floor is a lower bound and can
@@ -1047,7 +1051,7 @@ static void download_task(void *)
                           "clock floor; a certificate issued since then will be "
                           "rejected until NTP lands", timesync_source());
 
-        ESP_LOGI(TAG, "No SD cache — downloading blocklist...");
+        ESP_LOGI(TAG, "No cached blocklist (flash or SD) — downloading...");
         /* Retry with backoff (#57). blocklist_load() returns the domain count,
          * so 0 means the fetch failed; that used to be discarded, leaving the
          * sinkhole with an empty list — every query ALLOWED, silently — until
@@ -1068,8 +1072,8 @@ static void download_task(void *)
                               "until the next 4h reload or a manual /reload");
         }
     } else {
-        ESP_LOGI(TAG, "SD cache active (%" PRIu32 " domains) — skipping boot refresh",
-                 blocklist_domain_count());
+        ESP_LOGI(TAG, "%s cache active (%" PRIu32 " domains) — skipping boot refresh",
+                 from_flash ? "Flash" : "SD", blocklist_domain_count());
     }
     ESP_LOGI(TAG, "download_task stack hwm: %u bytes free",
              (unsigned)uxTaskGetStackHighWaterMark(NULL));
@@ -1359,6 +1363,11 @@ static void halt_or_rollback(const char *reason)
 /* ── app_main ────────────────────────────────────────────────────── */
 extern "C" void app_main(void)
 {
+    /* (#71) First thing, before anything else can plausibly reset or reason
+     * about the RTC-memory breadcrumb: snapshot whatever the last boot left
+     * behind and classify why we're here. Needs no NVS, no PSRAM, no clock. */
+    crashlog_init();
+
     /* NVS */
     esp_err_t r = nvs_flash_init();
     if (r == ESP_ERR_NVS_NO_FREE_PAGES || r == ESP_ERR_NVS_NEW_VERSION_FOUND) {
