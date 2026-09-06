@@ -1160,6 +1160,86 @@ extern "C" uint32_t dns_sink_l2_blocked(void) { return s_l2_blocked; }
 extern "C" uint32_t dns_sink_l2_cached(void)  { return s_l2_cached; }
 extern "C" uint32_t dns_sink_l2_fallthrough(void) { return s_l2_fallthrough; }
 
+/* Query-log staging ring (feature request, 2026-09-06): l2_input_cb answers
+ * most blocked/cached queries on Ethernet boards WITHOUT ever calling
+ * query_log_record() — that function lives in flash and isn't IRAM_ATTR, so
+ * calling it directly from this hot path would risk exactly the "must never
+ * fault to flash" hazard CONTRIBUTING.md §4 warns about. Bypassing it
+ * entirely was the original tradeoff (#78's comment: "the hook's cheaper
+ * check set is not a divergence"), but it meant the query log, top-lists,
+ * per-minute history, and #71's crash-log breadcrumb were all blind to the
+ * MAJORITY of blocked traffic on Ethernet boards (measured live on .244:
+ * l2_blocked outnumbers the socket path's own blocked count roughly 6:1).
+ *
+ * Fix: a small lock-free SPSC ring, internal RAM (not PSRAM — this hook's
+ * scratch stays internal per CONTRIBUTING.md §3a, for latency, not just
+ * flash-safety). l2_input_cb (producer, IRAM_ATTR) stages a raw record with
+ * a few atomic ops and a memcpy — no snprintf, no flash. dns_task (consumer,
+ * not IRAM-constrained) drains it on its existing per-tick housekeeping and
+ * calls the real query_log_record() for each entry, which is where
+ * crashlog_record() already lives — so this closes the #71 blind spot too,
+ * for free, the same "fix once, reuse everywhere" shape as this session's
+ * pause/bypass work. Ring full (a burst beyond what the tick-rate drain can
+ * keep up with) drops and counts rather than blocking or overwriting — the
+ * L2 hook must never stall waiting on dns_task. */
+#define L2LOG_RING 32
+typedef struct {
+    char     domain[64];
+    uint32_t client_ip;   /* host byte order */
+    uint16_t qtype;
+    bool     blocked;     /* false = l2_cached (an allowed answer) */
+} L2LogEntry;
+static L2LogEntry            s_l2log[L2LOG_RING];
+static std::atomic<uint32_t> s_l2log_head{0};   /* producer-owned (eth RX task) */
+static std::atomic<uint32_t> s_l2log_tail{0};   /* consumer-owned (dns_task) */
+static std::atomic<uint32_t> s_l2log_dropped{0}; /* producer increments, httpd task reads */
+
+static void IRAM_ATTR l2_log_stage(const char *name, size_t nlen, uint16_t qtype,
+                                   uint32_t client_ip_hbo, bool blocked)
+{
+    uint32_t head = s_l2log_head.load(std::memory_order_relaxed);
+    uint32_t tail = s_l2log_tail.load(std::memory_order_acquire);
+    /* Ring full: drop and count, never block or overwrite — the L2 hook must
+     * never stall waiting on dns_task. A nonzero l2_log_dropped means a burst
+     * outran the ~100ms drain rate for that window, not a bug; which specific
+     * queries were lost isn't recorded, only the count. */
+    if (head - tail >= L2LOG_RING) {
+        s_l2log_dropped.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    L2LogEntry *e = &s_l2log[head % L2LOG_RING];
+    size_t cl = nlen < sizeof(e->domain) - 1 ? nlen : sizeof(e->domain) - 1;
+    memcpy(e->domain, name, cl);
+    e->domain[cl] = '\0';
+    e->client_ip = client_ip_hbo;
+    e->qtype = qtype;
+    e->blocked = blocked;
+    s_l2log_head.store(head + 1, std::memory_order_release);
+}
+
+/* Consumer, called from dns_task: pulls one staged entry, if any. Returns
+ * false when the ring is empty. Not IRAM_ATTR — dns_task isn't flash-
+ * constrained the way the L2 hook is. */
+extern "C" bool dns_sink_l2log_drain(char *domain_out, size_t domain_cap,
+                                     uint16_t *qtype_out, uint32_t *client_ip_out,
+                                     bool *blocked_out)
+{
+    uint32_t tail = s_l2log_tail.load(std::memory_order_relaxed);
+    uint32_t head = s_l2log_head.load(std::memory_order_acquire);
+    if (tail == head) return false;
+    L2LogEntry *e = &s_l2log[tail % L2LOG_RING];
+    size_t cl = strnlen(e->domain, sizeof(e->domain));
+    if (cl >= domain_cap) cl = domain_cap - 1;
+    memcpy(domain_out, e->domain, cl);
+    domain_out[cl] = '\0';
+    *qtype_out = e->qtype;
+    *client_ip_out = e->client_ip;
+    *blocked_out = e->blocked;
+    s_l2log_tail.store(tail + 1, std::memory_order_release);
+    return true;
+}
+extern "C" uint32_t dns_sink_l2log_dropped(void) { return s_l2log_dropped.load(std::memory_order_relaxed); }
+
 /* Parse question qname → normalized name; return qend offset within DNS msg.
  * IRAM_ATTR (#78): called from l2_input_cb, which must never fault to flash. */
 #if CONFIG_ADBLOCK_NET_ETH
@@ -1301,6 +1381,7 @@ static esp_err_t IRAM_ATTR l2_input_cb(esp_eth_handle_t h, uint8_t *buf, uint32_
             uint16_t cks=~csum; tx[14+10]=(cks>>8); tx[14+11]=(cks&0xFF);
             if (esp_eth_transmit(h, tx, dns + clen) != ESP_OK) s_l2_tx_fail++;
             s_l2_cached++;
+            l2_log_stage(name, nlen, qtype, src_hbo, false);
             free(buf);                                    /* consumed (== eth_l2_free) */
             return ESP_OK;
         }
@@ -1341,6 +1422,7 @@ static esp_err_t IRAM_ATTR l2_input_cb(esp_eth_handle_t h, uint8_t *buf, uint32_
 
         if (esp_eth_transmit(h, tx, frame) != ESP_OK) s_l2_tx_fail++;
         s_l2_blocked++;
+        l2_log_stage(name, nlen, qtype, src_hbo, true);
         free(buf);                                       /* we consumed it (== eth_l2_free) */
         return ESP_OK;
     } while (0);

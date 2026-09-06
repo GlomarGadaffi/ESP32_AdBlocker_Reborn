@@ -1040,3 +1040,67 @@ sensitivity to a genuine later stall is unchanged. The Waveshare test-boots
 tripped this — a good argument for testing resilience features against
 genuinely noisy production conditions, not just a quiet test board, before
 calling them done.
+
+## Feature: L2 fast-path queries now visible in the query log (#124)
+
+User request (2026-09-06): "I'd like to see our blocked queries show up in
+the query log." Root cause matched the blind spot already documented above
+under #71's `.244` testing — `l2_input_cb` (the L2 Ethernet fast path)
+answers most cache-hit and blocklist-hit queries directly from the Ethernet
+RX task and never calls `query_log_record()`, because that function lives in
+flash and calling it from an `IRAM_ATTR` hook risks the exact "must never
+fault to flash" hazard CONTRIBUTING.md §4 exists to prevent. On `.244`,
+`l2_blocked` outnumbers the socket path's own blocked-query count roughly
+6:1 — so the majority of blocked traffic was invisible to `/log`, the
+top-lists, per-minute history, and #71's crash-log ring, on any Ethernet
+board.
+
+**Design:** a small lock-free SPSC ring in internal RAM (`s_l2log[32]`,
+`dns_sink.cpp`) — not PSRAM, matching CONTRIBUTING.md §3a's rule that this
+hook's scratch stays internal for latency. `l2_input_cb` (producer,
+`IRAM_ATTR`) stages a raw record — domain, qtype, client IP, blocked flag —
+with a `memcpy` and a couple of atomic index bumps at its two answer points
+(`l2_cached`, `l2_blocked`); no `snprintf`, no flash-resident call, from that
+context. `dns_task` (consumer, not IRAM-constrained) drains up to 32 entries
+per ~100ms tick — same "bounded work per wakeup" shape as the existing
+upstream-reply and DoT drains — calling the real `query_log_record()` for
+each, which automatically closes the #71 crash-recorder blind spot too,
+since `crashlog_record()` already lives inside `query_log_record()`. Ring
+full drops and counts (`l2_log_dropped` in `/metrics`) rather than blocking
+or overwriting — the L2 hook must never stall waiting on `dns_task`; a
+nonzero count means a burst outran that window's drain rate, not a bug, and
+which specific queries were lost isn't recorded, only the count.
+
+**Bug caught before hardware, via `advisor()`:** the first draft used C11
+`_Atomic uint32_t` / `<stdatomic.h>` free-function atomics (copied from the
+plain-`.c` convention in `pause.c`/`blocklist.c`), which doesn't compile in
+`dns_sink.cpp` (a `.cpp` file, compiled as C++) — `atomic_load_explicit`
+etc. don't exist without the `std::` prefix there. Fixed to
+`std::atomic<uint32_t>` with `.load()`/`.store()`/`.fetch_add()`
+member-function style, matching the file's existing convention (e.g.
+`s_eth_ip_nbo.load(std::memory_order_relaxed)`). Two more issues surfaced by
+the same `advisor()` pass, both fixed before any build: `s_l2log_dropped`
+was a plain (non-atomic) `uint32_t` incremented with `++` from the producer
+but read from the httpd task via the `/metrics` getter — a real
+read-modify-write race in a block whose whole point is lock-free
+correctness, fixed by making it `std::atomic<uint32_t>` with
+`fetch_add(1, std::memory_order_relaxed)`; and the consumer-side drain used
+`snprintf(domain_out, cap, "%s", ...)` for a plain fixed-buffer copy, swapped
+for `memcpy` + explicit NUL (the consumer runs on `dns_task`, not
+IRAM-constrained, but a format-string pass for a plain copy was pointless
+and risked a `-Wformat-truncation` warning under `-Werror`).
+
+**Verified post-fix, pre-flash:** all three board targets
+(`build`/T-ETH-Elite, `build-waveshare`, `build-wifi`) built clean with no
+warnings. Confirmed via `dns-sink.map` that `l2_log_stage`'s body is IRAM-
+resident (folded into `l2_input_cb`'s `.iram1.4` section, which grew from
+the pre-existing baseline to accommodate it) while `dns_sink_l2log_drain`
+correctly landed in flash (`0x42...`-range address), not IRAM — the
+IRAM/flash split the design depends on is real, not just asserted in a
+comment.
+
+**Not yet done:** on-hardware verification (flash Waveshare `.195` first per
+`.244` being production; confirm `/log` actually shows L2-answered
+blocked/cached entries with correct domain/client IP, `l2_log_dropped` stays
+0 under normal load, and no regression to L2 hot-path latency or stability
+via `dns_task_stack_hwm`/lookup histograms before/after), then `.244`.
