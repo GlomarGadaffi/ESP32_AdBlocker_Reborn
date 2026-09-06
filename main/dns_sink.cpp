@@ -1181,7 +1181,18 @@ extern "C" uint32_t dns_sink_l2_fallthrough(void) { return s_l2_fallthrough; }
  * for free, the same "fix once, reuse everywhere" shape as this session's
  * pause/bypass work. Ring full (a burst beyond what the tick-rate drain can
  * keep up with) drops and counts rather than blocking or overwriting — the
- * L2 hook must never stall waiting on dns_task. */
+ * L2 hook must never stall waiting on dns_task.
+ *
+ * Guarded under CONFIG_ADBLOCK_NET_ETH (review, #124 follow-up): unlike the
+ * 4-byte scalar counters just above — cheap enough to leave unconditional so
+ * dns_server.cpp needs no #ifdef — this ring is ~2.3 KB of internal .bss
+ * (L2LOG_RING=32 entries) whose only producer, l2_log_stage(), is only ever
+ * called from l2_input_cb below, itself already gated. Leaving the ring
+ * unconditional would burn that RAM on the Wi-Fi-only build, which has no L2
+ * hook at all, against CONTRIBUTING.md §3a's "internal RAM is the scarce
+ * resource" rule. The #else stub keeps dns_server.cpp's drain call
+ * unconditional the same way the scalar getters are. */
+#if CONFIG_ADBLOCK_NET_ETH
 #define L2LOG_RING 32
 typedef struct {
     char     domain[64];
@@ -1239,6 +1250,10 @@ extern "C" bool dns_sink_l2log_drain(char *domain_out, size_t domain_cap,
     return true;
 }
 extern "C" uint32_t dns_sink_l2log_dropped(void) { return s_l2log_dropped.load(std::memory_order_relaxed); }
+#else  /* !CONFIG_ADBLOCK_NET_ETH — no L2 hook, so no producer ever stages anything */
+extern "C" bool dns_sink_l2log_drain(char *, size_t, uint16_t *, uint32_t *, bool *) { return false; }
+extern "C" uint32_t dns_sink_l2log_dropped(void) { return 0; }
+#endif /* CONFIG_ADBLOCK_NET_ETH — L2 query-log staging ring */
 
 /* Parse question qname → normalized name; return qend offset within DNS msg.
  * IRAM_ATTR (#78): called from l2_input_cb, which must never fault to flash. */

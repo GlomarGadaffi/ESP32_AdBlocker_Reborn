@@ -1104,3 +1104,49 @@ comment.
 blocked/cached entries with correct domain/client IP, `l2_log_dropped` stays
 0 under normal load, and no regression to L2 hot-path latency or stability
 via `dns_task_stack_hwm`/lookup histograms before/after), then `.244`.
+
+**`/code-review` on PR #125 found three real issues, all fixed pre-flash
+(two independent review passes, one at `high` effort, agreed on all three
+with no new findings):**
+
+1. **The PR's own stated goal was only half met.** #124 makes L2-answered
+   cache hits (blocked and allowed) visible in `/log` — but the socket
+   path's own cache-hit branches, both UDP (`dns_server.cpp`, the `ce`
+   block right after "cache hit?") and TCP (the mirrored block in the TCP
+   handler), never called `query_log_record()` at all, on either verdict.
+   Pre-existing, not introduced by #124 — but it left a symmetric,
+   transport-dependent gap: a repeat blocked/allowed query is only visible
+   in the log if the L2 fast path (or a cold/forwarded query) answered it,
+   never if a socket-path cache hit did. Given the whole point of this PR is
+   "make repeat/blocked queries visible," leaving the socket path's own
+   cache hits dark defeated its purpose for any Wi-Fi client, TCP query, or
+   Ethernet query that missed the L2 fast path. Fixed: both UDP and TCP
+   cache-hit branches now call `query_log_record()` after delivering the
+   answer, matching the existing cold-path call sites exactly.
+2. **The ~2.3 KB ring was unconditionally compiled, including on the
+   Wi-Fi-only board, where its only producer (`l2_input_cb`) doesn't exist.**
+   The file's own established convention (documented in the comment right
+   above the ring, for the pre-existing `s_l2_fallthrough` etc.) is: keep
+   tiny 4-byte counters unconditional so `dns_server.cpp` needs no `#ifdef`,
+   but gate anything nontrivial behind `CONFIG_ADBLOCK_NET_ETH`. The ring
+   broke that convention — 2.3 KB of dead internal `.bss` on the Wi-Fi
+   board, against CONTRIBUTING.md §3a's "internal RAM is the scarce
+   resource" rule. Fixed: ring + `l2_log_stage()` now inside
+   `#if CONFIG_ADBLOCK_NET_ETH`, with a two-line `#else` stub
+   (`dns_sink_l2log_drain()` always `false`, `dns_sink_l2log_dropped()`
+   always `0`) so `dns_server.cpp`'s drain call still needs no `#ifdef`.
+   Verified via both `.map` files: `s_l2log`/`.bss` entries present in the
+   default (Ethernet) build, completely absent from `build-wifi`'s — only
+   the two trivial stubs remain there, no unused-function warning either.
+3. **Drain-loop ordering (low severity — a second independent review pass
+   confirmed no functional bug, latency is sub-millisecond against the
+   100ms tick).** The L2 log drain ran BEFORE the "Drain ALL upstream
+   replies first (frees table slots)" block, which its own comment already
+   flags as the higher-priority work. Reordered: drain now runs after both
+   the upstream-reply and DoT drains, before hedged retransmits — matching
+   the priority the surrounding code already states, at zero cost since
+   it's a pure reorder.
+
+All three board targets rebuilt clean (no errors, no warnings) after the
+fixes; `.map` files re-checked to confirm fix 2 actually removed the dead
+weight rather than just compiling around it.

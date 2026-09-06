@@ -1653,24 +1653,6 @@ void DnsSinkServer::run_loop()
                 }
             }
 
-            /* Drain the L2 hook's staged query log (feature request,
-             * 2026-09-06): l2_input_cb answers most blocked/cached queries
-             * on Ethernet boards without ever touching the query log — see
-             * the ring's own comment in dns_sink.cpp for why it can't call
-             * query_log_record() directly from that IRAM_ATTR context.
-             * Capped per tick, same "bounded work per wakeup" shape as the
-             * upstream-reply and DoT drains below — a sustained burst just
-             * spreads the catch-up over a few more 100ms ticks rather than
-             * this loop ever growing unbounded. */
-            {
-                char l2d_dom[64]; uint16_t l2d_qt; uint32_t l2d_ip; bool l2d_blk;
-                for (int dn = 0; dn < 32; dn++) {
-                    if (!dns_sink_l2log_drain(l2d_dom, sizeof(l2d_dom), &l2d_qt, &l2d_ip, &l2d_blk))
-                        break;
-                    query_log_record(l2d_dom, l2d_qt, l2d_ip, l2d_blk, false);
-                }
-            }
-
             (void)sel;  /* select() is just the wait; we drain non-blocking below */
 
             /* ── Drain ALL upstream replies first (frees table slots) ── */
@@ -1711,6 +1693,27 @@ void DnsSinkServer::run_loop()
                                (sockaddr *)&upstream_addr, sizeof(upstream_addr));
                         ESP_LOGW(TAG, "DoT failed — query re-sent over plain UDP");
                     }
+                }
+            }
+
+            /* Drain the L2 hook's staged query log (feature request,
+             * 2026-09-06): l2_input_cb answers most blocked/cached queries
+             * on Ethernet boards without ever touching the query log — see
+             * the ring's own comment in dns_sink.cpp for why it can't call
+             * query_log_record() directly from that IRAM_ATTR context.
+             * Deliberately AFTER the upstream-reply and DoT drains above —
+             * those free upstream table slots and deliver already-arrived
+             * answers, which matters more than log bookkeeping on a tick
+             * that's under load. Capped per tick, same "bounded work per
+             * wakeup" shape as those drains — a sustained burst just spreads
+             * the catch-up over a few more 100ms ticks rather than this loop
+             * ever growing unbounded. */
+            {
+                char l2d_dom[64]; uint16_t l2d_qt; uint32_t l2d_ip; bool l2d_blk;
+                for (int dn = 0; dn < 32; dn++) {
+                    if (!dns_sink_l2log_drain(l2d_dom, sizeof(l2d_dom), &l2d_qt, &l2d_ip, &l2d_blk))
+                        break;
+                    query_log_record(l2d_dom, l2d_qt, l2d_ip, l2d_blk, false);
                 }
             }
 
@@ -1834,12 +1837,22 @@ void DnsSinkServer::run_loop()
                             sendto(csock, tx, tlen, 0, (sockaddr *)&client_addr, clen);
                         s_cnt_blocked++;
                         hist_record(&s_h_cached, esp_timer_get_time() - t_recv);
+                        /* (review, #124 follow-up) A cache hit never logged at
+                         * all until now — the cold path a few dozen lines down
+                         * does, so a repeat query for the same name was
+                         * invisible to /log and the top-lists on every socket
+                         * path (UDP here, TCP's own cache hit below) despite
+                         * #124 making the L2 fast path's equivalent visible. */
+                        query_log_record(name, qtype,
+                            ntohl(client_addr.sin_addr.s_addr), true, false);
                     } else if (ce->resp_len > 0 && ce->resp_len <= (int)sizeof(tx)) {
                         /* allowed: replay the cached raw upstream response */
                         memcpy(tx, ce->resp, ce->resp_len);
                         tx[0] = rx[0]; tx[1] = rx[1];      /* keep client's txid (wire bytes) */
                         sendto(csock, tx, ce->resp_len, 0, (sockaddr *)&client_addr, clen);
                         hist_record(&s_h_cached, esp_timer_get_time() - t_recv);
+                        query_log_record(name, qtype,
+                            ntohl(client_addr.sin_addr.s_addr), false, false);
                     } else {
                         s_cnt_cache_hit--;       /* stale/empty — treat as miss */
                         goto forward;
@@ -2110,11 +2123,13 @@ void DnsSinkServer::run_loop()
                                 s_cnt_blocked++;
                                 tlen = build_blocked_any(q, qend, qtype, tx, sizeof(tx));
                                 hist_record(&s_h_blocked, esp_timer_get_time() - t_recv);
+                                query_log_record(name, qtype, s_tcp.peer_ip, true, false);
                             } else {
                                 memcpy(tx, ce->resp, ce->resp_len);
                                 tx[0] = q[0]; tx[1] = q[1];   /* client's txid */
                                 tlen = ce->resp_len;
                                 hist_record(&s_h_cached, esp_timer_get_time() - t_recv);
+                                query_log_record(name, qtype, s_tcp.peer_ip, false, false);
                             }
                         } else {
                             uint32_t rw_ip = rw_pre;
