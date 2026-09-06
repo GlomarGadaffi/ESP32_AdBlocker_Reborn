@@ -912,3 +912,74 @@ to confirm the A/B fallback in `blocklist_load_flash()` actually recovers
 (the logic was verified by code review — see the bug already caught and
 fixed above — but not by fault injection); and both features on the Wi-Fi-only
 board's smaller partition sizing / no-L2-hook configuration.
+
+**Feature: L2 hook as socket-path watchdog (#77), Wave 3.** `dns_sink.cpp`
+gains `s_l2_fallthrough` — every frame the L2 Ethernet RX hook hands to lwIP
+unanswered, DNS-shaped or not, incremented at the hook's single fall-through
+exit point. `dns_server.cpp`'s `run_loop()` compares that counter's movement
+against its own `s_cnt_total` on the existing 100 ms `select()` wake: if wire
+traffic keeps arriving (fallthrough count moving) while the socket path makes
+no progress at all for ~20 consecutive ticks (~2s), `csock`/`usock` are
+recreated in-task. The replacement socket is bound and confirmed *before* the
+original is closed, so a failed rebind leaves `dns_task` on the socket it
+already had rather than with none; if both sockets fail to even `socket()`
+(not just fail to bind — a much rarer, more serious resource-exhaustion
+signal), `esp_restart()` is the fallback rather than limping along with dead
+DNS and no recovery path. Explicitly out of scope, per the issue itself: a
+fully wedged `dns_task` (no `esp_task_wdt` watches this task today), and any
+hardware W5500 reset (this fix is entirely socket-layer, never touches the
+PHY). The issue's "TX side finding" (both `esp_eth_transmit()` call sites
+discarding their return value) was checked and found already fixed (#101,
+`s_l2_tx_fail`, predates this issue) — nothing to do there.
+
+**Verified on hardware 2026-09-06 (Waveshare, app-only reflash — no
+partition-table change):** `wd_restarts` stayed `0` through boot and several
+real queries, i.e. no false-positive trips during normal operation.
+`l2_fallthrough` climbed steadily with ordinary traffic (ARP/mDNS/etc.),
+confirming the counter itself is live. **Not yet verified:** an actual
+wedged-socket fault injection — only the no-false-positive side was tested;
+deliberately jamming `csock`/`usock` to confirm the watchdog *fires and
+recovers* wasn't attempted this pass.
+
+**Feature: DNS 0x20 case randomization (#72, half — the "0x20" half only;
+sticky upstream sharding stays blocked on multi-upstream config that doesn't
+exist yet, tracked separately).** `dns_server.cpp` gains
+`randomize_qname_case()` (flips each ASCII letter's case unpredictably in the
+outgoing wire qname — label-length bytes are always ≤ 63 and letters are
+≥ 65, so a flat byte scan needs no label-boundary bookkeeping) and
+`query_case_hash()` (a case-**sensitive** hash of the raw wire question,
+independent of `domain_hash()`/`ue->qhash`, which stay case-insensitive since
+they also key the forward cache). Called once per newly-allocated
+`UpstreamEntry` at all three send sites (UDP main forward, UDP serve-stale
+refresh, TCP forward); a DoT-fallback resend or hedge retransmit of the same
+flight reuses the already-randomized bytes rather than re-rolling, which is
+exactly what 0x20 wants — one case pattern per logical query attempt, not
+per packet.
+
+**Deliberately fail-open, not a reject gate — the load-bearing design
+decision in this feature.** `process_reply()`'s H2 check compares the
+reply's case-sensitive hash against `ue->case_hash` and, on mismatch, only
+increments `s_cnt_case_mismatch` — it does **not** discard the reply. Whether
+every hop to the authoritative chain preserves case is a fact about the
+*actual configured upstream*, not something safe to assume; this deployment
+forwards to a LAN router (`192.168.12.1`), not directly to a public resolver,
+and cheap router firmware forwarding paths are a real place case could get
+silently normalized. A hard reject on a wrong assumption there would have
+silently broken every single query on a box whose entire job is being the
+household's DNS resolver — categorically worse than the cache-poisoning risk
+this hardens against. `case_mismatch` is meant to be watched in the field;
+promoting it to an actual reject is future work, gated on that counter
+staying at zero.
+
+**Verified on hardware 2026-09-06 (Waveshare), with real evidence, not just
+code review:** sent real queries for `wikipedia.org`, `github.com` (UDP), and
+`cloudflare.com` (TCP) — the client-visible resolved names came back with
+visibly randomized case (e.g. `giThub.Com`, `CLoUdFLARe.Com`), proving
+randomization is live and this specific upstream (the LAN router) echoes
+case back exactly. **4 forwarded queries, `case_mismatch: 0`** — full case
+fidelity through this deployment's actual upstream. A blocked name
+(`googleadservices.com`) still correctly resolved to `0.0.0.0`, confirming
+the change doesn't touch the block path (it never goes upstream) or
+regress it. `heap_free`/`heap_largest`/`dns_task_stack_hwm` all stayed in
+normal range after the change — no leak or stack-pressure signal from
+either #77 or #72 in this pass.

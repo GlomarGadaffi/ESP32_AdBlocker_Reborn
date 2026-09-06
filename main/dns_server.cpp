@@ -13,6 +13,7 @@
 #include "esp_heap_caps.h"
 #include "esp_random.h"
 #include "esp_attr.h"
+#include "esp_system.h"
 #include "lwip/sockets.h"
 #include <fcntl.h>
 #include <cstring>
@@ -23,6 +24,12 @@
 #include <sys/select.h>
 
 static const char *TAG = "dns_server";
+
+/* (#77) L2 fast-path counter (dns_sink.cpp) — every frame the Ethernet RX
+ * hook hands to lwIP unanswered. Always callable: the getter exists
+ * unconditionally even on the Wi-Fi-only board, where it just always
+ * returns 0 (the hook that increments it isn't compiled in there). */
+extern "C" uint32_t dns_sink_l2_fallthrough(void);
 
 /* ── Metrics: lock-free counters + power-of-2 µs histograms ───────── */
 /* Single dns_task writes; httpd task reads. 32-bit aligned reads are
@@ -43,6 +50,10 @@ static uint32_t s_cnt_blocked      = 0;
 static uint32_t s_cnt_forwarded    = 0;
 static volatile bool s_reset_req   = false;  /* set by httpd; cleared+executed by dns_task */
 static uint32_t s_cnt_drop_table   = 0;  /* upstream table full */
+static uint32_t s_cnt_wd_restarts  = 0;  /* (#77) socket-path watchdog fired */
+static uint32_t s_cnt_case_mismatch = 0; /* (#72) 0x20: reply didn't echo our exact case —
+                                             observability only, never a reject gate; see
+                                             process_reply's H2 check for why */
 static uint32_t s_cnt_mbox_pressure = 0; /* (#81) client-socket drain loop hit its
                                             per-wakeup cap with recvfrom() still
                                             succeeding — the mailbox had more queued
@@ -646,6 +657,9 @@ struct UpstreamEntry {
     int64_t          recv_us;        /* esp_timer µs when client query received */
     int64_t          upstream_us;    /* esp_timer µs when forwarded upstream */
     uint32_t         qhash;          /* domain hash — to key the forward cache on reply */
+    uint32_t         case_hash;      /* (#72) 0x20: case-SENSITIVE hash of the exact bytes
+                                        sent upstream — qhash stays case-insensitive since
+                                        it also keys the forward cache. */
     uint16_t         qtype;
     bool             in_use;
     bool             via_tcp;        /* reply goes to the TCP conn, not client_addr */
@@ -788,6 +802,42 @@ static inline uint32_t query_env_hash(const uint8_t *q, int qlen, int qend)
 {
     uint32_t seed = DOMAIN_HASH_SEED ^ (((uint32_t)q[2] << 8) | q[3]);
     return murmur3_32(q + qend, (size_t)(qlen - qend), seed);
+}
+
+/* (#72) DNS 0x20: flip the case of each ASCII letter in the outgoing qname
+ * unpredictably before it leaves for upstream. An off-path attacker racing a
+ * spoofed reply now has to also guess this per-query case pattern, not just
+ * the 16-bit txid — meaningful extra entropy against cache poisoning
+ * (draft-vixie-dnsext-dns0x20). Label-length bytes are always <= 63 (0x3F)
+ * and ASCII letters are >= 65 ('A'), so a flat scan from the qname's first
+ * byte through its terminating null needs no label-boundary bookkeeping to
+ * stay safe — it can never mistake a length byte for a letter or vice versa.
+ * Called once per NEW outgoing query, on whichever buffer is about to be
+ * forwarded; a retry/hedge/DoT-fallback of the SAME flight reuses those same
+ * bytes rather than re-randomizing, which is exactly what 0x20 wants — one
+ * case pattern per logical query attempt. */
+static inline void randomize_qname_case(uint8_t *pkt, int qend)
+{
+    uint32_t bits = 0; int nbits = 0;
+    for (int i = (int)sizeof(DnsHeader); i < qend - 4; i++) {
+        uint8_t c = pkt[i];
+        if ((c | 0x20) < 'a' || (c | 0x20) > 'z') continue;   /* label-length byte or the null label */
+        if (nbits == 0) { bits = esp_random(); nbits = 32; }
+        if (bits & 1) pkt[i] = c ^ 0x20;
+        bits >>= 1; nbits--;
+    }
+}
+
+/* (#72) Case-SENSITIVE hash of the raw wire question (qname+qtype+qclass),
+ * stored at send time and re-checked against the reply in process_reply()'s
+ * H2 gate. domain_hash()/ue->qhash stay case-insensitive on purpose (they
+ * also key the forward cache, where two differently-cased queries for the
+ * same name must share one entry) — this is a second, independent hash whose
+ * only job is proving the resolver echoed back the exact bytes we sent. */
+static inline uint32_t query_case_hash(const uint8_t *pkt, int qend)
+{
+    return murmur3_32(pkt + sizeof(DnsHeader), (size_t)(qend - (int)sizeof(DnsHeader)),
+                       DOMAIN_HASH_SEED);
 }
 /* The entry a duplicate may actually ride (#76). Three conditions beyond
  * upstream_find_inflight's, all of which matter only to a requester about to
@@ -1348,6 +1398,21 @@ void DnsSinkServer::run_loop()
                 uint16_t rqtype = ntohs(*reinterpret_cast<uint16_t *>(pkt + rqend - 4));
                 if (rqtype != ue->qtype || domain_hash(rname, rnlen) != ue->qhash)
                     return;
+                /* (#72) 0x20: ideally the reply echoes the exact case pattern
+                 * we sent — deliberately NOT a reject gate here, though.
+                 * Whether every hop between here and the authoritative chain
+                 * preserves case (some LAN routers / cheap forwarders don't)
+                 * is a fact about THIS deployment's actual upstream, not
+                 * something safe to assume. A hard reject on mismatch, if
+                 * that assumption is wrong, silently breaks every query on a
+                 * box whose whole job is being the household resolver — far
+                 * worse than the poisoning risk this is hardening against.
+                 * So: send randomized case (real value against an off-path
+                 * attacker upstream of us), count mismatches for visibility,
+                 * never reject on one. Promote to a reject once the counter
+                 * is proven ~0 in the field against the real upstream. */
+                if (query_case_hash(pkt, rqend) != ue->case_hash)
+                    s_cnt_case_mismatch++;
             }
 
             /* CNAME-cloaking inspection (#74): a tracker hiding behind a CNAME
@@ -1490,6 +1555,85 @@ void DnsSinkServer::run_loop()
             if (s_reset_req) { s_reset_req = false; do_metrics_reset(); }
             if (s_tcp.fd != -1 && now_ms > s_tcp.deadline_ms)
                 tcp_conn_close();   /* idle/stuck client can't hold the slot */
+
+            /* ── L2 socket-path watchdog (#77) ───────────────────────
+             * Wire traffic proves the link and lwIP's netif are alive; our
+             * own query counter proves THESE sockets are making progress.
+             * If the L2 hook's fall-through counter keeps moving while ours
+             * doesn't for several consecutive ticks, csock/usock are likely
+             * wedged (a stuck PCB, not a dead cable) — recreate them,
+             * in-task, never touching another task's fd. Does not cover a
+             * fully wedged dns_task itself (nothing watches this task with
+             * esp_task_wdt today); this covers "task fine, socket dead". */
+            {
+                static uint32_t s_wd_last_l2 = 0, s_wd_last_total = 0, s_wd_stall = 0;
+                uint32_t l2_now = dns_sink_l2_fallthrough();
+                bool traffic  = (l2_now != s_wd_last_l2);
+                bool progress = (s_cnt_total != s_wd_last_total);
+                s_wd_last_l2 = l2_now;
+                s_wd_last_total = s_cnt_total;
+                if (traffic && !progress) {
+                    if (++s_wd_stall >= 20) {   /* ~2s at the 100ms select() timeout */
+                        ESP_LOGE(TAG, "L2 watchdog: wire traffic arriving, no query "
+                                      "progress for ~2s — reopening csock/usock");
+                        /* Bind the replacement BEFORE closing the original: a failed
+                         * rebind then leaves dns_task on the socket it already had,
+                         * never with none. SO_REUSEADDR lets the new socket share
+                         * :53 with the still-open old one for the instant it takes
+                         * to confirm the bind. */
+                        int newc = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
+                        bool c_ok = false;
+                        if (newc >= 0) {
+                            int reuse = 1;
+                            setsockopt(newc, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+                            struct sockaddr_in a{};
+                            a.sin_family = AF_INET; a.sin_addr.s_addr = INADDR_ANY;
+                            a.sin_port = htons(53);
+                            if (bind(newc, (sockaddr *)&a, sizeof(a)) == 0) {
+                                int rcvbuf = 32768;
+                                setsockopt(newc, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+                                close(csock);
+                                csock = newc;
+                                _client_fd.store(csock, std::memory_order_release);
+                                c_ok = true;
+                            } else {
+                                ESP_LOGE(TAG, "watchdog: csock rebind failed (%d) — "
+                                              "keeping the old one", errno);
+                                close(newc);
+                            }
+                        } else {
+                            ESP_LOGE(TAG, "watchdog: csock create failed (%d)", errno);
+                        }
+
+                        /* usock never binds (ephemeral outbound port) — no reuse dance. */
+                        int newu = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
+                        if (newu >= 0) {
+                            int flags = 1;
+                            setsockopt(newu, SOL_SOCKET, SO_REUSEADDR, &flags, sizeof(flags));
+                            close(usock);
+                            usock = newu;
+                            _upstream_fd.store(usock, std::memory_order_release);
+                        } else {
+                            ESP_LOGE(TAG, "watchdog: usock create failed (%d)", errno);
+                        }
+
+                        /* Both recreations failed outright — the socket layer itself
+                         * is out of resources at a level this task can't fix from
+                         * inside. A clean reboot is the safe fallback, same
+                         * philosophy as the OTA rollback path: never leave the
+                         * board serving no DNS with no recovery in sight. */
+                        if (!c_ok && newu < 0) {
+                            ESP_LOGE(TAG, "watchdog: both sockets failed to recreate "
+                                          "— restarting");
+                            esp_restart();
+                        }
+                        s_cnt_wd_restarts++;
+                        s_wd_stall = 0;
+                    }
+                } else {
+                    s_wd_stall = 0;
+                }
+            }
 
             (void)sel;  /* select() is just the wait; we drain non-blocking below */
 
@@ -1705,6 +1849,8 @@ void DnsSinkServer::run_loop()
                                 /* env_hash deliberately left unset: a
                                  * refresh_only entry is never a coalescing
                                  * target, so nobody can ride its envelope. */
+                                randomize_qname_case(rx, qend);   /* (#72) */
+                                ue->case_hash = query_case_hash(rx, qend);
                                 hdr->id = htons(our_txid);
                                 ue->upstream_us = esp_timer_get_time();
                                 if (!(dot_is_enabled() && !localzone_match(name, nlen) &&
@@ -1815,6 +1961,8 @@ void DnsSinkServer::run_loop()
                     ue->env_hash    = eh;
                     ue->no_cache    = !cls_in || fwd_no_cache;   /* (#106) class; (#48) pause */
                     ue->paused      = fwd_no_cache;              /* (#48) */
+                    randomize_qname_case(rx, qend);   /* (#72) */
+                    ue->case_hash   = query_case_hash(rx, qend);
 
                     /* rewrite txid and forward — read the live upstream address
                      * so an in-flight query batch can straddle a set_upstream() */
@@ -2001,6 +2149,8 @@ void DnsSinkServer::run_loop()
                                     ue->paused   = tcp_no_cache;             /* (#48) */
                                     ue->via_tcp  = true;
                                     ue->tcp_gen  = s_tcp.gen;
+                                    randomize_qname_case(q, qend);   /* (#72) */
+                                    ue->case_hash = query_case_hash(q, qend);
                                     qh->id = htons(our_txid);
                                     ue->upstream_us = esp_timer_get_time();
                                     bool use_dot = dot_is_enabled() && !localzone_match(name, nlen);
@@ -2134,6 +2284,8 @@ int dns_server_metrics_json(char *out, size_t cap)
         "\"queries_total\":%" PRIu32 ",\"blocked\":%" PRIu32 ",\"forwarded\":%" PRIu32 ","
         "\"tcp_queries\":%" PRIu32 ","
         "\"l2_blocked\":%" PRIu32 ",\"l2_cached\":%" PRIu32 ",\"l2_tx_fail\":%" PRIu32 ","
+        "\"l2_fallthrough\":%" PRIu32 ",\"wd_restarts\":%" PRIu32 ","
+        "\"case_mismatch\":%" PRIu32 ","
         "\"cache_probes\":%" PRIu32 ",\"cache_hits\":%" PRIu32 ",\"cache_hit_rate\":%.1f,"
         "\"cache_evictions\":%" PRIu32 ",\"cache_too_big\":%" PRIu32 ","
         "\"stale_served\":%" PRIu32 ","
@@ -2156,6 +2308,8 @@ int dns_server_metrics_json(char *out, size_t cap)
         s_cnt_total, s_cnt_blocked, s_cnt_forwarded,
         s_cnt_tcp,
         dns_sink_l2_blocked(), dns_sink_l2_cached(), dns_sink_l2_tx_fail(),
+        dns_sink_l2_fallthrough(), s_cnt_wd_restarts,
+        s_cnt_case_mismatch,
         probes, hits, hitrate,
         s_cnt_cache_evict, s_cnt_cache_toobig,
         s_cnt_stale,
