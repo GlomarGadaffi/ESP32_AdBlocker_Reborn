@@ -6,9 +6,11 @@
 #include "domain.h"
 #include "rewrite.h"
 #include "acl.h"
+#include "pause.h"
 #include "dot.h"
 #include "localzone.h"
 #include "query_log.h"
+#include "lwip/sockets.h"
 #include "esp_http_server.h"
 #include "esp_https_server.h"
 #include "esp_log.h"
@@ -35,6 +37,7 @@ static DnsSinkServer  *s_dns      = nullptr;
 
 extern "C" void dns_sink_trigger_reload(void);
 extern "C" bool dns_sink_wifi_built(void);
+extern "C" bool dns_sink_eth_built(void);    /* (#49) false on the Wi-Fi-only board */
 extern "C" void dns_sink_net_status(char *iface, size_t iface_cap,
                                      char *eth_ip, size_t eth_cap,
                                      char *wifi_ip, size_t wifi_cap);
@@ -347,6 +350,44 @@ static void form_field(const char *body, const char *key, char *dst, size_t cap)
     }
 }
 
+/* (#48) The address the current request came from, host order, 0 if unknown.
+ * Read from the TCP connection itself — never from anything the client sent —
+ * because it decides whose blocking a default-scope pause switches off. The
+ * server listens dual-stack, so an IPv4 client shows up as a v4-mapped IPv6
+ * peer (::ffff:a.b.c.d); unwrap that. A native IPv6 peer is reported as 0:
+ * the pause table and the DNS paths are IPv4, so there is nothing to match. */
+static uint32_t req_peer_ip(httpd_req_t *r)
+{
+    int fd = httpd_req_to_sockfd(r);
+    if (fd < 0) return 0;
+    struct sockaddr_storage ss; socklen_t sl = sizeof(ss);
+    memset(&ss, 0, sizeof(ss));
+    if (getpeername(fd, reinterpret_cast<struct sockaddr *>(&ss), &sl) != 0) return 0;
+    if (ss.ss_family == AF_INET)
+        return ntohl(reinterpret_cast<struct sockaddr_in *>(&ss)->sin_addr.s_addr);
+#if LWIP_IPV6
+    if (ss.ss_family == AF_INET6) {
+        const uint8_t *a = reinterpret_cast<const uint8_t *>(
+            &reinterpret_cast<struct sockaddr_in6 *>(&ss)->sin6_addr);
+        static const uint8_t v4mapped[12] = { 0,0,0,0,0,0,0,0,0,0,0xFF,0xFF };
+        if (memcmp(a, v4mapped, sizeof(v4mapped)) == 0)
+            return ((uint32_t)a[12] << 24) | ((uint32_t)a[13] << 16) |
+                   ((uint32_t)a[14] << 8)  |  (uint32_t)a[15];
+    }
+#endif
+    return 0;
+}
+
+/* Dotted-quad -> host order; 0 on any malformed input (0.0.0.0 is not a
+ * client either, so rejecting it as "no address" is the right answer). */
+static uint32_t parse_ip4(const char *s)
+{
+    unsigned b0 = 256, b1 = 256, b2 = 256, b3 = 256; char tail = 0;
+    if (!s || sscanf(s, "%u.%u.%u.%u%c", &b0, &b1, &b2, &b3, &tail) != 4) return 0;
+    if (b0 > 255 || b1 > 255 || b2 > 255 || b3 > 255) return 0;
+    return ((uint32_t)b0 << 24) | ((uint32_t)b1 << 16) | ((uint32_t)b2 << 8) | (uint32_t)b3;
+}
+
 /* ── GET/POST /setup — first-boot onboarding (#89) ───────────────────
  * Reached only while no admin account exists (auth_wrap routes everything
  * here until one does). Creates the account, opens a session, and lands on
@@ -641,6 +682,58 @@ static esp_err_t handle_status(httpd_req_t *r)
         "<p><small>This tab auto-refreshes every 10s; the other tabs don't, so "
         "they won't reload while you're editing.</small></p>",
         paused ? 0 : 1, paused ? "Resume blocking" : "Pause blocking");
+
+    /* (#48) Timed, scoped pause. Default scope is the device viewing the page
+     * — its address comes from the connection, never from the form — so one
+     * client can unblock itself without switching protection off for the
+     * house. "All devices" goes through a confirmation page (handle_pause_timed)
+     * before it takes effect. The Dashboard's 10 s auto-refresh keeps the
+     * "time left" column live. */
+    {
+        uint32_t me = req_peer_ip(r);
+        pause_view_t pv[PAUSE_MAX];
+        uint32_t pn = pause_list(pv, PAUSE_MAX);
+        page_appendf(page, sizeof(page), &n,
+            "<h3>Pause blocking for a while</h3>"
+            "<form method=post action=/pause/timed>"
+            "<input name=min type=number min=1 max=%u value=30 style='width:5em'> minutes "
+            "(max %u = 24 h)<br>"
+            "<label><input type=radio name=scope value=me checked> This device (%u.%u.%u.%u)</label><br>"
+            "<label><input type=radio name=scope value=host> Another host:</label> "
+            "<input name=ip placeholder='192.168.1.23' size=15><br>"
+            "<label><input type=radio name=scope value=all> All devices (asks you to confirm)</label><br>"
+            "<button>Pause</button></form>"
+            "<p><small>Only the chosen scope stops being filtered. Blocking resumes on its own "
+            "when the time is up, and a reboot always comes back blocking.</small></p>",
+            (unsigned)PAUSE_MAX_MINUTES, (unsigned)PAUSE_MAX_MINUTES,
+            (unsigned)((me>>24)&0xFF),(unsigned)((me>>16)&0xFF),
+            (unsigned)((me>>8)&0xFF),(unsigned)(me&0xFF));
+        if (pn > 0) {
+            page_appendf(page, sizeof(page), &n,
+                "<table><tr><th>Paused for</th><th>Time left</th><th></th></tr>");
+            for (uint32_t i = 0; i < pn; i++) {
+                char who[24], ipv[24];
+                if (pv[i].ip == PAUSE_IP_ALL) {
+                    snprintf(who, sizeof(who), "<b>All devices</b>");
+                    snprintf(ipv, sizeof(ipv), "all");
+                } else {
+                    snprintf(who, sizeof(who), "%u.%u.%u.%u",
+                        (unsigned)((pv[i].ip>>24)&0xFF),(unsigned)((pv[i].ip>>16)&0xFF),
+                        (unsigned)((pv[i].ip>>8)&0xFF),(unsigned)(pv[i].ip&0xFF));
+                    snprintf(ipv, sizeof(ipv), "%s", who);
+                }
+                page_appendf(page, sizeof(page), &n,
+                    "<tr><td>%s%s</td><td>%um %02us</td>"
+                    "<td><form method=post action=/pause/resume style='margin:0'>"
+                    "<input type=hidden name=ip value='%s'><button>Resume now</button></form></td></tr>",
+                    who, pv[i].ip == me ? " (this device)" : "",
+                    (unsigned)(pv[i].remaining_s / 60), (unsigned)(pv[i].remaining_s % 60), ipv);
+            }
+            page_appendf(page, sizeof(page), &n,
+                "</table><form method=post action=/pause/resume style='margin-top:.4em'>"
+                "<input type=hidden name=ip value=every><button>Resume all now</button></form>");
+        }
+    }
 
     /* Clock status (NTP) */
     {
@@ -938,8 +1031,8 @@ static esp_err_t handle_status(httpd_req_t *r)
 
     page_appendf(page, sizeof(page), &n, "</div><div class='tab' id=tab-network>");
 
-    /* Dual-WAN interface selection (#53) */
-    if (dns_sink_wifi_built()) {
+    /* Dual-WAN interface selection (#53) — only when both links exist (#49) */
+    if (dns_sink_wifi_built() && dns_sink_eth_built()) {
         char iface[8]="", eth_ip[16]="", wifi_ip[16]="";
         dns_sink_net_status(iface, sizeof(iface), eth_ip, sizeof(eth_ip), wifi_ip, sizeof(wifi_ip));
         page_appendf(page, sizeof(page), &n,
@@ -962,7 +1055,10 @@ static esp_err_t handle_status(httpd_req_t *r)
     {
         const char *ifaces[2] = { "eth", "wifi" };
         const char *labels[2] = { "Ethernet", "Wi-Fi" };
-        for (int i = 0; i < (dns_sink_wifi_built() ? 2 : 1); i++) {
+        for (int i = 0; i < 2; i++) {
+            /* (#49) Only the interfaces this build actually has. */
+            if (i == 0 && !dns_sink_eth_built())  continue;
+            if (i == 1 && !dns_sink_wifi_built()) continue;
             bool dhcp = true; char ip[16]="", nm[16]="", gw[16]="", dns_ip[16]="";
             dns_sink_net_get_static(ifaces[i], &dhcp, ip, sizeof(ip), nm, sizeof(nm),
                                      gw, sizeof(gw), dns_ip, sizeof(dns_ip));
@@ -1173,6 +1269,105 @@ static esp_err_t handle_pause(httpd_req_t *r)
     }
     char body[16] = {}; httpd_req_recv(r, body, sizeof(body) - 1);
     blocklist_set_paused(strstr(body, "on=1") != nullptr);
+    httpd_resp_set_status(r, "303 See Other");
+    httpd_resp_set_hdr(r, "Location", "/");
+    httpd_resp_send(r, nullptr, 0);
+    return ESP_OK;
+}
+
+/* ── POST /pause/timed — timed, scoped pause (#48) ─────────────────
+ * Fields: min (1..PAUSE_MAX_MINUTES), scope (me | host | all), ip (with
+ * scope=host), confirm=1 (with scope=all, second step). The cap and the
+ * scope rules are enforced here, not just in the form; "me" is the
+ * connection's own address, never a submitted one. A global pause without
+ * confirm=1 renders a confirmation page instead of taking effect. */
+static esp_err_t handle_pause_timed(httpd_req_t *r)
+{
+    if (!csrf_ok(r)) {
+        httpd_resp_send_err(r, HTTPD_403_FORBIDDEN, "CSRF"); return ESP_FAIL;
+    }
+    char body[128] = {}; httpd_req_recv(r, body, sizeof(body) - 1);
+    char minv[12], scope[8], ipv[24], conf[4];
+    form_field(body, "min",     minv,  sizeof(minv));
+    form_field(body, "scope",   scope, sizeof(scope));
+    form_field(body, "ip",      ipv,   sizeof(ipv));
+    form_field(body, "confirm", conf,  sizeof(conf));
+
+    char *end = nullptr;
+    long minutes = strtol(minv, &end, 10);
+    if (minv[0] == '\0' || (end && *end != '\0') || minutes < 1 ||
+        minutes > (long)PAUSE_MAX_MINUTES) {
+        httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST,
+                            "Duration must be 1 to 1440 minutes (24 h)");
+        return ESP_FAIL;
+    }
+
+    uint32_t target;
+    if (strcmp(scope, "all") == 0) {
+        if (strcmp(conf, "1") != 0) {
+            /* Second confirmation for the whole-network case. Self-contained
+             * page (no tab script), so the CSRF token rides on the action. */
+            char csrf[33] = ""; web_auth_session_csrf(s_req_sid, csrf, sizeof(csrf));
+            static EXT_RAM_BSS_ATTR char page[1536];
+            int n = snprintf(page, sizeof(page),
+                "<!DOCTYPE html><html><head><meta charset=utf-8><title>Confirm pause</title>"
+                "<style>body{font-family:monospace;max-width:700px;margin:2em auto}</style>"
+                "</head><body><h2>Pause blocking for every device?</h2>"
+                "<p>Are you sure? This disables blocking for <b>every device</b> on the "
+                "network for <b>%ld minute%s</b>. It resumes by itself afterwards.</p>"
+                "<form method=post action='/pause/timed?csrf=%s'>"
+                "<input type=hidden name=min value=%ld>"
+                "<input type=hidden name=scope value=all>"
+                "<input type=hidden name=confirm value=1>"
+                "<button>Yes, pause for everyone</button></form>"
+                "<p><a href='/'>Cancel</a></p></body></html>",
+                minutes, minutes == 1 ? "" : "s", csrf, minutes);
+            httpd_resp_set_type(r, "text/html");
+            httpd_resp_send(r, page, n);
+            return ESP_OK;
+        }
+        target = PAUSE_IP_ALL;
+    } else if (strcmp(scope, "host") == 0) {
+        target = parse_ip4(ipv);
+        if (target == 0) {
+            httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST, "Enter the host's IPv4 address");
+            return ESP_FAIL;
+        }
+    } else {
+        target = req_peer_ip(r);
+        if (target == 0) {
+            httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST,
+                                "Could not determine this device's IPv4 address");
+            return ESP_FAIL;
+        }
+    }
+    if (!pause_set(target, (uint32_t)minutes)) {
+        httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST,
+                            "Pause table is full — resume an existing pause first");
+        return ESP_FAIL;
+    }
+    httpd_resp_set_status(r, "303 See Other");
+    httpd_resp_set_hdr(r, "Location", "/");
+    httpd_resp_send(r, nullptr, 0);
+    return ESP_OK;
+}
+
+/* ── POST /pause/resume — end a timed pause early (#48) ───────────
+ * ip=<dotted quad> resumes that host, ip=all resumes the all-devices entry,
+ * ip=every clears the whole table. */
+static esp_err_t handle_pause_resume(httpd_req_t *r)
+{
+    if (!csrf_ok(r)) {
+        httpd_resp_send_err(r, HTTPD_403_FORBIDDEN, "CSRF"); return ESP_FAIL;
+    }
+    char body[64] = {}; httpd_req_recv(r, body, sizeof(body) - 1);
+    char ipv[24]; form_field(body, "ip", ipv, sizeof(ipv));
+    if (strcmp(ipv, "every") == 0)      pause_clear_all();
+    else if (strcmp(ipv, "all") == 0)   pause_clear(PAUSE_IP_ALL);
+    else {
+        uint32_t ip = parse_ip4(ipv);
+        if (ip) pause_clear(ip);
+    }
     httpd_resp_set_status(r, "303 See Other");
     httpd_resp_set_hdr(r, "Location", "/");
     httpd_resp_send(r, nullptr, 0);
@@ -1906,7 +2101,7 @@ bool web_ui_start(DnsSinkServer *dns)
     cfg.prvtkey_pem      = (const uint8_t *)key;
     cfg.prvtkey_len      = key_len;
     cfg.port_secure      = 443;
-    cfg.httpd.max_uri_handlers = 40;
+    cfg.httpd.max_uri_handlers = 48;   /* 38 registered as of #48 — keep headroom */
     cfg.httpd.max_resp_headers = 16;   /* 5 hardening headers + cookie + Location + type */
     cfg.httpd.stack_size       = 16384;
     /* Recycle the least-recently-used connection instead of refusing new ones
@@ -1947,6 +2142,8 @@ bool web_ui_start(DnsSinkServer *dns)
         { "/reload",              HTTP_POST, H(handle_reload)        },
         { "/blocklist/stop",      HTTP_POST, H(handle_bl_stop)       },
         { "/pause",               HTTP_POST, H(handle_pause)         },
+        { "/pause/timed",         HTTP_POST, H(handle_pause_timed)   },
+        { "/pause/resume",        HTTP_POST, H(handle_pause_resume)  },
         { "/check",               HTTP_POST, H(handle_check)         },
         { "/auth/set",            HTTP_POST, H(handle_auth_set)      },
         { "/whitelist/add",       HTTP_POST, H(handle_wl_add)        },

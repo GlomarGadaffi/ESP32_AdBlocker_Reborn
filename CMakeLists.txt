@@ -26,6 +26,10 @@ if(EXISTS "${_adblock_sdkconfig}")
     if(_ws_line)
         set(ADBLOCK_BOARD_TAG "waveshare-s3-eth")
     endif()
+    file(STRINGS "${_adblock_sdkconfig}" _wifi_line REGEX "^CONFIG_ADBLOCK_BOARD_GENERIC_S3_WIFI=y")
+    if(_wifi_line)
+        set(ADBLOCK_BOARD_TAG "generic-s3-wifi")
+    endif()
 endif()
 # On the very first configure the sdkconfig doesn't exist yet — it's generated
 # from SDKCONFIG_DEFAULTS after this point — so also honour the board overlay
@@ -33,18 +37,26 @@ endif()
 if("${SDKCONFIG_DEFAULTS}" MATCHES "waveshare")
     set(ADBLOCK_BOARD_TAG "waveshare-s3-eth")
 endif()
+if("${SDKCONFIG_DEFAULTS}" MATCHES "generic-s3-wifi")
+    set(ADBLOCK_BOARD_TAG "generic-s3-wifi")
+endif()
 set(PROJECT_VER "${ADBLOCK_BASE_VER}+${ADBLOCK_BOARD_TAG}")
 
-# Guard against the two build dirs sharing one sdkconfig. build-waveshare/
+# Guard against the build dirs sharing one sdkconfig. build-waveshare/
 # was once configured with SDKCONFIG=sdkconfig (the root file): every
 # reconfigure then rewrote the T-ETH-Elite config with the Waveshare board
 # selected, and the next `idf.py build` produced a "LilyGO" image with the
 # Waveshare W5500 pin map — Ethernet dead on the board it was flashed to.
-# A Waveshare build dir must point at its own sdkconfig file.
+# A Waveshare (or Wi-Fi-only) build dir must point at its own sdkconfig file.
 if(CMAKE_BINARY_DIR MATCHES "waveshare" AND NOT "${_adblock_sdkconfig}" MATCHES "waveshare")
     message(FATAL_ERROR "build dir ${CMAKE_BINARY_DIR} would use ${_adblock_sdkconfig}. "
         "Configure it with: idf.py -B build-waveshare \"-DSDKCONFIG=<abs path>/sdkconfig.waveshare\" "
         "\"-DSDKCONFIG_DEFAULTS=sdkconfig.defaults;sdkconfig.board.waveshare-s3-eth\" build")
+endif()
+if(CMAKE_BINARY_DIR MATCHES "wifi" AND NOT "${_adblock_sdkconfig}" MATCHES "wifi")
+    message(FATAL_ERROR "build dir ${CMAKE_BINARY_DIR} would use ${_adblock_sdkconfig}. "
+        "Configure it with: idf.py -B build-wifi \"-DSDKCONFIG=<abs path>/sdkconfig.wifi\" "
+        "\"-DSDKCONFIG_DEFAULTS=sdkconfig.defaults;sdkconfig.board.generic-s3-wifi\" build")
 endif()
 message(STATUS "ESP32_AdBlocker_Reborn version: ${PROJECT_VER} (from ${_adblock_sdkconfig})")
 

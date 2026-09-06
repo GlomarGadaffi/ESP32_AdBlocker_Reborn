@@ -43,6 +43,11 @@ extern "C" {
  * where capacity grows. See docs/blocklist-format.md. */
 #define BLOCKLIST_CAPACITY  800000u
 
+/* (#49) The capacity actually in force. Equal to BLOCKLIST_CAPACITY on the
+ * 8 MB-PSRAM boards; smaller on a generic ESP32-S3 with 2/4 MB PSRAM, where
+ * blocklist_init() sizes the table to what is fitted (see capacity_for_psram). */
+uint32_t blocklist_capacity(void);
+
 /* NVS whitelist — domains that always bypass blocklist (up to 64) */
 #define WHITELIST_MAX  64
 

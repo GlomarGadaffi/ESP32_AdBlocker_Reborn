@@ -1,12 +1,15 @@
 #include "console.h"
 #include "web_auth.h"
 #include "web_tls.h"
+#include "pause.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/usb_serial_jtag.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
 
 static const char *TAG = "console";
 
@@ -33,11 +36,41 @@ const char *dns_sink_hostname(void);
  *                              is minted on the next boot (#89)
  *   cert                       print the TLS certificate fingerprint
  *   setup-psk                  print the setup AP's WPA2 passphrase
+ *   pause <min> [ip|all]       suspend blocking for <min> minutes (#48), for
+ *                              one client IP or, with "all", every client;
+ *                              no scope argument lists what is active
+ *   resume [ip|all]            end a pause early; no argument clears them all
  *
  * Replies go out as normal log lines (visible on both consoles). Physical
  * USB access already implies full control (reflash), so no auth here — which
  * is exactly why the lost-password and lost-trust recoveries live here and
  * not in the web UI. */
+
+/* Dotted quad -> host order; 0 on anything malformed (#48). */
+static uint32_t console_parse_ip(const char *s)
+{
+    unsigned b0 = 256, b1 = 256, b2 = 256, b3 = 256; char tail = 0;
+    if (!s || sscanf(s, "%u.%u.%u.%u%c", &b0, &b1, &b2, &b3, &tail) != 4) return 0;
+    if (b0 > 255 || b1 > 255 || b2 > 255 || b3 > 255) return 0;
+    return ((uint32_t)b0 << 24) | ((uint32_t)b1 << 16) | ((uint32_t)b2 << 8) | (uint32_t)b3;
+}
+
+static void console_pause_list(void)
+{
+    pause_view_t pv[PAUSE_MAX];
+    uint32_t n = pause_list(pv, PAUSE_MAX);
+    if (n == 0) { ESP_LOGI(TAG, "no pause active — blocking is on for every client"); return; }
+    for (uint32_t i = 0; i < n; i++) {
+        if (pv[i].ip == PAUSE_IP_ALL)
+            ESP_LOGI(TAG, "paused: ALL clients, %um%02us left",
+                     (unsigned)(pv[i].remaining_s / 60), (unsigned)(pv[i].remaining_s % 60));
+        else
+            ESP_LOGI(TAG, "paused: %u.%u.%u.%u, %um%02us left",
+                     (unsigned)((pv[i].ip >> 24) & 0xFF), (unsigned)((pv[i].ip >> 16) & 0xFF),
+                     (unsigned)((pv[i].ip >> 8) & 0xFF), (unsigned)(pv[i].ip & 0xFF),
+                     (unsigned)(pv[i].remaining_s / 60), (unsigned)(pv[i].remaining_s % 60));
+    }
+}
 
 static void handle_line(char *line)
 {
@@ -90,8 +123,45 @@ static void handle_line(char *line)
         char psk[24]; dns_sink_setup_ap_passphrase(psk, sizeof(psk));
         if (psk[0]) ESP_LOGI(TAG, "setup AP \"ESP32AdBlock-Setup\" WPA2 passphrase: %s", psk);
         else        ESP_LOGI(TAG, "Wi-Fi not built in — no setup AP");
+    } else if (strncmp(line, "pause", 5) == 0 && (line[5] == '\0' || line[5] == ' ')) {
+        /* (#48) The web UI is the intended control, but it needs a login —
+         * and the whole point of this console is the case where that is not
+         * available. Same server-side cap and scope rules as the UI; the
+         * only difference is that a global pause here needs no second
+         * confirmation, because physical USB access already implies it. */
+        char *p = line + 5;
+        while (*p == ' ') p++;
+        if (*p == '\0') { console_pause_list(); return; }
+        char *scope = p;
+        while (*scope && *scope != ' ') scope++;
+        if (*scope) *scope++ = '\0';
+        while (*scope == ' ') scope++;
+        long minutes = strtol(p, NULL, 10);
+        uint32_t ip = (*scope == '\0' || strcmp(scope, "all") == 0)
+                    ? PAUSE_IP_ALL : console_parse_ip(scope);
+        if (*scope != '\0' && strcmp(scope, "all") != 0 && ip == 0)
+            ESP_LOGW(TAG, "pause: '%s' is not an IPv4 address", scope);
+        else if (!pause_set(ip, (uint32_t)minutes))
+            ESP_LOGW(TAG, "pause: rejected (1-%u minutes, and the table holds %d entries)",
+                     (unsigned)PAUSE_MAX_MINUTES, PAUSE_MAX);
+        else
+            console_pause_list();
+    } else if (strncmp(line, "resume", 6) == 0 && (line[6] == '\0' || line[6] == ' ')) {
+        char *p = line + 6;
+        while (*p == ' ') p++;
+        if (*p == '\0')                    ESP_LOGI(TAG, "resume: %u pause(s) cleared",
+                                                    (unsigned)pause_clear_all());
+        else if (strcmp(p, "all") == 0)    ESP_LOGI(TAG, "resume all-clients pause: %s",
+                                                    pause_clear(PAUSE_IP_ALL) ? "cleared" : "none active");
+        else {
+            uint32_t ip = console_parse_ip(p);
+            if (!ip) ESP_LOGW(TAG, "resume: '%s' is not an IPv4 address", p);
+            else     ESP_LOGI(TAG, "resume %s: %s", p, pause_clear(ip) ? "cleared" : "none active");
+        }
+        console_pause_list();
     } else {
-        ESP_LOGW(TAG, "unknown command (have: wifi, status, heap, admin-reset, cert-reset, cert, setup-psk)");
+        ESP_LOGW(TAG, "unknown command (have: wifi, status, heap, admin-reset, cert-reset, "
+                      "cert, setup-psk, pause, resume)");
     }
 }
 
@@ -107,7 +177,8 @@ static void console_task(void *arg)
         vTaskDelete(NULL);
         return;
     }
-    ESP_LOGI(TAG, "USB recovery console ready (wifi/status/heap/admin-reset/cert-reset/cert/setup-psk)");
+    ESP_LOGI(TAG, "USB recovery console ready "
+                  "(wifi/status/heap/admin-reset/cert-reset/cert/setup-psk/pause/resume)");
     static char line[160];
     size_t have = 0;
     for (;;) {

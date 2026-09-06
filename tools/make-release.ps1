@@ -55,8 +55,9 @@ if (-not $OutDir) { $OutDir = Join-Path $RepoRoot 'release' }
 # Board id -> display name + build directory. Board ids are the tags baked into
 # esp_app_desc_t.version by CMakeLists.txt; keep the two lists in sync.
 $Boards = [ordered]@{
-    't-eth-elite'      = @{ Name = 'LilyGO T-ETH-Elite';    BuildDir = 'build' }
-    'waveshare-s3-eth' = @{ Name = 'Waveshare ESP32-S3-ETH'; BuildDir = 'build-waveshare' }
+    't-eth-elite'      = @{ Name = 'LilyGO T-ETH-Elite';             BuildDir = 'build' }
+    'waveshare-s3-eth' = @{ Name = 'Waveshare ESP32-S3-ETH';          BuildDir = 'build-waveshare' }
+    'generic-s3-wifi'  = @{ Name = 'Generic ESP32-S3 (Wi-Fi only)';  BuildDir = 'build-wifi' }
 }
 
 # Map a flash_args source path to the role the flasher uses to decide which
@@ -165,17 +166,17 @@ foreach ($boardId in $Boards.Keys) {
 
     $flashArgs = Read-FlashArgs -Path $flashArgsPath
 
-    # All supported boards share a partition table and flash settings; if that
-    # ever stops being true the manifest's single "flash" block needs to move
-    # into the per-board entries.
+    # Flash settings are per board since the Wi-Fi-only target (#49): the
+    # generic dev-board build addresses 8 MB where the Ethernet boards use 16.
+    # Each board entry carries its own "flash" block; the top-level one is kept
+    # (first board's values) for flasher pages that predate per-board blocks.
     if ($null -eq $flashSettings) {
         $flashSettings = $flashArgs.Settings
-    } else {
-        foreach ($key in @('mode', 'freq', 'size')) {
-            if ($flashSettings[$key] -ne $flashArgs.Settings[$key]) {
-                throw "Flash setting '$key' differs between builds ($($flashSettings[$key]) vs $($flashArgs.Settings[$key])); the manifest carries one shared 'flash' block."
-            }
-        }
+    }
+    $boardFlash = [ordered]@{
+        size = $flashArgs.Settings['size']
+        mode = $flashArgs.Settings['mode']
+        freq = $flashArgs.Settings['freq']
     }
 
     $manifestParts = @()
@@ -213,6 +214,7 @@ foreach ($boardId in $Boards.Keys) {
 
     $manifestBoards[$boardId] = [ordered]@{
         name  = $board.Name
+        flash = $boardFlash
         parts = $manifestParts
     }
 

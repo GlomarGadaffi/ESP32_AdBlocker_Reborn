@@ -3,6 +3,7 @@
 #include "domain.h"
 #include "rewrite.h"
 #include "acl.h"
+#include "pause.h"
 #include "dot.h"
 #include "localzone.h"
 #include "query_log.h"
@@ -652,6 +653,14 @@ struct UpstreamEntry {
     bool             no_cache;       /* (#106) non-IN class: deliver the reply, never cache it,
                                         and never let an IN flight coalesce onto it — the cache
                                         and the coalescing key are both class-blind */
+    bool             paused;         /* (#48) this flight exists only because the requester is
+                                        under a pause. The CNAME-cloaking check in process_reply
+                                        is skipped for it: the queried name is itself on the
+                                        blocklist, so that check would re-block the very answer
+                                        the pause exists to deliver — one upstream round trip
+                                        later, which is what it looked like on the bench. Also
+                                        forces no_cache, so no other client can ride or inherit
+                                        an unfiltered answer. */
     uint8_t          n_wait;         /* coalesced waiters (#76) */
     bool             hedged;         /* (#69) retransmit already fired — at most one per flight */
     uint16_t         hedge_qlen;     /* (#69) stashed wire bytes in s_hedge_q; 0 = not
@@ -720,6 +729,7 @@ static UpstreamEntry *upstream_alloc(uint16_t *our_txid_out)
             s_upstream[i].via_tcp      = false;
             s_upstream[i].refresh_only = false;
             s_upstream[i].no_cache     = false;   /* (#106) recycled slot */
+            s_upstream[i].paused       = false;   /* (#48) ditto — never inherit a pause */
             s_upstream[i].n_wait       = 0;   /* (#76) a recycled slot must not
                                                  fan out to its predecessor's waiters */
             s_upstream[i].hedged       = false; /* (#69) hedge state is per-flight: a stale
@@ -1341,7 +1351,10 @@ void DnsSinkServer::run_loop()
              * nothing in its answer chain is itself blocked. Walk the answer
              * section; on a hit, replace the whole reply with a blocked
              * answer before either delivery or caching sees it. */
-            bool cloaked = cname_chain_is_blocked(pkt, plen, rqend);
+            /* (#48) A paused requester is the one case where a reply whose own
+             * name is on the blocklist must be delivered verbatim — re-blocking
+             * it here would undo the pause after the fact. */
+            bool cloaked = !ue->paused && cname_chain_is_blocked(pkt, plen, rqend);
             if (cloaked) {
                 static uint8_t cloak_blocked[320];  /* worst case: 271 B question (12 hdr +
                                                         255 B max name + 4 qtype/qclass) +
@@ -1589,6 +1602,17 @@ void DnsSinkServer::run_loop()
 
                 uint32_t h = domain_hash(name, nlen);
 
+                /* (#48) Timed/scoped pause. This is a DELIVERY-time override,
+                 * not a verdict: the blocklist answer stays global and cacheable
+                 * (see pause.h for why it must not live inside
+                 * blocklist_is_blocked()). A paused client gets a BLOCKED hit or
+                 * a fresh BLOCK verdict turned into a forward whose upstream
+                 * answer is never cached (fwd_no_cache -> ue->no_cache). Decided
+                 * once per query; both flags are declared ahead of the
+                 * `goto forward` below so no initialisation is jumped over. */
+                bool paused_client = cls_in && pause_active_for(ntohl(client_addr.sin_addr.s_addr));
+                bool fwd_no_cache  = false;
+
                 /* (#100) The rewrite verdict is taken BEFORE the cache, not after
                  * it. A rule added while an answer for that name sat in the cache
                  * (or was in flight, and so got stored stamped with the current
@@ -1605,7 +1629,14 @@ void DnsSinkServer::run_loop()
                                                      : cache_lookup(h, qtype, now_ms);
                 if (ce) {
                     s_cnt_cache_hit++;
-                    if (ce->blocked) {
+                    if (ce->blocked && paused_client) {
+                        /* (#48) The cached BLOCK is still right for everyone
+                         * else — leave it — but this client is paused, so this
+                         * delivery forwards, uncached. */
+                        s_cnt_cache_hit--;
+                        fwd_no_cache = true;
+                        goto forward;
+                    } else if (ce->blocked) {
                         int tlen = build_blocked_any(rx, qend, qtype, tx, sizeof(tx));
                         if (tlen > 0)
                             sendto(csock, tx, tlen, 0, (sockaddr *)&client_addr, clen);
@@ -1704,6 +1735,15 @@ void DnsSinkServer::run_loop()
                     bool is_blk = cls_in && (blocklist_is_blocked(name, nlen) ||
                                              blocklist_custom_is_blocked(name, nlen));
                     hist_record(&s_h_lookup, esp_timer_get_time() - t_lk);
+                    if (is_blk && paused_client) {
+                        /* (#48) The verdict is BLOCKED and that is what the
+                         * cache learns — the next unpaused client's hit must be
+                         * right. Only this delivery is overridden: forward,
+                         * and never cache the answer. */
+                        cache_store_blocked(h, qtype, BLOCKED_TTL_S, now_ms);
+                        fwd_no_cache = true;
+                        is_blk = false;
+                    }
                     if (is_blk) {
                         s_cnt_blocked++;
                         int tlen = build_blocked_any(rx, qend, qtype, tx, sizeof(tx));
@@ -1735,7 +1775,11 @@ void DnsSinkServer::run_loop()
                     /* (#106) A non-IN query must not ride an IN flight: the join
                      * key carries no class, so it would be answered with the IN
                      * reply (and vice versa). It forwards on its own slot. */
-                    UpstreamEntry *fl = cls_in ? upstream_find_joinable(h, qtype, eh,
+                    /* (#48) A paused requester never rides someone else's
+                     * flight: that flight's reply goes through the cloaking
+                     * check, which is exactly what the pause must skip. */
+                    UpstreamEntry *fl = (cls_in && !fwd_no_cache)
+                                               ? upstream_find_joinable(h, qtype, eh,
                                                                         (uint32_t)now_ms)
                                                : nullptr;
                     if (fl && upstream_join(fl, ntohs(hdr->id), &client_addr,
@@ -1755,7 +1799,8 @@ void DnsSinkServer::run_loop()
                     ue->qhash       = h;
                     ue->qtype       = qtype;
                     ue->env_hash    = eh;
-                    ue->no_cache    = !cls_in;   /* (#106) */
+                    ue->no_cache    = !cls_in || fwd_no_cache;   /* (#106) class; (#48) pause */
+                    ue->paused      = fwd_no_cache;              /* (#48) */
 
                     /* rewrite txid and forward — read the live upstream address
                      * so an in-flight query batch can straddle a set_upstream() */
@@ -1841,14 +1886,21 @@ void DnsSinkServer::run_loop()
                         bool cls_in = (qclass == 1);              /* (#106), as on UDP */
                         uint32_t h = domain_hash(name, nlen);
                         int tlen = 0;    /* >0: answer in tx; 0: forwarded, conn held */
+                        /* (#48) Same delivery-time pause override as UDP. */
+                        bool paused_client = cls_in && pause_active_for(s_tcp.peer_ip);
+                        bool tcp_no_cache  = false;
 
                         /* (#100) Rewrite verdict before the cache, as on UDP. */
                         uint32_t rw_pre = (cls_in && qtype == 1) ? rewrite_lookup(name) : 0;
                         s_cnt_cache_probe++;
                         CacheEntry *ce = (rw_pre || !cls_in) ? nullptr
                                                              : cache_lookup(h, qtype, now_ms);
-                        if (ce && (ce->blocked ||
-                                   (ce->resp_len > 0 && ce->resp_len <= (int)sizeof(tx)))) {
+                        /* (#48) A cached BLOCK is skipped for a paused client:
+                         * the verdict branch below re-derives it, stores it, and
+                         * forwards this one delivery. */
+                        if (ce && !(ce->blocked && paused_client) &&
+                            (ce->blocked ||
+                             (ce->resp_len > 0 && ce->resp_len <= (int)sizeof(tx)))) {
                             s_cnt_cache_hit++;
                             if (ce->blocked) {
                                 s_cnt_blocked++;
@@ -1862,11 +1914,20 @@ void DnsSinkServer::run_loop()
                             }
                         } else {
                             uint32_t rw_ip = rw_pre;
+                            bool is_blk = !rw_ip && cls_in &&
+                                          (blocklist_is_blocked(name, nlen) ||
+                                           blocklist_custom_is_blocked(name, nlen));
+                            if (is_blk && paused_client) {
+                                /* (#48) as on UDP: the cache learns BLOCKED,
+                                 * this delivery forwards uncached. */
+                                cache_store_blocked(h, qtype, BLOCKED_TTL_S, now_ms);
+                                tcp_no_cache = true;
+                                is_blk = false;
+                            }
                             if (rw_ip) {
                                 tlen = build_rewrite_a(q, qend, rw_ip, tx, sizeof(tx));
                                 query_log_record(name, qtype, s_tcp.peer_ip, false, true);
-                            } else if (cls_in && (blocklist_is_blocked(name, nlen) ||
-                                                  blocklist_custom_is_blocked(name, nlen))) {
+                            } else if (is_blk) {
                                 s_cnt_blocked++;
                                 tlen = build_blocked_any(q, qend, qtype, tx, sizeof(tx));
                                 cache_store_blocked(h, qtype, BLOCKED_TTL_S, now_ms);
@@ -1887,7 +1948,7 @@ void DnsSinkServer::run_loop()
                                  * the age gate keeps that wait from outliving
                                  * the entry by more than a fraction of it. */
                                 uint32_t eh = query_env_hash(q, mlen, qend);
-                                UpstreamEntry *fl = cls_in                    /* (#106) */
+                                UpstreamEntry *fl = (cls_in && !tcp_no_cache)  /* (#106); (#48) */
                                     ? upstream_find_joinable(h, qtype, eh, (uint32_t)now_ms)
                                     : nullptr;
                                 if (fl && upstream_join(fl, ntohs(qh->id), nullptr,
@@ -1912,7 +1973,8 @@ void DnsSinkServer::run_loop()
                                     ue->qhash    = h;
                                     ue->qtype    = qtype;
                                     ue->env_hash = eh;
-                                    ue->no_cache = !cls_in;   /* (#106) */
+                                    ue->no_cache = !cls_in || tcp_no_cache;   /* (#106); (#48) */
+                                    ue->paused   = tcp_no_cache;             /* (#48) */
                                     ue->via_tcp  = true;
                                     ue->tcp_gen  = s_tcp.gen;
                                     qh->id = htons(our_txid);
@@ -2058,6 +2120,7 @@ int dns_server_metrics_json(char *out, size_t cap)
         "\"upstream_inflight\":%d,\"upstream_max\":%d,"
         "\"blocklist_count\":%" PRIu32 ",\"blocklist_loading\":%s,"
         "\"blocklist_paused\":%s,"
+        "\"pause_active\":%" PRIu32 ","
         "\"blocklist_dropped\":%" PRIu32 ","
         "\"blocklist_feed_failures\":%" PRIu32 ","
         "\"sd_status\":\"%s\",\"sd_bytes\":%" PRIu32 ","
@@ -2077,6 +2140,7 @@ int dns_server_metrics_json(char *out, size_t cap)
         upstream_inflight(), UPSTREAM_TABLE_SIZE,
         blocklist_domain_count(), blocklist_is_loading() ? "true" : "false",
         blocklist_is_paused() ? "true" : "false",
+        pause_count(),
         blocklist_dropped_count(),
         blocklist_feed_failures(),
         blocklist_sd_status(), blocklist_sd_bytes(),

@@ -1,0 +1,32 @@
+# Generic ESP32-S3 dev board, Wi-Fi only (#49) — apply ON TOP of sdkconfig.defaults:
+#   idf.py -B build-wifi -DSDKCONFIG=sdkconfig.wifi \
+#          -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.board.generic-s3-wifi" build
+# Keeps the main sdkconfig/build directory as the T-ETH-Elite build.
+#
+# No W5500, no SD card: the sinkhole runs over the S3's built-in Wi-Fi and
+# every query takes the lwIP socket path (no L2 fast path — that hook is an
+# esp_eth feature with no Wi-Fi equivalent). The blocklist downloads on each
+# cold boot; the forward cache still warm-boots from nothing, so the first
+# minutes after power-up forward unfiltered exactly as an Ethernet board with
+# no SD card does.
+
+CONFIG_ADBLOCK_BOARD_GENERIC_S3_WIFI=y
+CONFIG_ADBLOCK_NET_WIFI=y
+
+# Target + flash geometry. 8 MB is the smallest flash on the common dev-board
+# modules (N8R8, N8R2); a 16 MB module (N16R8) runs this image unchanged — the
+# partition table (two_ota_large, ~3.5 MB) fits either, and the size here only
+# tells the bootloader/esptool how much of the chip to address.
+CONFIG_IDF_TARGET="esp32s3"
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=n
+CONFIG_ESPTOOLPY_FLASHMODE_DIO=y
+CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
+
+# PSRAM: sdkconfig.defaults selects octal (OPI) at 80 MHz, which is what the
+# -R8 modules (ESP32-S3-WROOM-1-N8R8 / N16R8) carry. A module with QUAD PSRAM
+# (-R2: N8R2, N4R2) needs the two lines below uncommented instead, and the
+# firmware then sizes the blocklist to the 2 MB it finds (capacity_for_psram
+# in blocklist.c) rather than failing the boot-time allocation.
+# CONFIG_SPIRAM_MODE_QUAD=y
+# CONFIG_SPIRAM_MODE_OCT=n

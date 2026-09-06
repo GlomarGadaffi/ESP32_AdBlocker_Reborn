@@ -132,17 +132,35 @@ If you forget your admin password, lose network access, or enter invalid IP sett
    * `wifi "<SSID>" <password>` — Sets new Wi-Fi credentials and reconnects.
    * `status` — Prints board uptime, link status, and IP addresses.
    * `heap` — Displays internal and external PSRAM utilization.
+   * `pause <minutes> [<ip>|all]` — Suspends blocking for one client, or for every client with `all`, up to 24 hours. With no arguments it lists what is currently paused and how long is left.
+   * `resume [<ip>|all]` — Ends a pause early; with no arguments it clears every pause.
+
+---
+
+## ⏸️ Pausing Blocking Temporarily
+
+The Dashboard has a **Pause blocking for a while** panel for the case where a site is broken and you want it working *now* without switching protection off for the house.
+
+* **Duration** is capped at 24 hours and enforced on the device, not just in the form. Blocking resumes on its own; nothing has to be remembered or undone.
+* **Scope defaults to the device you are browsing from.** Its address is read from the connection itself, never from the form, so one device can unblock itself and nothing else changes.
+* **Pausing for every device asks for confirmation first**, on a separate page, because that one turns off filtering for the whole network.
+* **A reboot always comes back blocking.** Timed pauses are deliberately never written to flash, unlike the separate persistent on/off switch.
+
+A paused client's queries are forwarded and the answers are never written to the shared cache, so nothing a paused device resolves can leak to anyone else, and blocking snaps back the instant the pause ends.
 
 ---
 
 ## 🛠️ Hardware Support
 
-Both supported boards run the **ESP32-S3** with 16 MB flash, 8 MB Octal PSRAM, and a W5500 SPI Ethernet controller:
+Two boards use the **ESP32-S3** with 16 MB flash, 8 MB Octal PSRAM, and a W5500 SPI Ethernet controller. A third target runs on any plain ESP32-S3 board over Wi-Fi:
 
 | Board | Default Hostname | W5500 Ethernet Pins | MicroSD Slot Pins | Notes |
 | :--- | :--- | :--- | :--- | :--- |
 | **LilyGO T-ETH-Elite** *(Default)* | `esp32adblock.local` | SCLK 48, MISO 47, MOSI 21, CS 45, INT 14 (40 MHz) | SCLK 10, MISO 9, MOSI 11, CS 12 | Recommended board; full PoE options available |
 | **Waveshare ESP32-S3-ETH** | `esp32adblock2.local` | SCLK 13, MISO 12, MOSI 11, CS 14, INT 10, RST 9 (40 MHz) | SCLK 7, MISO 5, MOSI 6, CS 4 | Compact form factor; separate build target. SD pins come from the CircuitPython board definition and have not been verified with a card — a wrong pin only fails the mount and falls back to downloading |
+| **Generic ESP32-S3 (Wi-Fi only)** | `esp32adblock.local` | none — Wi-Fi STA instead | none | Any plain ESP32-S3 dev board **with PSRAM** (ESP32-S3-DevKitC-1 N8R8 / N16R8 and similar). No Ethernet hardware and no SD card required. See the note below on what you give up |
+
+> **Note on the Wi-Fi-only build:** it runs the same DNS engine, blocklist, cache, whitelist, rewrites, ACL, DoT, web UI and OTA as the Ethernet boards. Two things differ. There is no **Layer 2 fast path**, because that hook is an `esp_eth` feature with no Wi-Fi equivalent, so blocked and cached answers take the normal socket path at roughly 1.8 ms instead of 0.4 ms. And with no SD card the blocklist is downloaded on every cold boot, which means the first few minutes after power-up forward unfiltered. Blocklist capacity adapts to the PSRAM actually fitted, so a 2 MB quad-PSRAM module holds proportionally fewer domains instead of failing to start.
 
 > **Note on MicroSD Cards:** A MicroSD card is optional but strongly recommended. Without a card, the device re-downloads the blocklist over HTTPS on every boot — minutes, and up to 459 s on a four-feed configuration — instead of restoring it from an SD snapshot in ~21 seconds. It forwards unfiltered until the list is live.
 
@@ -236,6 +254,13 @@ idf.py -p COM_PORT flash monitor
 idf.py -B build-waveshare "-DSDKCONFIG=sdkconfig.waveshare" "-DSDKCONFIG_DEFAULTS=sdkconfig.defaults;sdkconfig.board.waveshare-s3-eth" build
 idf.py -B build-waveshare -p COM_PORT flash
 ```
+
+### Generic ESP32-S3, Wi-Fi only (no W5500, no SD card)
+```powershell
+idf.py -B build-wifi "-DSDKCONFIG=sdkconfig.wifi" "-DSDKCONFIG_DEFAULTS=sdkconfig.defaults;sdkconfig.board.generic-s3-wifi" build
+idf.py -B build-wifi -p COM_PORT flash
+```
+Set the Wi-Fi credentials afterwards over the USB console (`wifi "<SSID>" <password>`) or, if the board has never joined a network, from the `ESP32AdBlock-Setup` access point it raises on its own. A module with **quad** PSRAM instead of octal needs the two commented lines in `sdkconfig.board.generic-s3-wifi` enabled.
 
 > ⚠️ **`-DSDKCONFIG=sdkconfig.waveshare` is mandatory.** A separate build directory is not enough: without its own `SDKCONFIG`, the Waveshare build writes the board selection into the shared top-level `sdkconfig`, and the *default* LilyGO build then silently comes out with Waveshare pins and the `esp32adblock2` hostname. Both flags go together, every time.
 
