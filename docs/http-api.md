@@ -48,6 +48,7 @@ metrics fields from `dns_server_metrics_json()` in `dns_server.cpp`.
 | POST | `/logout` | Destroy the current session and clear the cookie. |
 | GET | `/` | Status page (Dashboard + tabs). Auto-refreshes every 10 s. |
 | GET | `/metrics` | JSON counters and latency histograms — see below. |
+| GET | `/metrics/view` | Rendered dashboard over `/metrics` (#126). Static page; the grouping lives in its JS and it polls `/metrics` every 10 s, pausing while the tab is hidden. Fields the grouping does not claim are still shown, under "Other (ungrouped)". |
 | GET | `/lastwords` | JSON crash flight recorder (#71) — see below. |
 | POST | `/metrics/reset` | Zero the counters and histograms. |
 | POST | `/reload` | Reload the blocklist now (does not shift the 4 h timer). |
