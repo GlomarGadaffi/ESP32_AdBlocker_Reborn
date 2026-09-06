@@ -1895,7 +1895,8 @@ static esp_err_t handle_wl_add(httpd_req_t *r)
     char body[256] = {}; httpd_req_recv(r, body, sizeof(body) - 1);
     char decoded[256]; form_field(body, "domain", decoded, sizeof(decoded));
     char norm[256]; size_t nlen = domain_normalize(norm, sizeof(norm), decoded, strlen(decoded));
-    if (nlen == 0 || !blocklist_whitelist_add(norm)) {
+    if (nlen == 0) { httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST, "bad domain"); return ESP_FAIL; }
+    if (!blocklist_whitelist_add(norm)) {
         httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST,
             "Whitelist is full (max 64), or the domain is too long");
         return ESP_FAIL;
@@ -2195,7 +2196,8 @@ static esp_err_t handle_custom_rules(httpd_req_t *r)
      * the wire. A single recv() isn't enough at this size either — loop to
      * content_len like handle_ota_update does. (#91) */
     static EXT_RAM_BSS_ATTR char body[CUSTOM_RULES_CAP * 3 + 64];
-    if (r->content_len <= 0 || r->content_len > (int)sizeof(body) - 1) {
+    if (r->content_len <= 0) { httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST, ""); return ESP_FAIL; }
+    if (r->content_len > (int)sizeof(body) - 1) {
         httpd_resp_send_err(r, HTTPD_413_CONTENT_TOO_LARGE, "");
         return ESP_FAIL;
     }
