@@ -1568,12 +1568,25 @@ void DnsSinkServer::run_loop()
              * esp_task_wdt today); this covers "task fine, socket dead". */
             {
                 static uint32_t s_wd_last_l2 = 0, s_wd_last_total = 0, s_wd_stall = 0;
+                static bool     s_wd_ever_served = false;
                 uint32_t l2_now = dns_sink_l2_fallthrough();
                 bool traffic  = (l2_now != s_wd_last_l2);
                 bool progress = (s_cnt_total != s_wd_last_total);
                 s_wd_last_l2 = l2_now;
                 s_wd_last_total = s_cnt_total;
-                if (traffic && !progress) {
+                if (s_cnt_total > 0) s_wd_ever_served = true;
+                /* (#77 follow-up, found live on the LilyGo's first post-reflash
+                 * boot) Right after boot, ordinary household broadcast/ARP
+                 * traffic keeps l2_fallthrough moving before this board's own
+                 * first DNS query happens to land — with s_cnt_total still at
+                 * its initial 0, that reads identically to "traffic arriving,
+                 * no progress" and fired the watchdog on a board that was
+                 * never actually wedged. Harmless (create-before-close made
+                 * the false recreate a no-op), but not what this check is for.
+                 * Gate the whole thing on having served at least one query
+                 * since boot — a stall on a socket that has never worked yet
+                 * isn't the "was fine, now stuck" case this watchdog targets. */
+                if (s_wd_ever_served && traffic && !progress) {
                     if (++s_wd_stall >= 20) {   /* ~2s at the 100ms select() timeout */
                         ESP_LOGE(TAG, "L2 watchdog: wire traffic arriving, no query "
                                       "progress for ~2s — reopening csock/usock");
