@@ -378,16 +378,6 @@ static uint32_t req_peer_ip(httpd_req_t *r)
     return 0;
 }
 
-/* Dotted-quad -> host order; 0 on any malformed input (0.0.0.0 is not a
- * client either, so rejecting it as "no address" is the right answer). */
-static uint32_t parse_ip4(const char *s)
-{
-    unsigned b0 = 256, b1 = 256, b2 = 256, b3 = 256; char tail = 0;
-    if (!s || sscanf(s, "%u.%u.%u.%u%c", &b0, &b1, &b2, &b3, &tail) != 4) return 0;
-    if (b0 > 255 || b1 > 255 || b2 > 255 || b3 > 255) return 0;
-    return ((uint32_t)b0 << 24) | ((uint32_t)b1 << 16) | ((uint32_t)b2 << 8) | (uint32_t)b3;
-}
-
 /* ── GET/POST /setup — first-boot onboarding (#89) ───────────────────
  * Reached only while no admin account exists (auth_wrap routes everything
  * here until one does). Creates the account, opens a session, and lands on
@@ -1328,7 +1318,7 @@ static esp_err_t handle_pause_timed(httpd_req_t *r)
         }
         target = PAUSE_IP_ALL;
     } else if (strcmp(scope, "host") == 0) {
-        target = parse_ip4(ipv);
+        target = acl_parse_ip4(ipv);
         if (target == 0) {
             httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST, "Enter the host's IPv4 address");
             return ESP_FAIL;
@@ -1365,7 +1355,7 @@ static esp_err_t handle_pause_resume(httpd_req_t *r)
     if (strcmp(ipv, "every") == 0)      pause_clear_all();
     else if (strcmp(ipv, "all") == 0)   pause_clear(PAUSE_IP_ALL);
     else {
-        uint32_t ip = parse_ip4(ipv);
+        uint32_t ip = acl_parse_ip4(ipv);
         if (ip) pause_clear(ip);
     }
     httpd_resp_set_status(r, "303 See Other");

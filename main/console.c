@@ -2,6 +2,7 @@
 #include "web_auth.h"
 #include "web_tls.h"
 #include "pause.h"
+#include "acl.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/usb_serial_jtag.h"
@@ -45,15 +46,6 @@ const char *dns_sink_hostname(void);
  * USB access already implies full control (reflash), so no auth here — which
  * is exactly why the lost-password and lost-trust recoveries live here and
  * not in the web UI. */
-
-/* Dotted quad -> host order; 0 on anything malformed (#48). */
-static uint32_t console_parse_ip(const char *s)
-{
-    unsigned b0 = 256, b1 = 256, b2 = 256, b3 = 256; char tail = 0;
-    if (!s || sscanf(s, "%u.%u.%u.%u%c", &b0, &b1, &b2, &b3, &tail) != 4) return 0;
-    if (b0 > 255 || b1 > 255 || b2 > 255 || b3 > 255) return 0;
-    return ((uint32_t)b0 << 24) | ((uint32_t)b1 << 16) | ((uint32_t)b2 << 8) | (uint32_t)b3;
-}
 
 static void console_pause_list(void)
 {
@@ -138,7 +130,7 @@ static void handle_line(char *line)
         while (*scope == ' ') scope++;
         long minutes = strtol(p, NULL, 10);
         uint32_t ip = (*scope == '\0' || strcmp(scope, "all") == 0)
-                    ? PAUSE_IP_ALL : console_parse_ip(scope);
+                    ? PAUSE_IP_ALL : acl_parse_ip4(scope);
         if (*scope != '\0' && strcmp(scope, "all") != 0 && ip == 0)
             ESP_LOGW(TAG, "pause: '%s' is not an IPv4 address", scope);
         else if (!pause_set(ip, (uint32_t)minutes))
@@ -154,7 +146,7 @@ static void handle_line(char *line)
         else if (strcmp(p, "all") == 0)    ESP_LOGI(TAG, "resume all-clients pause: %s",
                                                     pause_clear(PAUSE_IP_ALL) ? "cleared" : "none active");
         else {
-            uint32_t ip = console_parse_ip(p);
+            uint32_t ip = acl_parse_ip4(p);
             if (!ip) ESP_LOGW(TAG, "resume: '%s' is not an IPv4 address", p);
             else     ESP_LOGI(TAG, "resume %s: %s", p, pause_clear(ip) ? "cleared" : "none active");
         }

@@ -27,6 +27,13 @@ bool     acl_permits(uint32_t client_ip_hbo);
  * denied. Never answers on its own authority when it cannot tell. */
 bool     acl_permits_nb(uint32_t client_ip_hbo);
 
+/* Dotted-quad -> host byte order, 0 on anything malformed. Rejects octets
+ * above 255 and trailing junk, which the ACL's own parser used to accept.
+ * Shared so the ACL, the web UI and the USB console agree on what an address
+ * is — three private copies had already started to drift. 0.0.0.0 reads as
+ * "not an address" for every caller, which is what they all want. */
+uint32_t acl_parse_ip4(const char *s);
+
 #ifdef __cplusplus
 }
 #endif
