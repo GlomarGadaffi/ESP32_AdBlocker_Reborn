@@ -1489,8 +1489,13 @@ static esp_err_t handle_pause(httpd_req_t *r)
     if (!csrf_ok(r)) {
         httpd_resp_send_err(r, HTTPD_403_FORBIDDEN, "CSRF"); return ESP_FAIL;
     }
-    char body[16] = {}; httpd_req_recv(r, body, sizeof(body) - 1);
-    blocklist_set_paused(strstr(body, "on=1") != nullptr);
+    /* #97: was a fixed 16-byte body window read with a raw strstr("on=1") —
+     * any other field sent ahead of "on=" (or padding past 15 bytes) pushed
+     * it out of the window and silently un-paused. form_field() is anchored
+     * and url-decodes, so field order and extra fields no longer matter. */
+    char body[64] = {}; httpd_req_recv(r, body, sizeof(body) - 1);
+    char onv[4]; form_field(body, "on", onv, sizeof(onv));
+    blocklist_set_paused(strcmp(onv, "1") == 0);
     httpd_resp_set_status(r, "303 See Other");
     httpd_resp_set_hdr(r, "Location", "/");
     httpd_resp_send(r, nullptr, 0);

@@ -53,7 +53,7 @@ metrics fields from `dns_server_metrics_json()` in `dns_server.cpp`.
 | POST | `/metrics/reset` | Zero the counters and histograms. |
 | POST | `/reload` | Reload the blocklist now (does not shift the 4 h timer). |
 | POST | `/blocklist/stop` | Abort an in-progress download/reload; the previously loaded list keeps serving. |
-| POST | `/pause` | Toggle global pause (allow every query without unloading anything). NVS-persisted, survives reboot. |
+| POST | `/pause` | Set global pause to `on=1` (allow every query without unloading anything) or `on=0`. An absolute set, not a toggle — a body without `on=` un-pauses. NVS-persisted, survives reboot. |
 | POST | `/pause/timed` | Suspend blocking for `min` minutes (1–1440, enforced server-side). `scope=me` (default) applies to the requesting connection's own IP, `scope=host` with `ip=<IPv4>` to another host, `scope=all` to every client. A global pause renders a confirmation page unless `confirm=1` is also sent. Never persisted: a reboot resumes blocking. |
 | POST | `/pause/resume` | End a timed pause early. `ip=<IPv4>` for one host, `ip=all` for the every-client entry, `ip=every` to clear the table. |
 | POST | `/check` | Test one domain against the current verdict ladder. |
@@ -64,7 +64,7 @@ metrics fields from `dns_server_metrics_json()` in `dns_server.cpp`.
 | POST | `/blocklist/url/clear` | Clear one extra feed slot. |
 | POST | `/blocklist/url/toggle` | Enable/disable one extra feed without clearing its URL. |
 | POST | `/rewrite/set` | Add a static host / rewrite (bare hostname or domain → fixed IPv4; a domain also matches its subdomains; up to 48). |
-| POST | `/rewrite/clear` | Clear the rewrite table. |
+| POST | `/rewrite/clear` | Remove one rewrite entry, given `domain=<name>` (the name it was set on). Despite the name, this does not clear the whole table — there is no whole-table-clear route; remove entries one at a time. A body without `domain=` 400s. |
 | GET | `/log` | Recent query log (512-entry ring, wall-clock timestamps). |
 | GET | `/top` | Top domains/clients plus the 60-bucket per-minute CSS bar graph. |
 | POST | `/custom/rules` | Save the custom block-rules textarea (hosts format or bare domains). |
