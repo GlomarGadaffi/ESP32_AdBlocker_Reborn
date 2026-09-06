@@ -1,5 +1,6 @@
 #include "domain.h"
 #include <string.h>
+#include <strings.h>
 #include <ctype.h>
 
 /* IRAM_ATTR (#78): called unconditionally from dns_extract_qname() (this
@@ -120,4 +121,244 @@ size_t domain_extract_token(const char *line, size_t len, const char **tok_out)
     if (p == start) return 0;
     *tok_out = start;
     return (size_t)(p - start);
+}
+
+/* ---- #117: AdGuard rule-grammar subset --------------------------------- */
+
+static bool is_all_digits(const char *p, size_t n)
+{
+    if (n == 0) return false;
+    for (size_t i = 0; i < n; i++) if (!isdigit((unsigned char)p[i])) return false;
+    return true;
+}
+
+/* Strip a trailing ":<1-5 digits>" port suffix, but only when it can't be
+ * confused with IPv6 colons: the token is bracketed ("[addr]:port") or it
+ * has exactly the one colon that can only be a port separator. */
+static size_t strip_port(const char *tok, size_t toklen)
+{
+    if (toklen == 0) return toklen;
+    size_t colon = toklen, colons = 0;
+    for (size_t i = 0; i < toklen; i++) if (tok[i] == ':') { colon = i; colons++; }
+    if (colon == toklen) return toklen;
+    size_t plen = toklen - colon - 1;
+    if (plen == 0 || plen > 5 || !is_all_digits(tok + colon + 1, plen)) return toklen;
+    bool bracketed = (colon > 0 && tok[colon - 1] == ']');
+    return (bracketed || colons == 1) ? colon : toklen;
+}
+
+static void strip_brackets(const char **tok, size_t *toklen)
+{
+    if (*toklen >= 2 && (*tok)[0] == '[' && (*tok)[*toklen - 1] == ']') {
+        *tok += 1; *toklen -= 2;
+    }
+}
+
+/* is_too_wide_rule (DnsLibs rule_utils.cpp:480-484): a pattern shorter than
+ * 3 chars, or made only of '.' and '*', is too generic to mean anything. */
+static bool too_wide(const char *tok, size_t len)
+{
+    if (len < 3) return true;
+    for (size_t i = 0; i < len; i++)
+        if (tok[i] != '.' && tok[i] != '*') return false;
+    return true;
+}
+
+/* Comma-separated modifier list after the LAST '$' in the line. The only
+ * modifier this subset honours is "important", exactly once — anything
+ * else (dnstype=, dnsrewrite=, denyallow=, badfilter, ctag=, client=,
+ * unknown text, an empty segment, or a duplicate) rejects the whole line.
+ * A hosts-format line calls this only when it already knows to reject
+ * (AdGuard hosts syntax carries no modifiers at all), never to accept. */
+static bool parse_modifiers(const char *m, size_t mlen, bool *important_out)
+{
+    *important_out = false;
+    if (mlen == 0) return false;
+    bool seen = false;
+    const char *p = m, *end = m + mlen;
+    for (;;) {
+        const char *comma = memchr(p, ',', (size_t)(end - p));
+        const char *segend = comma ? comma : end;
+        size_t seglen = (size_t)(segend - p);
+        if (seglen != 9 || memcmp(p, "important", 9) != 0) return false;
+        if (seen) return false;   /* duplicate modifier */
+        seen = true;
+        if (!comma) break;
+        p = comma + 1;
+    }
+    *important_out = seen;
+    return seen;
+}
+
+static void reject(rule_t *out, size_t *cursor, size_t line_len, uint8_t reason)
+{
+    out->tok = NULL;
+    out->len = 0;
+    out->kind = RULE_REJECT;
+    out->flags = 0;
+    out->reject_reason = reason;
+    *cursor = line_len;
+}
+
+/* Finish validating a plain domain token — shared by the anchored/bare
+ * path and each hosts-format trailing token. Applies the wildcard-prefix
+ * collapse, port/bracket stripping, trailing-dot strip, then the
+ * too-wide / address / character-set gates. On success fills tok/len only
+ * (caller sets kind and flags); on failure calls reject() and returns
+ * false. */
+static bool finish_token(const char *tstart, size_t toklen, rule_t *out,
+                          size_t *cursor, size_t line_len)
+{
+    if (toklen >= 2 && tstart[0] == '*' && tstart[1] == '.') { tstart += 2; toklen -= 2; }
+    /* Any '*' surviving the collapsible prefix above is a genuine wildcard
+     * pattern ("ex*.com"), not the "*.domain" shorthand — reject it with
+     * its own reason rather than letting the char-set loop below catch it
+     * as generic MALFORMED. */
+    for (size_t i = 0; i < toklen; i++)
+        if (tstart[i] == '*') { reject(out, cursor, line_len, RULE_REJECT_WILDCARD); return false; }
+    toklen = strip_port(tstart, toklen);
+    strip_brackets(&tstart, &toklen);
+    while (toklen > 0 && tstart[toklen - 1] == '.') toklen--;
+
+    if (toklen == 0) { reject(out, cursor, line_len, RULE_REJECT_MALFORMED); return false; }
+    if (tok_is_address(tstart, toklen)) { reject(out, cursor, line_len, RULE_REJECT_CIDR); return false; }
+    if (too_wide(tstart, toklen)) { reject(out, cursor, line_len, RULE_REJECT_TOO_WIDE); return false; }
+    for (size_t i = 0; i < toklen; i++)
+        if (!tok_char_ok(tstart[i])) { reject(out, cursor, line_len, RULE_REJECT_MALFORMED); return false; }
+    if (toklen > 253) { reject(out, cursor, line_len, RULE_REJECT_MALFORMED); return false; }
+
+    out->tok = tstart;
+    out->len = (uint8_t)toklen;
+    out->reject_reason = 0;
+    return true;
+}
+
+/* Walk one whitespace-delimited trailing token starting at *cursor, for
+ * hosts-format lines ("0.0.0.0 a.com b.com"). Always RULE_BLOCK, never
+ * exact, never important — hosts syntax has no way to express either. */
+static bool hosts_token_next(const char *line, size_t len, size_t *cursor, rule_t *out)
+{
+    const char *p = line + *cursor, *end = line + len;
+    while (p < end && (*p == ' ' || *p == '\t')) p++;
+    if (p >= end) { *cursor = len; return false; }
+    const char *t = p;
+    while (t < end && *t != ' ' && *t != '\t') t++;
+    size_t resume = (size_t)(t - line);   /* next trailing token, if any */
+
+    out->kind = RULE_BLOCK;
+    out->flags = 0;
+    /* finish_token() calls reject() on failure, which sets *cursor = len —
+     * override back to resume so a bad token doesn't cut off the rest of
+     * the hosts line's trailing tokens; either way one rule slot (BLOCK or
+     * REJECT) has been produced for this token. */
+    finish_token(p, (size_t)(t - p), out, cursor, len);
+    *cursor = resume;
+    return true;
+}
+
+bool rule_parse_next(const char *line, size_t len, size_t *cursor, rule_t *out)
+{
+    if (!line || !cursor || !out || len == 0) return false;
+
+    if (*cursor != 0) {
+        if (*cursor >= len) return false;
+        return hosts_token_next(line, len, cursor, out);
+    }
+
+    /* Comment lines never emit a rule. */
+    if (line[0] == '!') { *cursor = len; return false; }
+    if (line[0] == '#' && (len < 2 || line[1] != '#')) { *cursor = len; return false; }
+
+    /* Cosmetic marker, anywhere on the line ("example.com##.ad", or a bare
+     * "##selector" with no domain prefix). */
+    for (size_t i = 0; i + 1 < len; i++) {
+        if (line[i] == '#' && line[i + 1] == '#') {
+            reject(out, cursor, len, RULE_REJECT_COSMETIC);
+            return true;
+        }
+    }
+
+    const char *p = line, *end = line + len;
+    while (p < end && (*p == ' ' || *p == '\t')) p++;
+
+    uint8_t kind = RULE_BLOCK;
+    if (end - p >= 2 && p[0] == '@' && p[1] == '@') { kind = RULE_ALLOW; p += 2; }
+
+    bool anchored = false, exact;
+    if (end - p >= 2 && p[0] == '|' && p[1] == '|')      { p += 2; anchored = true;  exact = false; }
+    else if (end - p >= 1 && p[0] == '|')                { p += 1; anchored = true;  exact = true;  }
+    else                                                  { exact = (kind == RULE_ALLOW); }
+
+    /* Hosts format only applies to a bare BLOCK line (no exception marker,
+     * no anchor) whose first token is an address, with something after it. */
+    if (kind == RULE_BLOCK && !anchored) {
+        const char *t = p;
+        while (t < end && *t != ' ' && *t != '\t') t++;
+        if (tok_is_address(p, (size_t)(t - p)) && t < end) {
+            for (const char *q = t; q < end; q++) {
+                if (*q == '$') { reject(out, cursor, len, RULE_REJECT_MODIFIER); return true; }
+            }
+            *cursor = (size_t)(t - line);
+            return hosts_token_next(line, len, cursor, out);
+        }
+    }
+
+    /* Not hosts format: split modifiers at the LAST '$' in [p, end). */
+    const char *dollar = NULL;
+    for (const char *q = end; q > p; ) { --q; if (*q == '$') { dollar = q; break; } }
+    const char *tokend = dollar ? dollar : end;
+
+    bool important = false;
+    if (dollar && !parse_modifiers(dollar + 1, (size_t)(end - dollar - 1), &important)) {
+        reject(out, cursor, len, RULE_REJECT_MODIFIER);
+        return true;
+    }
+
+    /* '^' terminator only recognized when anchored (|.../||...). */
+    const char *tend = tokend;
+    if (anchored) {
+        for (const char *q = p; q < tend; q++) if (*q == '^') { tend = q; break; }
+    }
+    while (tend > p && (tend[-1] == ' ' || tend[-1] == '\t')) tend--;
+
+    const char *tstart = p;
+    size_t toklen = (size_t)(tend - tstart);
+
+    /* A pattern both starting and ending with '/' is a regex, not a domain
+     * with a stray slash — check before any scheme/slash stripping below,
+     * which would otherwise mangle it into a mid-token-slash MALFORMED. */
+    if (toklen >= 2 && tstart[0] == '/' && tstart[toklen - 1] == '/') {
+        reject(out, cursor, len, RULE_REJECT_REGEX);
+        return true;
+    }
+
+    /* Strip a scheme prefix, then a lone trailing '/'; anything else with a
+     * '/' left in it isn't a plain domain pattern. */
+    static const char *const schemes[] = { "https://", "http://", "://", "//" };
+    for (size_t i = 0; i < sizeof(schemes) / sizeof(schemes[0]); i++) {
+        size_t sl = strlen(schemes[i]);
+        if (toklen >= sl && strncasecmp(tstart, schemes[i], sl) == 0) {
+            tstart += sl; toklen -= sl;
+            break;
+        }
+    }
+    if (toklen > 0 && tstart[toklen - 1] == '/') toklen--;
+    for (size_t i = 0; i < toklen; i++) {
+        if (tstart[i] == '/') { reject(out, cursor, len, RULE_REJECT_MALFORMED); return true; }
+    }
+
+    out->kind = kind;
+    out->flags = (uint8_t)((exact ? RULE_EXACT : 0) | (important ? RULE_IMPORTANT : 0));
+    if (!finish_token(tstart, toklen, out, cursor, len)) return true;
+    *cursor = len;
+    return true;
+}
+
+void rule_apply_feed_policy(rule_t *r)
+{
+    if (r->kind == RULE_BLOCK && (r->flags & RULE_IMPORTANT)) {
+        r->kind = RULE_REJECT;
+        r->flags = 0;
+        r->reject_reason = RULE_REJECT_IMPORTANT_BLOCK_UNSUPPORTED;
+    }
 }

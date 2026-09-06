@@ -5,6 +5,7 @@ extern "C" {
 
 #include <stddef.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include "murmur3.h"   /* also brings in the IRAM_ATTR portability shim */
 
 #define DOMAIN_HASH_SEED  0xDEADF00Du
@@ -56,6 +57,70 @@ static inline IRAM_ATTR uint32_t domain_hash(const char *name, size_t len)
 {
     return murmur3_32(name, len, DOMAIN_HASH_SEED);
 }
+
+/* ---- #117: AdGuard rule-grammar subset ----------------------------------
+ * Parse-time only (feed load, custom-rule set): never reached from the L2
+ * hook, so none of this is IRAM_ATTR. */
+
+typedef enum { RULE_BLOCK, RULE_ALLOW, RULE_REJECT } rule_kind_t;
+
+enum {
+    RULE_EXACT     = 1u << 0,  /* participates only at suffix depth 0 */
+    RULE_IMPORTANT = 1u << 1,  /* $important */
+};
+
+enum {
+    RULE_REJECT_REGEX = 1,
+    RULE_REJECT_WILDCARD,
+    RULE_REJECT_MODIFIER,
+    RULE_REJECT_COSMETIC,
+    RULE_REJECT_CIDR,
+    RULE_REJECT_TOO_WIDE,
+    RULE_REJECT_MALFORMED,
+    RULE_REJECT_IMPORTANT_BLOCK_UNSUPPORTED,
+};
+
+typedef struct {
+    const char *tok;            /* domain text, NOT NUL-terminated, points into line */
+    uint8_t     len;
+    uint8_t     kind;            /* rule_kind_t */
+    uint8_t     flags;           /* RULE_EXACT | RULE_IMPORTANT */
+    uint8_t     reject_reason;   /* set only when kind == RULE_REJECT */
+} rule_t;
+
+/*
+ * Iterate the rule(s) on one already-isolated line (no '\n', trailing '\r'
+ * and spaces already trimmed by the caller — same contract as
+ * domain_extract_token). *cursor must be 0 on the first call for a line;
+ * each call that returns true fills *out and advances *cursor so the next
+ * call continues where this one left off. Returns false when there is
+ * nothing left to parse: either the line was a blank/comment line (zero
+ * rules ever emitted — the parser owns comments now, silently), or every
+ * rule on the line has already been emitted. A REJECT is exactly one true
+ * result (whole-line, first call only), then false. Hosts-format lines
+ * ("0.0.0.0 a.com b.com") yield one BLOCK rule per trailing token, which is
+ * the only case a single line produces more than one rule.
+ * Source-agnostic: $important is accepted and flagged here regardless of
+ * whether the caller is a feed or the custom-rules text — whether a FEED
+ * block rule is allowed to carry it is caller policy, see
+ * rule_apply_feed_policy() below.
+ * Allocation-free, single pass over the line (hosts-format tokens are
+ * re-scanned from *cursor on each call rather than held in state).
+ */
+bool rule_parse_next(const char *line, size_t len, size_t *cursor, rule_t *out);
+
+/*
+ * FEED-only policy layered on top of the source-agnostic parse above: the
+ * feed block-table entry is a bare 3-byte remainder with no spare bit (see
+ * #117), so a FEED block rule cannot carry $important — accepting it and
+ * silently dropping the flag would make it lose a precedence fight it was
+ * explicitly written to win. Downgrades exactly that case (BLOCK with
+ * RULE_IMPORTANT set) to REJECT/IMPORTANT_BLOCK_UNSUPPORTED in place.
+ * Every other rule (any ALLOW, or a BLOCK without $important) is
+ * untouched. Never call this for exception or custom rules — they have
+ * somewhere to store the flag.
+ */
+void rule_apply_feed_policy(rule_t *r);
 
 #ifdef __cplusplus
 }
