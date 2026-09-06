@@ -10,6 +10,7 @@ idf_component_register(
         "acl.c"
         "pause.c"
         "query_log.c"
+        "crashlog.c"
         "timesync.c"
         "http_fetch.c"
         "murmur3.c"

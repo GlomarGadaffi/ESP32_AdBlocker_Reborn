@@ -238,11 +238,41 @@ portion of the cached runs.
   own TTLs, and the measured `cache_hit_rate` was only 16.6% — so those runs were
   substantially cold-path measurements of the upstream resolver.
 
-## Wave 2 (later, not now)
+## Wave 2 — shipped, in a narrower shape than first sketched (#70)
 
-The same `[idx | entries]` image is what a flash partition would hold. 16 MB
-flash with the table ending at 0x379000 leaves 12.4 MB unallocated, enough for
-A/B table partitions. What Wave 2 additionally needs is an external merge sort
-(sorted runs streamed to flash, k-way merged) so the staging array stops being
-the capacity ceiling. That is what buys multi-million-entry lists and frees
-PSRAM; this wave deliberately does not attempt it.
+The same `[idx | entries]` image IS what the flash partitions hold — no format
+change, `bl_image_valid()` and the header-triple check are shared verbatim
+with the SD path. What actually shipped: `partitions.csv` (16 MB boards) /
+`partitions_wifi.csv` (the 8 MB Wi-Fi-only board, #49) each add two `data`
+partitions, `bl_a`/`bl_b` (2700K/1500K respectively), right after `ota_1`.
+`blocklist_load_flash()` runs at boot before `blocklist_load_sd()` on every
+board; `blocklist_save_flash()` runs after every reload with `feed_failures
+== 0`, same gate as the SD save. The two slots exist because NOR flash has no
+atomic "replace this file": a save always erases-then-writes whichever slot
+does **not** currently hold the higher validated sequence number, so a power
+cut mid-write leaves the other slot as a working fallback — `blocklist.c`'s
+loader tries the higher-seq slot first and falls back to the other one if
+`bl_image_valid()` rejects a torn body, rather than just trusting the newer
+header.
+
+**What this deliberately does NOT do, and why:** `s_live` still always points
+into PSRAM (`s_image`), never at an `esp_partition_mmap()`'d flash region. On
+both Ethernet boards, `is_blocked_impl()`/`bl_image_contains()` are
+`IRAM_ATTR` specifically because they run inside the L2 fast-path RX hook,
+which `CONTRIBUTING.md` §4 says must never fault to flash — repointing the
+live buffer at mapped flash would put every blocked-domain lookup on that hot
+path behind a real flash read, and a concurrent flash write anywhere
+(an NVS commit, an OTA upload, this very feature's own save) briefly disables
+the flash cache on both cores while it runs. Flash here is boot-time
+persistence and a periodic backup, not the serving path — so it buys
+SD-independence and instant reload after a reboot, but it does **not** free
+the live-image PSRAM allocation (~2.54 MB at `BLOCKLIST_CAPACITY`) and it does
+**not** raise the capacity ceiling `s_cap`/the staging array impose.
+
+**Left for later, on purpose:** on the Wi-Fi-only board specifically there is
+no L2 hook at all (`CONFIG_ADBLOCK_NET_ETH=n`), so a true `esp_partition_mmap`
+live-serving design has no hot-path conflict there and would free PSRAM on
+exactly the board where PSRAM is scarcest — worth a dedicated future issue,
+not attempted here. The external-merge-sort idea (sorted runs streamed to
+flash, k-way merged, breaking the staging array as the capacity ceiling) is
+still wholly unbuilt; multi-million-entry lists need that, not this.

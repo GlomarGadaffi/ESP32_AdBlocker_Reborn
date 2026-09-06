@@ -53,7 +53,17 @@ CONFIG_LWIP_IRAM_OPTIMIZATION=y
 # upstream ESP32_AdBlocker's OTA Upload tab). ota_0/ota_1 at 1700K each easily
 # clears the current ~1.15MB binary with headroom; nvs/otadata/phy_init total
 # under 40KB, so this still uses well under 4MB of the board's 16MB flash.
-CONFIG_PARTITION_TABLE_TWO_OTA_LARGE=y
+#
+# CUSTOM as of #70: the first five rows of partitions.csv are byte-identical
+# to IDF's own partitions_two_ota_large.csv (verified against a real
+# gen_esp32part.py dump of the pre-#70 layout) — this switch exists only to
+# add the bl_a/bl_b flash-resident-blocklist slots after them. A board
+# switching onto this table needs a full serial reflash regardless (adding
+# any partition changes the partition-table image itself, which OTA never
+# touches) — see docs/blocklist-format.md.
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+# CONFIG_PARTITION_TABLE_TWO_OTA_LARGE=y
 # The module is 16MB flash; IDF's own default is 2MB. Without this explicit,
 # regenerating sdkconfig from just this file silently produces a 2MB-flash
 # image against the wrong offsets (#82) — it still builds and links clean.

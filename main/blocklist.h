@@ -101,9 +101,28 @@ const char *blocklist_sd_status(void);
 /* Byte size of the snapshot seen at boot, or 0 if there was none. */
 uint32_t blocklist_sd_bytes(void);
 
+/* Same idea, for the flash A/B slots (#70): "unknown", "absent" (partitions
+ * missing — pre-#70 partition table), "empty" (never written), "bad-count",
+ * "short-read", "invalid-index", "loaded", "saved", "too-big" (s_count
+ * exceeds a slot's capacity — see partitions.csv), "erase-failed",
+ * "write-failed". */
+const char *blocklist_flash_status(void);
+
 /* SD card persistence — call after blocklist_init(), before download_task */
 bool     blocklist_load_sd(void);   /* returns true if loaded from /sdcard/blocklist.bin */
 void     blocklist_save_sd(void);   /* write sorted array to SD after successful download */
+
+/* Flash-resident persistence (#70): a partition-backed analog of the SD
+ * snapshot above, for boards with no SD card (and as a second copy on boards
+ * that have one). Two slots (partitions "bl_a"/"bl_b"), each a header plus one
+ * complete image; load picks whichever slot validates AND carries the higher
+ * sequence number, so a power cut mid-write always leaves a working fallback
+ * in the other slot. Call after blocklist_init(), before blocklist_load_sd()
+ * (flash wins the race on every board; SD stays as a second warm-boot path on
+ * boards that have one). The save side has no public entry point — it's
+ * called internally by blocklist_load(), same feed_failures==0 gate as the
+ * SD save, so nothing external needs to trigger it. */
+bool     blocklist_load_flash(void);   /* returns true if loaded from either slot */
 
 /* Extra blocklist URLs (up to 4, NVS-backed; idx 0-3; empty string = disabled).
  * Merged with BLOCKLIST_URL on each blocklist_load() call. (#4, #9) */

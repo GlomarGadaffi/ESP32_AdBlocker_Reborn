@@ -793,3 +793,86 @@ ceiling rather than a fixed size: `blocklist_init()` now sizes the table from
 2 MB quad-PSRAM module runs a smaller table instead of failing its allocation.
 Release packaging and the browser flasher moved to per-board flash settings,
 since this target addresses 8 MB where the Ethernet boards use 16.
+
+**Feature: flash-resident blocklist persistence (#70), Wave 3.** New custom
+partition table (`partitions.csv` / `partitions_wifi.csv`, `CONFIG_PARTITION_TABLE_CUSTOM=y`)
+— the first five rows are byte-identical to the stock `partitions_two_ota_large.csv`
+this project used before (verified with `gen_esp32part.py` against the actual
+built binary, not by hand-arithmetic), plus two new `data` partitions, `bl_a`/
+`bl_b` (2700K each on the 16 MB boards, 1500K on the 8 MB Wi-Fi-only board),
+right after `ota_1`. `blocklist_load_flash()` (`blocklist.c`) now runs at boot
+before `blocklist_load_sd()` on every board — instant, SD-independent warm
+boot, closing the Waveshare's and the Wi-Fi-only board's multi-minute
+unfiltered cold-boot window. `blocklist_save_flash()` runs after every reload
+with `feed_failures == 0`, same gate as the existing SD save, and both now
+run side by side (SD stays as a second warm-boot path on boards that have
+one, not replaced).
+
+**Transactional write, the actual point of the issue:** two slots because NOR
+flash has no atomic "replace this file" — a save erases-then-writes whichever
+slot does NOT hold the current higher validated sequence number, so a power
+cut mid-write always leaves the untouched slot as a working fallback. The
+loader doesn't just trust the higher-seq header: it tries that slot's body
+first and falls back to the other valid slot if `bl_image_valid()` rejects a
+torn read (the shape a mid-write power cut actually produces — a header
+already committed with the new count, body partly still the erased 0xFF
+pattern). `capacity_for_flash()` guards the write side: if a board's
+PSRAM-derived `s_cap` ever exceeds what its `partitions.csv` provisioned, the
+save logs and skips rather than writing past the slot.
+
+**Deliberately NOT done, and why (see `docs/blocklist-format.md`'s Wave 2
+section for the full reasoning):** `s_live` still always points into PSRAM.
+`is_blocked_impl()`/`bl_image_contains()` are `IRAM_ATTR` because they run
+inside the L2 Ethernet fast-path hook, which `CONTRIBUTING.md` §4 says must
+never fault to flash — an `esp_partition_mmap()`'d live buffer would put
+every blocked-domain lookup on that hot path behind a real flash read, and a
+concurrent flash write anywhere briefly disables the flash cache on both
+cores. So this feature is boot-time persistence, not a serving-path change:
+it does not free the ~2.54 MB live-image PSRAM allocation and does not raise
+the capacity ceiling. A true mmap'd live buffer is safe on the Wi-Fi-only
+board specifically (no L2 hook compiled in there at all) and is left as a
+documented future issue, not attempted here.
+
+Also fixed in the same change: `blocklist_load_sd()` was never calling
+`blocklist_generation_bump()` on publish, unlike the network-reload path —
+harmless only because nothing had raced it in practice. Both persistence
+paths bump it now.
+
+**Not yet verified on hardware** — builds clean on all three board configs
+(`idf.py build`, `build-wifi`, `build-waveshare`); needs a full serial reflash
+(adding partitions changes the partition-table image, which OTA never
+touches) plus a real power-cut-mid-write test before this is more than
+"correct on paper."
+
+**Feature: crash flight recorder (#71), Wave 3.** New `main/crashlog.c`/`.h`.
+A small struct (magic, sequence/head, running query count, min-heap-free,
+an 8-entry ring of truncated-domain/qtype/blocked/timestamp) lives in
+`RTC_NOINIT_ATTR` memory — confirmed placed there via the link map
+(`.rtc_noinit.0`, 0x150 bytes at 0x50000000), not assumed. That section
+survives a software reset, a panic reboot, and a task/interrupt-watchdog
+reset (cleared only by power-on reset and brownout, which need no query
+history — `esp_reset_reason()` already says "power cycled" for those).
+`crashlog_record()` is called from inside `query_log_record()` — one call
+site covers all six existing callers in `dns_server.cpp` — so it's always
+current; there's no panic hook involved at all. `crashlog_init()` runs as
+the literal first line of `app_main()`, before NVS/PSRAM/clock: it snapshots
+whatever the struct currently holds (the previous boot's final state) into a
+plain-BSS copy, classifies `esp_reset_reason()`, and leaves the live struct
+recording without a gap.
+
+Deliberately did NOT try to hook `esp_panic_handler()` — checked ESP-IDF's
+own `esp_system/panic.c` directly rather than assuming: there is no general
+user-code extension point in the panic path, only `CONFIG_ESP_COREDUMP_ENABLE`'s
+`esp_core_dump_write()`, which this project doesn't enable. The RTC-memory
+approach sidesteps needing one — the data is just always there.
+
+Surfaced at `GET /lastwords` (`web_ui.cpp`, JSON, same `auth_wrap` gate and
+`_json(buf,cap)`-formatter-plus-thin-handler shape as `/metrics`) — no new
+access-control mechanism, reuses what every other admin page already
+requires.
+
+**Not yet verified on hardware** — builds clean; needs a real forced panic
+(e.g. an intentional `abort()` behind a debug console command) to confirm
+`/lastwords` shows the right pre-crash query history after reboot, and
+ideally confirmation that RTC memory actually survives a real watchdog reset
+on this board, not just a software `esp_restart()`.

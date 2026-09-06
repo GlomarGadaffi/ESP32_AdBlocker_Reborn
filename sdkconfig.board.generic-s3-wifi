@@ -13,6 +13,10 @@
 CONFIG_ADBLOCK_BOARD_GENERIC_S3_WIFI=y
 CONFIG_ADBLOCK_NET_WIFI=y
 
+# #70: smaller blocklist A/B slots than the 16 MB boards' partitions.csv —
+# this board's flash is 8 MB, with far less tail space to spare.
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_wifi.csv"
+
 # Target + flash geometry. 8 MB is the smallest flash on the common dev-board
 # modules (N8R8, N8R2); a 16 MB module (N16R8) runs this image unchanged — the
 # partition table (two_ota_large, ~3.5 MB) fits either, and the size here only

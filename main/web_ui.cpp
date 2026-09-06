@@ -10,6 +10,7 @@
 #include "dot.h"
 #include "localzone.h"
 #include "query_log.h"
+#include "crashlog.h"
 #include "lwip/sockets.h"
 #include "esp_http_server.h"
 #include "esp_https_server.h"
@@ -1212,6 +1213,17 @@ static esp_err_t handle_metrics(httpd_req_t *r)
     return ESP_OK;
 }
 
+/* ── GET /lastwords — crash flight recorder (#71) ────────────────── */
+static esp_err_t handle_lastwords(httpd_req_t *r)
+{
+    static EXT_RAM_BSS_ATTR char json[1024];
+    int n = crashlog_json(json, sizeof(json));
+    httpd_resp_set_type(r, "application/json");
+    httpd_resp_set_hdr(r, "Cache-Control", "no-store");
+    httpd_resp_send(r, json, n > 0 ? n : 0);
+    return ESP_OK;
+}
+
 /* ── POST /metrics/reset — zero counters+histograms ──────────────── */
 static esp_err_t handle_metrics_reset(httpd_req_t *r)
 {
@@ -2128,6 +2140,7 @@ bool web_ui_start(DnsSinkServer *dns)
         { "/logout",              HTTP_POST, H(handle_logout)        },
         { "/",                    HTTP_GET,  H(handle_status)        },
         { "/metrics",             HTTP_GET,  H(handle_metrics)       },
+        { "/lastwords",           HTTP_GET,  H(handle_lastwords)     },
         { "/metrics/reset",       HTTP_POST, H(handle_metrics_reset) },
         { "/reload",              HTTP_POST, H(handle_reload)        },
         { "/blocklist/stop",      HTTP_POST, H(handle_bl_stop)       },

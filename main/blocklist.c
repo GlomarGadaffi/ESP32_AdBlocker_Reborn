@@ -4,6 +4,7 @@
 #include "http_fetch.h"
 #include "esp_heap_caps.h"
 #include "esp_psram.h"
+#include "esp_partition.h"
 #include "esp_log.h"
 #include "esp_attr.h"
 #include "nvs_flash.h"
@@ -45,13 +46,43 @@ typedef struct {
     uint32_t dropped;
 } bl_sd_header_t;
 
+/* ── Flash-resident persistence (#70) ────────────────────────────────
+ * Two data partitions, "bl_a"/"bl_b" (see partitions.csv / partitions_wifi.csv),
+ * each holding one bl_flash_header_t followed by one complete image — the
+ * same [idx|entries] bytes bl_sd_header_t's file holds, so bl_image_valid()
+ * and the format-triple check are shared verbatim with the SD path. The two
+ * slots exist because NOR flash has no atomic "replace this file": writing
+ * always erases-then-writes the OLDER (or invalid) slot, so a power cut
+ * mid-write leaves the other slot's last-known-good image intact for the
+ * next boot to fall back to. */
+#define BL_FLASH_MAGIC 0xB10CF1A5u
+typedef struct {
+    uint32_t magic;
+    uint32_t seq;           /* monotonic; the higher VALID seq wins at load */
+    uint32_t count;
+    uint8_t  hash_bits, bucket_bits, entry_bytes, pad;
+    uint32_t dropped;
+} bl_flash_header_t;
+
 static const char *TAG = "blocklist";
+
+/* Defined near the other flash-persistence code, below; forward-declared here
+ * because blocklist_load()'s publish step (well above that section) calls it. */
+static void blocklist_save_flash(void);
 
 /* See blocklist_sd_status() in the header for why this exists. */
 static const char *s_sd_status = "unknown";
 static _Atomic uint32_t s_sd_bytes = 0;
 const char *blocklist_sd_status(void) { return s_sd_status; }
 uint32_t    blocklist_sd_bytes(void)  { return atomic_load(&s_sd_bytes); }
+
+/* Same idea as s_sd_status, for the flash slots: "unknown" (never tried),
+ * "absent" (partitions not found — old binary on old partition table),
+ * "empty" (both slots have an invalid/never-written header), "bad-count",
+ * "invalid-index", "loaded", "saved", "too-big" (s_count exceeds what a slot
+ * can hold — see capacity_for_flash), "erase-failed", "write-failed". */
+static const char *s_flash_status = "unknown";
+const char *blocklist_flash_status(void) { return s_flash_status; }
 #define NVS_NS  "dns_sink"
 /* PSRAM buffers.
  * Not a ping-pong pair any more: the two buffers have different shapes and
@@ -106,6 +137,18 @@ static uint32_t capacity_for_psram(size_t psram_bytes)
 }
 
 uint32_t blocklist_capacity(void) { return s_cap; }
+
+/* (#70) Mirrors capacity_for_psram()'s shape: how many entries a single flash
+ * slot of this many bytes can hold, given the header up front. Used only as a
+ * guard — blocklist_save_flash() refuses (logs, skips the write) rather than
+ * ever writing past a slot, if a board's actual PSRAM-derived s_cap somehow
+ * exceeds what its partitions.csv provisioned for. */
+static uint32_t capacity_for_flash(size_t slot_bytes)
+{
+    if (slot_bytes <= sizeof(bl_flash_header_t) + BL_IDX_BYTES) return 0;
+    size_t avail = slot_bytes - sizeof(bl_flash_header_t) - BL_IDX_BYTES;
+    return (uint32_t)(avail / BL_ENT_BYTES);
+}
 static _Atomic bool        s_stop_requested = false;  /* #1: mirrors upstream's xStop */
 
 /* Any event that changes what a query SHOULD resolve to — a reload, a pause
@@ -705,6 +748,7 @@ uint32_t blocklist_load(void)
      * (Capacity drops DO get saved: those are recorded in the header and
      * restored by blocklist_load_sd, so they stay visible.) */
     if (feed_failures == 0) {
+        blocklist_save_flash();   /* (#70) — every board; belt-and-suspenders with SD below */
         blocklist_save_sd();
     } else {
         ESP_LOGW(TAG, "SD snapshot SKIPPED: %" PRIu32 " feed(s) failed this reload — keeping "
@@ -974,6 +1018,12 @@ bool blocklist_load_sd(void)
     atomic_store_explicit(&s_count, hdr.count, memory_order_relaxed);
     atomic_store(&s_dropped, hdr.dropped);
     atomic_store_explicit(&s_live, s_image, memory_order_release);
+    /* (#70) Was missing here — harmless only because nothing raced it in
+     * practice (this ran at boot, before the forward cache had any entries to
+     * go stale). blocklist_load_flash() below now runs at the same point in
+     * boot on every board, so both publish paths bump it, not just the
+     * network-reload one. */
+    blocklist_generation_bump();
     s_sd_status = "loaded";
     ESP_LOGI(TAG, "SD blocklist loaded: %" PRIu32 " domains (instant)", hdr.count);
     if (hdr.dropped > 0)
@@ -1033,6 +1083,196 @@ void blocklist_save_sd(void)
     else
         ESP_LOGW(TAG, "SD blocklist: short write %" PRIu32 "/%" PRIu32,
                  (uint32_t)written, (uint32_t)total);
+}
+
+/* ── Flash persistence (#70) ─────────────────────────────────────── */
+
+static bool flash_partitions_find(const esp_partition_t **out_a, const esp_partition_t **out_b)
+{
+    *out_a = esp_partition_find_first(ESP_PARTITION_TYPE_DATA, 0x40, "bl_a");
+    *out_b = esp_partition_find_first(ESP_PARTITION_TYPE_DATA, 0x40, "bl_b");
+    return *out_a && *out_b;
+}
+
+/* Caller must have already checked hdr->magic == BL_FLASH_MAGIC. */
+static bool flash_header_valid(const bl_flash_header_t *hdr)
+{
+    return hdr->hash_bits == BL_HASH_BITS && hdr->bucket_bits == BL_BUCKET_BITS &&
+           hdr->entry_bytes == BL_ENT_BYTES && hdr->count > 0 && hdr->count <= s_cap;
+}
+
+/* Attempt to load and publish from one header-validated slot. Returns false
+ * (touching s_image as scratch but never s_live) if the BODY doesn't check
+ * out, so the caller can fall back to the other slot instead of giving up —
+ * this is the actual power-loss guarantee, not just "trust the newer seq". */
+static bool flash_try_load_slot(const esp_partition_t *pick, const bl_flash_header_t *hdr)
+{
+    /* Internal DRAM, not EXT_RAM_BSS: this is a READ, so the PSRAM-source
+     * write penalty (see blocklist_save_flash) doesn't apply, but there's no
+     * reason to risk it either — this runs once at boot, the extra copy is
+     * free at that cost. */
+    static uint8_t chunk[4096];
+    size_t total = BL_IMAGE_BYTES(hdr->count), done = 0;
+    while (done < total) {
+        size_t batch = total - done;
+        if (batch > sizeof(chunk)) batch = sizeof(chunk);
+        if (esp_partition_read(pick, sizeof(bl_flash_header_t) + done, chunk, batch) != ESP_OK)
+            break;
+        memcpy(s_image + done, chunk, batch);
+        done += batch;
+    }
+    if (done != total) {
+        ESP_LOGW(TAG, "flash blocklist: short read %u/%u from %s",
+                 (unsigned)done, (unsigned)total, pick->label);
+        s_flash_status = "short-read";
+        return false;
+    }
+
+    /* Same immunity as the SD path: the index bounds come straight out of
+     * flash, so a torn write that leaves the header intact must still be
+     * caught before dns_task or the L2 hook ever probes it. A slot that was
+     * mid-write when power died is exactly this case — its header can say
+     * seq=N, count=700000 while the body is still partly the erased 0xFF
+     * pattern, which fails the monotonic idx[] check below. */
+    if (!bl_image_valid(s_image, hdr->count)) {
+        ESP_LOGW(TAG, "flash blocklist: index failed validation on %s — refusing", pick->label);
+        s_flash_status = "invalid-index";
+        return false;
+    }
+
+    atomic_store_explicit(&s_count, hdr->count, memory_order_relaxed);
+    atomic_store(&s_dropped, hdr->dropped);
+    atomic_store_explicit(&s_live, s_image, memory_order_release);
+    blocklist_generation_bump();   /* (#85) */
+    s_flash_status = "loaded";
+    ESP_LOGI(TAG, "Flash blocklist loaded from %s: %" PRIu32 " domains (seq %" PRIu32 ", instant)",
+             pick->label, hdr->count, hdr->seq);
+    if (hdr->dropped > 0)
+        ESP_LOGW(TAG, "Snapshot was TRUNCATED when written: %" PRIu32 " entries had been "
+                 "dropped — this warm-boot list is INCOMPLETE until the next reload",
+                 hdr->dropped);
+    return true;
+}
+
+bool blocklist_load_flash(void)
+{
+    const esp_partition_t *pa, *pb;
+    if (!flash_partitions_find(&pa, &pb)) {
+        ESP_LOGI(TAG, "blocklist: bl_a/bl_b partitions not found (pre-#70 partition table?)");
+        s_flash_status = "absent";
+        return false;
+    }
+
+    bl_flash_header_t ha, hb;
+    bool a_ok = esp_partition_read(pa, 0, &ha, sizeof(ha)) == ESP_OK &&
+                ha.magic == BL_FLASH_MAGIC && flash_header_valid(&ha);
+    bool b_ok = esp_partition_read(pb, 0, &hb, sizeof(hb)) == ESP_OK &&
+                hb.magic == BL_FLASH_MAGIC && flash_header_valid(&hb);
+
+    if (!a_ok && !b_ok) {
+        ESP_LOGI(TAG, "No valid flash blocklist slot (first boot on this partition table, "
+                      "or both slots empty/stale)");
+        s_flash_status = "empty";
+        return false;
+    }
+
+    /* Try the higher-seq valid slot first (it's the most recently completed
+     * save); if ITS body turns out torn, fall back to the other slot before
+     * giving up and falling further back to SD/network. */
+    bool a_first = a_ok && (!b_ok || ha.seq >= hb.seq);
+    if (a_first) {
+        if (flash_try_load_slot(pa, &ha)) return true;
+        if (b_ok && flash_try_load_slot(pb, &hb)) return true;
+    } else {
+        if (flash_try_load_slot(pb, &hb)) return true;
+        if (a_ok && flash_try_load_slot(pa, &ha)) return true;
+    }
+    return false;
+}
+
+/* Called from blocklist_load() itself, same feed_failures==0 gate as
+ * blocklist_save_sd() — no public entry point, nothing external triggers this. */
+static void blocklist_save_flash(void)
+{
+    uint32_t n = atomic_load(&s_count);
+    const uint8_t *img = atomic_load_explicit(&s_live, memory_order_acquire);
+    if (!img || n == 0) return;
+
+    const esp_partition_t *pa, *pb;
+    if (!flash_partitions_find(&pa, &pb)) { s_flash_status = "absent"; return; }
+
+    uint32_t slot_cap = capacity_for_flash(pa->size);
+    if (n > slot_cap) {
+        ESP_LOGE(TAG, "flash blocklist: %" PRIu32 " domains exceeds slot capacity %" PRIu32
+                 " entries — SKIPPING flash save (partitions.csv needs a bigger bl_a/bl_b "
+                 "for this board's PSRAM)", n, slot_cap);
+        s_flash_status = "too-big";
+        return;
+    }
+
+    bl_flash_header_t ha, hb;
+    bool a_ok = esp_partition_read(pa, 0, &ha, sizeof(ha)) == ESP_OK &&
+                ha.magic == BL_FLASH_MAGIC && flash_header_valid(&ha);
+    bool b_ok = esp_partition_read(pb, 0, &hb, sizeof(hb)) == ESP_OK &&
+                hb.magic == BL_FLASH_MAGIC && flash_header_valid(&hb);
+    uint32_t next_seq = (a_ok && ha.seq > (b_ok ? hb.seq : 0)) ? ha.seq
+                       : (b_ok ? hb.seq : 0);
+    next_seq++;
+
+    /* Target the slot load would NOT currently pick — the older or invalid
+     * one. The slot untouched by this call is exactly what a power cut during
+     * this write falls back to on the next boot. */
+    const esp_partition_t *target = (a_ok && (!b_ok || ha.seq >= hb.seq)) ? pb : pa;
+
+    uint32_t dropped = atomic_load(&s_dropped);
+    bl_flash_header_t hdr = { .magic = BL_FLASH_MAGIC, .seq = next_seq, .count = n,
+                              .hash_bits = BL_HASH_BITS, .bucket_bits = BL_BUCKET_BITS,
+                              .entry_bytes = BL_ENT_BYTES, .pad = 0, .dropped = dropped };
+
+    /* Erase-then-write is inherently non-atomic on NOR flash — that's exactly
+     * why the OTHER slot, never touched by this call, is the fallback a power
+     * cut here leaves behind. Erase the whole slot up front (partitions.csv
+     * sizes both slots as exact multiples of the 4KB erase sector). */
+    if (esp_partition_erase_range(target, 0, target->size) != ESP_OK) {
+        ESP_LOGE(TAG, "flash blocklist: erase failed on %s — previous slot is still the "
+                 "only valid copy", target->label);
+        s_flash_status = "erase-failed";
+        return;
+    }
+    if (esp_partition_write(target, 0, &hdr, sizeof(hdr)) != ESP_OK) {
+        ESP_LOGE(TAG, "flash blocklist: header write failed on %s", target->label);
+        s_flash_status = "write-failed";
+        return;
+    }
+
+    /* Chunk from a small INTERNAL-RAM bounce buffer: esp_flash_write bounces a
+     * PSRAM source 32 bytes at a time internally (same reason the OTA-upload
+     * buffer in web_ui.cpp stays off PSRAM) — sourcing straight from s_image
+     * would make this the slowest possible way to do the write. */
+    static uint8_t chunk[4096];
+    size_t total = BL_IMAGE_BYTES(n), written = 0;
+    bool ok = true;
+    while (written < total) {
+        size_t batch = total - written;
+        if (batch > sizeof(chunk)) batch = sizeof(chunk);
+        memcpy(chunk, img + written, batch);
+        if (esp_partition_write(target, sizeof(hdr) + written, chunk, batch) != ESP_OK) {
+            ok = false;
+            break;
+        }
+        written += batch;
+    }
+
+    if (ok) {
+        s_flash_status = "saved";
+        ESP_LOGI(TAG, "Flash blocklist saved to %s: %" PRIu32 " domains (seq %" PRIu32 ")",
+                 target->label, n, next_seq);
+    } else {
+        ESP_LOGW(TAG, "flash blocklist: short write to %s at %u/%u — that slot is now "
+                 "suspect, the other slot remains the good copy", target->label,
+                 (unsigned)written, (unsigned)total);
+        s_flash_status = "write-failed";
+    }
 }
 
 uint32_t blocklist_domain_count(void)  { return atomic_load(&s_count); }
