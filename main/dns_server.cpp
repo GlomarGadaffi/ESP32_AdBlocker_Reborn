@@ -31,6 +31,10 @@ static const char *TAG = "dns_server";
  * unconditionally even on the Wi-Fi-only board, where it just always
  * returns 0 (the hook that increments it isn't compiled in there). */
 extern "C" uint32_t dns_sink_l2_fallthrough(void);
+extern "C" bool     dns_sink_l2log_drain(char *domain_out, size_t domain_cap,
+                                         uint16_t *qtype_out, uint32_t *client_ip_out,
+                                         bool *blocked_out);
+extern "C" uint32_t dns_sink_l2log_dropped(void);
 
 /* ── Metrics: lock-free counters + power-of-2 µs histograms ───────── */
 /* Single dns_task writes; httpd task reads. 32-bit aligned reads are
@@ -1692,6 +1696,27 @@ void DnsSinkServer::run_loop()
                 }
             }
 
+            /* Drain the L2 hook's staged query log (feature request,
+             * 2026-09-06): l2_input_cb answers most blocked/cached queries
+             * on Ethernet boards without ever touching the query log — see
+             * the ring's own comment in dns_sink.cpp for why it can't call
+             * query_log_record() directly from that IRAM_ATTR context.
+             * Deliberately AFTER the upstream-reply and DoT drains above —
+             * those free upstream table slots and deliver already-arrived
+             * answers, which matters more than log bookkeeping on a tick
+             * that's under load. Capped per tick, same "bounded work per
+             * wakeup" shape as those drains — a sustained burst just spreads
+             * the catch-up over a few more 100ms ticks rather than this loop
+             * ever growing unbounded. */
+            {
+                char l2d_dom[64]; uint16_t l2d_qt; uint32_t l2d_ip; bool l2d_blk;
+                for (int dn = 0; dn < 32; dn++) {
+                    if (!dns_sink_l2log_drain(l2d_dom, sizeof(l2d_dom), &l2d_qt, &l2d_ip, &l2d_blk))
+                        break;
+                    query_log_record(l2d_dom, l2d_qt, l2d_ip, l2d_blk, false);
+                }
+            }
+
             /* ── Hedged retransmits (#69): flights past their p95 deadline ──
              * Deliberately AFTER the reply drains rather than literally beside
              * upstream_evict_expired(): any reply that was already sitting in
@@ -1812,12 +1837,22 @@ void DnsSinkServer::run_loop()
                             sendto(csock, tx, tlen, 0, (sockaddr *)&client_addr, clen);
                         s_cnt_blocked++;
                         hist_record(&s_h_cached, esp_timer_get_time() - t_recv);
+                        /* (review, #124 follow-up) A cache hit never logged at
+                         * all until now — the cold path a few dozen lines down
+                         * does, so a repeat query for the same name was
+                         * invisible to /log and the top-lists on every socket
+                         * path (UDP here, TCP's own cache hit below) despite
+                         * #124 making the L2 fast path's equivalent visible. */
+                        query_log_record(name, qtype,
+                            ntohl(client_addr.sin_addr.s_addr), true, false);
                     } else if (ce->resp_len > 0 && ce->resp_len <= (int)sizeof(tx)) {
                         /* allowed: replay the cached raw upstream response */
                         memcpy(tx, ce->resp, ce->resp_len);
                         tx[0] = rx[0]; tx[1] = rx[1];      /* keep client's txid (wire bytes) */
                         sendto(csock, tx, ce->resp_len, 0, (sockaddr *)&client_addr, clen);
                         hist_record(&s_h_cached, esp_timer_get_time() - t_recv);
+                        query_log_record(name, qtype,
+                            ntohl(client_addr.sin_addr.s_addr), false, false);
                     } else {
                         s_cnt_cache_hit--;       /* stale/empty — treat as miss */
                         goto forward;
@@ -2088,11 +2123,13 @@ void DnsSinkServer::run_loop()
                                 s_cnt_blocked++;
                                 tlen = build_blocked_any(q, qend, qtype, tx, sizeof(tx));
                                 hist_record(&s_h_blocked, esp_timer_get_time() - t_recv);
+                                query_log_record(name, qtype, s_tcp.peer_ip, true, false);
                             } else {
                                 memcpy(tx, ce->resp, ce->resp_len);
                                 tx[0] = q[0]; tx[1] = q[1];   /* client's txid */
                                 tlen = ce->resp_len;
                                 hist_record(&s_h_cached, esp_timer_get_time() - t_recv);
+                                query_log_record(name, qtype, s_tcp.peer_ip, false, false);
                             }
                         } else {
                             uint32_t rw_ip = rw_pre;
@@ -2303,6 +2340,7 @@ int dns_server_metrics_json(char *out, size_t cap)
         "\"tcp_queries\":%" PRIu32 ","
         "\"l2_blocked\":%" PRIu32 ",\"l2_cached\":%" PRIu32 ",\"l2_tx_fail\":%" PRIu32 ","
         "\"l2_fallthrough\":%" PRIu32 ",\"wd_restarts\":%" PRIu32 ","
+        "\"l2_log_dropped\":%" PRIu32 ","
         "\"case_mismatch\":%" PRIu32 ","
         "\"cache_probes\":%" PRIu32 ",\"cache_hits\":%" PRIu32 ",\"cache_hit_rate\":%.1f,"
         "\"cache_evictions\":%" PRIu32 ",\"cache_too_big\":%" PRIu32 ","
@@ -2328,6 +2366,7 @@ int dns_server_metrics_json(char *out, size_t cap)
         s_cnt_tcp,
         dns_sink_l2_blocked(), dns_sink_l2_cached(), dns_sink_l2_tx_fail(),
         dns_sink_l2_fallthrough(), s_cnt_wd_restarts,
+        dns_sink_l2log_dropped(),
         s_cnt_case_mismatch,
         probes, hits, hitrate,
         s_cnt_cache_evict, s_cnt_cache_toobig,
