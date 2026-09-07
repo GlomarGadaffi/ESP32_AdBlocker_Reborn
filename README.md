@@ -6,9 +6,9 @@
 [![Web Flasher](https://img.shields.io/badge/Web%20Flasher-Browser%20Install-brightgreen.svg)](https://glomargadaffi.github.io/ESP32_AdBlocker_Reborn/flasher/)
 [![Release](https://img.shields.io/github/v/release/GlomarGadaffi/ESP32_AdBlocker_Reborn)](https://github.com/GlomarGadaffi/ESP32_AdBlocker_Reborn/releases)
 
-A high-performance, native ESP-IDF DNS sinkhole (a dedicated hardware "Pi-hole" alternative) for **ESP32-S3 + W5500 SPI Ethernet** boards. It blocks ads, tracking, and malware at the network layer for your entire home or office while consuming negligible power (~1W).
+Pi-hole made the case that DNS-level ad and tracking blocking deserves an always-on dedicated box instead of a bolt-on to your router. This project takes that idea and swaps the hardware underneath it: it's a high-performance, native ESP-IDF DNS sinkhole (a dedicated hardware "Pi-hole" alternative) for **ESP32-S3 + W5500 SPI Ethernet** boards — a roughly $15-30 microcontroller taking on a job usually handed to a $50+ single-board computer. It blocks ads, tracking, and malware at the network layer for your entire home or office while consuming negligible power (~1W).
 
-Unlike typical microcontroller blockers, this is a ground-up rewrite engineered for speed and scale: it holds **800,000+ wildcard domains** in PSRAM, answers blocked and cached queries in **~1.8 ms at ~2,200 qps** via an L2 Ethernet fast path, and warm-boots a full list from an SD card cache in **~21 seconds** instead of re-downloading it for minutes.
+Running on smaller, cheaper hardware doesn't mean running slower. Unlike typical microcontroller blockers, this is a ground-up rewrite engineered for speed and scale: it holds **800,000+ wildcard domains** in PSRAM, answers blocked and cached queries in **~1.8 ms at ~2,200 qps** via an L2 Ethernet fast path, and warm-boots a full list from an SD card cache in **~21 seconds** instead of re-downloading it for minutes. The **How It Works** section below covers the mechanics.
 
 ---
 
@@ -184,8 +184,10 @@ Two boards use the **ESP32-S3** with 16 MB flash, 8 MB Octal PSRAM, and a W5500 
 
 ## 🔬 How It Works: Technical Architecture
 
+None of the speed above is an accident. It comes down to three deliberate design decisions, none of them exotic — they just get applied carefully, right down to the byte and the CPU cycle.
+
 ### 1. 40-Bit Bucket-Split Hash Table
-Storing 800,000 domain strings directly would require over 25 MB of RAM—far exceeding the ESP32-S3's 8 MB PSRAM. Storing standard 32-bit hashes causes frequent collisions (~1 in 1,500 domains falsely blocked).
+The first problem is simple arithmetic. Storing 800,000 domain strings directly would require over 25 MB of RAM—far exceeding the ESP32-S3's 8 MB PSRAM. Storing standard 32-bit hashes causes frequent collisions (~1 in 1,500 domains falsely blocked).
 
 **The Solution:** A 40-bit hash is partitioned using hash quotienting:
 $$\text{40-bit hash} = \underbrace{\text{Top 16 bits}}_{\text{Bucket Index } (q)} \ + \ \underbrace{\text{Bottom 24 bits}}_{\text{Stored Remainder } (r)}$$
@@ -197,8 +199,10 @@ $$\text{40-bit hash} = \underbrace{\text{Top 16 bits}}_{\text{Bucket Index } (q)
 * **Known cost:** building the live image has to write the buffer that is serving, so there is a **~50 ms fail-open window on each blocklist reload** (every 4 hours) during which queries are forwarded unfiltered. See [`docs/blocklist-format.md`](docs/blocklist-format.md) for why, and the alternatives.
 
 ### 2. Layer 2 (L2) Ethernet Fast Path
-In standard firmware, incoming DNS UDP packets must traverse:
+This is the piece that does the real work. In standard firmware, incoming DNS UDP packets must traverse:
 $$\text{Hardware} \longrightarrow \text{Driver ISR} \longrightarrow \text{lwIP Stack} \longrightarrow \text{Socket Layer} \longrightarrow \text{FreeRTOS Context Switch} \longrightarrow \text{DNS Task}$$
+
+Reborn skips essentially all of that.
 
 **The Reborn Fast Path:**
 * The W5500 driver registers an input hook (`esp_eth_update_input_path_info`).
@@ -228,6 +232,7 @@ Both `acl_permits_nb()` and `rewrite_lookup_nb()` are **tri-state and zero-wait*
 The net effect: the fast path is still what delivers the ~2,200 qps below, but it is now provably consistent with the socket path rather than a cheaper approximation of it.
 
 ### 3. PSRAM Forward Cache & Optimistic Stale Serving (RFC 8767)
+The third piece is everything that happens once a query has to go upstream: answers worth remembering, and answers worth serving even a little stale rather than making the client wait.
 * **4-Way Set-Associative Cache:** 512 sets (2,048 entries) in PSRAM. Query type is folded into the hash key so `A` and `AAAA` records for the same domain never evict each other.
 * **Serve-Stale:** If an allowed domain's TTL has expired, the cached answer is replayed immediately to the client while a refresh query is dispatched in the background. LAN clients never wait for upstream round trips on frequently visited sites.
 * **Single-Flight Coalescing & Hedging:** Duplicate concurrent requests for the same un-cached domain share a single upstream socket. If an upstream query exceeds the observed p95 response time, a hedged duplicate query is sent.
@@ -237,7 +242,7 @@ The net effect: the fast path is still what delivers the ~2,200 qps below, but i
 
 ## 📊 Measured Performance
 
-Tested LAN client to board over wired Ethernet:
+Numbers, not adjectives. Tested LAN client to board over wired Ethernet:
 
 | Query Type | Typical Latency (p50, c=1) | Minimum Latency | Saturated Throughput |
 | :--- | :--- | :--- | :--- |
