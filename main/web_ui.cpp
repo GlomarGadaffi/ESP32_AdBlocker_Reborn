@@ -541,6 +541,15 @@ static esp_err_t handle_status(httpd_req_t *r)
     int  n = 0;
     char csrf[33] = "";
     web_auth_session_csrf(s_req_sid, csrf, sizeof(csrf));
+    /* Hoisted here (was computed down in the pause section) so the head
+     * script can embed it — refreshDash's live pause-countdown rebuild
+     * needs to know which entry is "this device" the same way the
+     * server-rendered table already does. */
+    uint32_t me = req_peer_ip(r);
+    char my_ip_s[16];
+    snprintf(my_ip_s, sizeof(my_ip_s), "%u.%u.%u.%u",
+             (unsigned)((me>>24)&0xFF),(unsigned)((me>>16)&0xFF),
+             (unsigned)((me>>8)&0xFF),(unsigned)(me&0xFF));
     page_appendf(page, sizeof(page), &n,
         "<!DOCTYPE html><html><head><meta charset=utf-8>"
         "<title>DNS Sinkhole</title>"
@@ -569,6 +578,7 @@ static esp_err_t handle_status(httpd_req_t *r)
          * or the header). JS is already required for the tabs, and with JS
          * off every POST simply fails closed with 403. */
         "var CSRF='%s';"
+        "var MY_IP='%s';"
         "document.addEventListener('submit',function(e){var f=e.target;"
         "if(f.method&&f.method.toLowerCase()=='post'){var a=f.getAttribute('action')||location.pathname;"
         "f.action=a+(a.indexOf('?')<0?'?':'&')+'csrf='+CSRF;}});"
@@ -601,17 +611,29 @@ static esp_err_t handle_status(httpd_req_t *r)
         "function schedRefresh(){"
         "if(RT){clearTimeout(RT);RT=null;}"
         "var a=document.querySelector('.tab.active');"
-        "if(a&&a.id=='tab-dashboard'){RT=setTimeout(refreshDash,10000);}"
+        "if(a&&a.id=='tab-dashboard'){RT=setTimeout(function(){refreshDash(0);},10000);}"
         "}"
+        "var DASH_BUSY=false,DASH_FAILS=0;"
         /* Same Response.redirected check as /metrics/view (#126/#127): an
          * expired session answers this GET with a 303 to /login that fetch()
          * follows and hands back as 200 HTML, so a naive .json() parse would
-         * fail confusingly instead of just sending the user back to sign in. */
-        "function refreshDash(){"
+         * fail confusingly instead of just sending the user back to sign in.
+         * BUSY/document.hidden guards and the visibilitychange catch-up
+         * mirror /metrics/view's tick() exactly (#126/#127) — same reasons:
+         * a slow response must not overlap with the next scheduled one, and
+         * a backgrounded tab must not keep hitting the single-task httpd.
+         * (A prior version of this function called schedRefresh() right
+         * after STARTING the fetch, not after it settled — meaning it
+         * re-armed immediately regardless of how long the request took, the
+         * exact overlap this guard exists to prevent. Caught by review, not
+         * by the mocked-fetch tests, which only ever waited a fixed 50ms.) */
+        "function refreshDash(force){"
+        "if(DASH_BUSY||(document.hidden&&!force))return;"
+        "DASH_BUSY=true;"
         "fetch('/metrics',{cache:'no-store'}).then(function(r){"
         "if(r.redirected){location.reload();return null;}return r.json();"
         "}).then(function(m){"
-        "if(!m)return;"
+        "if(m){"
         "document.getElementById('st-domains').textContent=m.blocklist_count;"
         "document.getElementById('st-queries').textContent=m.queries_total;"
         "document.getElementById('st-blocked').textContent=m.blocked;"
@@ -622,9 +644,50 @@ static esp_err_t handle_status(httpd_req_t *r)
         "var txt=m.blocklist_loading?'Reloading':(m.blocklist_paused?'Paused':(degraded?'Degraded':'Active'));"
         "var st=document.getElementById('st-status');"
         "st.className='val '+cls;st.textContent=txt;"
-        "}).catch(function(){});"
-        "schedRefresh();"
+        "var sl=document.getElementById('stop-load-form');"
+        "if(sl)sl.hidden=!m.blocklist_loading;"
+        "renderPause(m.pause_list||[]);"
+        "DASH_FAILS=0;"
+        "}else{DASH_FAILS++;}"
+        "markStale();DASH_BUSY=false;schedRefresh();"
+        "}).catch(function(){DASH_FAILS++;markStale();DASH_BUSY=false;schedRefresh();});"
         "}"
+        /* (#105/#108 follow-up) A poll failing silently forever is worse than
+         * the reload it replaced, which at least errored visibly in the
+         * browser's own UI on a dead connection — same reasoning as
+         * /metrics/view's FAILS/'stale' handling (#127). */
+        "function markStale(){"
+        "var e=document.getElementById('dash-stale');if(!e)return;"
+        "e.hidden=DASH_FAILS<3;"
+        "}"
+        /* Mirrors the server-rendered pause table exactly (main/web_ui.cpp's
+         * own handle_status) so the two never need to agree on markup by
+         * hand — same client-side-rendering approach #126 established for
+         * the rest of /metrics/view, applied to this one section instead of
+         * the whole page. The submit listener above is delegated on
+         * `document`, so it CSRF-tags these forms even though they're
+         * created here, after page load. */
+        "function renderPause(list){"
+        "var c=document.getElementById('pause-active');if(!c)return;"
+        "if(!list.length){c.innerHTML='';return;}"
+        "var h='<table><tr><th>Paused for</th><th>Time left</th><th></th></tr>';"
+        "for(var i=0;i<list.length;i++){"
+        "var p=list[i];"
+        "var who=p.ip=='all'?'<b>All devices</b>':p.ip;"
+        "if(p.ip==MY_IP)who+=' (this device)';"
+        "var m=Math.floor(p.remaining_s/60),s=p.remaining_s%%60;"
+        "h+='<tr><td>'+who+'</td><td>'+m+'m '+(s<10?'0':'')+s+'s</td>'+"
+        "'<td><form method=post action=/pause/resume style=\"margin:0\">'+"
+        "'<input type=hidden name=ip value=\"'+p.ip+'\"><button>Resume now</button></form></td></tr>';"
+        "}"
+        "h+='</table><form method=post action=/pause/resume style=\"margin-top:.4em\">'+"
+        "'<input type=hidden name=ip value=every><button>Resume all now</button></form>';"
+        "c.innerHTML=h;"
+        "}"
+        "document.addEventListener('visibilitychange',function(){"
+        "if(!document.hidden){var a=document.querySelector('.tab.active');"
+        "if(a&&a.id=='tab-dashboard')refreshDash(1);}"
+        "});"
         "window.onload=function(){"
         "var id=location.hash?location.hash.substring(1):'';"
         "if(!id){try{id=sessionStorage.getItem('tab')||'';}catch(e){id='';}}"
@@ -643,7 +706,7 @@ static esp_err_t handle_status(httpd_req_t *r)
         "<button id=btn-access onclick=\"showTab('access')\">Access</button>"
         "<button id=btn-upstream onclick=\"showTab('upstream')\">Upstream DNS</button>"
         "</div>"
-        "<div class='tab' id=tab-dashboard>", csrf);
+        "<div class='tab' id=tab-dashboard>", csrf, my_ip_s);
     float pct = total > 0 ? 100.0f * (float)blocked / (float)total : 0.0f;
     /* F9: this chip had a DUPLICATE class attribute (class=val class='%s') —
      * HTML keeps only the first, so the ok/warn class never actually applied.
@@ -666,7 +729,10 @@ static esp_err_t handle_status(httpd_req_t *r)
         "<div class=stat><div class=val id=st-blocked>%" PRIu32 "</div><div class=lbl>Blocked</div></div>"
         "<div class=stat><div class=val id=st-rate>%.1f%%</div><div class=lbl>Block rate</div></div>"
         "<div class=stat><div class='val %s' id=st-status>%s</div><div class=lbl>Status</div></div>"
-        "</div>",
+        "</div>"
+        "<p id=dash-stale class=warn hidden><small>The numbers above stopped "
+        "updating a few polls ago &mdash; reload the page to check "
+        "whether the board is still reachable.</small></p>",
         domains, total, blocked, pct,
         status_cls, status_txt);
 
@@ -680,12 +746,15 @@ static esp_err_t handle_status(httpd_req_t *r)
     }
     page_appendf(page, sizeof(page), &n,
         "<h3>Actions</h3>"
-        "<form method=post action=/reload><button>Reload blocklist</button></form><br>");
-    if (loading) {
-        page_appendf(page, sizeof(page), &n,
-            "<form method=post action=/blocklist/stop>"
-            "<button>Stop load</button></form><br>");
-    }
+        "<form method=post action=/reload><button>Reload blocklist</button></form><br>"
+        /* (#105/#108 follow-up) Always rendered, `hidden` toggled by
+         * refreshDash() from m.blocklist_loading — a reload that starts
+         * after the page loaded used to only show this button on the next
+         * full-page reload; now the 10s poll flips it live like the status
+         * chip already does. */
+        "<form method=post action=/blocklist/stop id=stop-load-form%s>"
+        "<button>Stop load</button></form><br>",
+        loading ? "" : " hidden");
     page_appendf(page, sizeof(page), &n,
         "<form method=post action=/pause>"
         "<input type=hidden name=on value=%d>"
@@ -702,20 +771,21 @@ static esp_err_t handle_status(httpd_req_t *r)
         "<a href='/log'>Query log</a> &nbsp; <a href='/top'>Top lists</a>"
         " &nbsp; <a href='/metrics/view'>Metrics</a>"
         " (<a href='/metrics'>JSON</a>)"
-        "<p><small>The stat chips above refresh every 10s while this tab is "
-        "open — nothing on the page reloads, so it's safe to leave the "
-        "Check-domain or Add-to-whitelist fields half-filled. The other tabs "
-        "don't poll at all.</small></p>",
+        "<p><small>The stat chips, Stop-load button, and the pause countdown "
+        "below all refresh every 10s while this tab is open and visible — "
+        "nothing on the page reloads, so it's safe to leave the Check-domain "
+        "or Add-to-whitelist fields half-filled. The other tabs don't poll "
+        "at all.</small></p>",
         paused ? 0 : 1, paused ? "Resume blocking" : "Pause blocking");
 
     /* (#48) Timed, scoped pause. Default scope is the device viewing the page
      * — its address comes from the connection, never from the form — so one
      * client can unblock itself without switching protection off for the
      * house. "All devices" goes through a confirmation page (handle_pause_timed)
-     * before it takes effect. The Dashboard's 10 s auto-refresh keeps the
-     * "time left" column live. */
+     * before it takes effect. refreshDash() (see the head script) rebuilds
+     * the "Time left" table from /metrics's pause_list every 10s — the
+     * static render below is just the first paint. */
     {
-        uint32_t me = req_peer_ip(r);
         pause_view_t pv[PAUSE_MAX];
         uint32_t pn = pause_list(pv, PAUSE_MAX);
         page_appendf(page, sizeof(page), &n,
@@ -733,6 +803,14 @@ static esp_err_t handle_status(httpd_req_t *r)
             (unsigned)PAUSE_MAX_MINUTES, (unsigned)PAUSE_MAX_MINUTES,
             (unsigned)((me>>24)&0xFF),(unsigned)((me>>16)&0xFF),
             (unsigned)((me>>8)&0xFF),(unsigned)(me&0xFF));
+        /* (#105/#108 follow-up) Stable container: refreshDash() replaces
+         * this div's innerHTML from /metrics's pause_list every 10s, the
+         * same client-side-rendering approach #126 already established for
+         * /metrics/view — rather than a second server-side renderer to keep
+         * in step. The submit listener in the head script is delegated on
+         * `document`, so it CSRF-tags these forms' actions even when they're
+         * created by innerHTML after page load, same as any other form. */
+        page_appendf(page, sizeof(page), &n, "<div id=pause-active>");
         if (pn > 0) {
             page_appendf(page, sizeof(page), &n,
                 "<table><tr><th>Paused for</th><th>Time left</th><th></th></tr>");
@@ -758,6 +836,7 @@ static esp_err_t handle_status(httpd_req_t *r)
                 "</table><form method=post action=/pause/resume style='margin-top:.4em'>"
                 "<input type=hidden name=ip value=every><button>Resume all now</button></form>");
         }
+        page_appendf(page, sizeof(page), &n, "</div>");
     }
 
     /* Clock status (NTP) */

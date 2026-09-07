@@ -2403,7 +2403,31 @@ int dns_server_metrics_json(char *out, size_t cap)
             hist_pctl(cats[i].h, 0.50), hist_pctl(cats[i].h, 0.99),
             cats[i].h->max_us, cats[i].h->count);
     }
-    if ((size_t)n < cap) n += snprintf(out + n, cap - (size_t)n, "}}");
+    if ((size_t)n < cap) n += snprintf(out + n, cap - (size_t)n, "}");
+
+    /* (#105/#108 follow-up) The Dashboard's "Time left" pause table used to
+     * only refresh on the full-page reload that #105/#108 removed; now
+     * refreshDash() rebuilds it from here every 10s, the same client-side
+     * pattern #126 already established for the rest of /metrics/view. */
+    if ((size_t)n < cap) n += snprintf(out + n, cap - (size_t)n, ",\"pause_list\":[");
+    {
+        pause_view_t pv[PAUSE_MAX];
+        uint32_t pn = pause_list(pv, PAUSE_MAX);
+        for (uint32_t i = 0; i < pn && (size_t)n < cap; i++) {
+            char ip_s[16];
+            if (pv[i].ip == PAUSE_IP_ALL) {
+                snprintf(ip_s, sizeof(ip_s), "all");
+            } else {
+                snprintf(ip_s, sizeof(ip_s), "%u.%u.%u.%u",
+                    (unsigned)((pv[i].ip>>24)&0xFF),(unsigned)((pv[i].ip>>16)&0xFF),
+                    (unsigned)((pv[i].ip>>8)&0xFF),(unsigned)(pv[i].ip&0xFF));
+            }
+            n += snprintf(out + n, cap - (size_t)n,
+                "%s{\"ip\":\"%s\",\"remaining_s\":%" PRIu32 "}",
+                i ? "," : "", ip_s, pv[i].remaining_s);
+        }
+    }
+    if ((size_t)n < cap) n += snprintf(out + n, cap - (size_t)n, "]}");
     /* F15: n accumulates snprintf's WOULD-BE length, not bytes actually
      * written. Every append above is guarded (`if ((size_t)n < cap) ...`) so
      * none of them overflow `out`, but that guard only stops FURTHER growth —
