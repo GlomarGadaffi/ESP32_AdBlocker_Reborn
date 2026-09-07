@@ -257,7 +257,7 @@ header.
 
 **What this deliberately does NOT do, and why:** `s_live` still always points
 into PSRAM (`s_image`), never at an `esp_partition_mmap()`'d flash region. On
-both Ethernet boards, `is_blocked_impl()`/`bl_image_contains()` are
+both Ethernet boards, `blocklist_verdict_nb()`/`bl_image_contains()` are
 `IRAM_ATTR` specifically because they run inside the L2 fast-path RX hook,
 which `CONTRIBUTING.md` §4 says must never fault to flash — repointing the
 live buffer at mapped flash would put every blocked-domain lookup on that hot

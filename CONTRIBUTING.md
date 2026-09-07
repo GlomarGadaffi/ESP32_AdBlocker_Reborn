@@ -81,15 +81,12 @@ leak into every later client's answer. Two rules follow:
 * **Global state → bump the generation.** `blocklist_generation_bump()` in
   `blocklist.c` increments `s_blocklist_gen`; every cache entry is stamped with
   the generation live at store time, and a lookup under a newer generation is
-  treated as a miss. Today exactly two events bump it: a reload that swaps in a
-  new live list (#85) and a pause flip (#86).
-
-  Note that `blocklist_whitelist_add()` / `_remove()` and
-  `blocklist_custom_set()` do **not** bump, even though `is_blocked_impl()`
-  consults the whitelist inside the cached verdict. A cached BLOCK therefore
-  survives a whitelist add, and a cached ALLOW survives a custom-rule add,
-  until the entry's TTL expires. If you touch these paths, that is the bump
-  they are missing.
+  treated as a miss. A reload that swaps in a new live list (#85), a pause
+  flip (#86), and every whitelist/custom-rule mutation
+  (`blocklist_whitelist_add()`/`_remove()`, `blocklist_custom_set()`, #88)
+  all bump it, since `blocklist_verdict{,_nb}()` consults both tables inside
+  the cached verdict. If you add a new source of state that
+  `blocklist_verdict()` reads, this is the bump it needs.
 
 * **Per-client state → never cache it.** A verdict that depends on the source
   address (ACL is the live example) must be evaluated outside the cached
@@ -136,15 +133,17 @@ DMA driver can't get is a live outage (the W5500 driver logs
 ### 4. `IRAM_ATTR` on definitions only
 
 Tag the *definition*, never the declaration in the header. The L2 hook must
-never fault to flash, so `l2_input_cb`, `l2_qname`, `is_blocked_impl`,
+never fault to flash, so `l2_input_cb`, `l2_qname`, `blocklist_verdict_nb`,
 `dns_cache_l2_get` and `blocklist_generation` carry `IRAM_ATTR` at their
-definitions (#78). `CONFIG_LWIP_IRAM_OPTIMIZATION` covers lwIP's own sources
-only — it does not reach this callback, which `esp_eth` invokes through a
-stored function pointer.
+definitions (#78, #117). `CONFIG_LWIP_IRAM_OPTIMIZATION` covers lwIP's own
+sources only — it does not reach this callback, which `esp_eth` invokes
+through a stored function pointer.
 
-`domain_is_bare_tld()` and the whitelist callbacks reached from
-`is_blocked_impl()` are *not* tagged. That is a known incomplete edge, not a
-claim of full coverage.
+`bl_rank_resolve()`, its three rank-source probes (`feed_probe`,
+`wl_probe_locked`, `custom_probe_locked`), `wl_contains_locked()`, and
+`domain_is_bare_tld()` all sit on this path and carry `IRAM_ATTR` too
+(#117) — this list is meant to be exhaustive for what the L2 hook can
+reach; if you add a new probe or a function one calls, tag it here.
 
 ## Cross-task reads
 

@@ -1005,8 +1005,8 @@ static bool IRAM_ATTR custom_probe_locked(void *ctx, const char *suffix, size_t 
 
 /* Socket path: bounded ~2ms take on the small tables (whitelist + custom
  * rules share one lock, one take for the whole walk — strictly LESS
- * contention than today's per-suffix-level wl_check take inside
- * is_blocked_impl). A busy take fails open: NO_MATCH with .unproven set,
+ * contention than the old is_blocked_impl()'s per-suffix-level wl_check
+ * take). A busy take fails open: NO_MATCH with .unproven set,
  * so the caller forwards the query without caching the answer — the same
  * #99-class fail-open contract the old per-caller whitelist checks used
  * to have, now expressed once instead of independently per caller. */
