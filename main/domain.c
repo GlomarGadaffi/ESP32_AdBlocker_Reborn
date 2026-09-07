@@ -21,6 +21,37 @@ size_t IRAM_ATTR domain_normalize(char *buf, size_t buf_size, const char *src, s
     return src_len;
 }
 
+/* IRAM_ATTR (#109): shared by dns_sink.cpp's L2 hook (IRAM-mandatory) and
+ * dns_server.cpp's socket path (flash-resident is fine there, but tagging
+ * costs nothing extra and keeps this one definition, not two). */
+int IRAM_ATTR dns_extract_qname(const uint8_t *pkt, int pkt_len, int offset,
+                                char *name_out, size_t name_cap, size_t *name_len_out)
+{
+    char raw[256];
+    size_t raw_len = 0;
+    while (offset < pkt_len && pkt[offset] != 0) {
+        uint8_t label_len = pkt[offset];
+        /* (#42) A question QNAME never uses compression (0xC0) or a reserved
+         * label type (0x40-0xBF) per RFC 1035 — either way the top two bits
+         * being set is disqualifying, so one check covers both cases. */
+        if (label_len & 0xC0) return -1;
+        if (offset + 1 + label_len > pkt_len || raw_len + label_len + 1 >= sizeof(raw))
+            return -1;
+        if (raw_len > 0) raw[raw_len++] = '.';
+        memcpy(raw + raw_len, pkt + offset + 1, label_len);
+        raw_len += label_len;
+        offset  += 1 + label_len;
+    }
+    if (offset >= pkt_len) return -1;
+    offset++;                              /* skip the null label */
+    if (offset + 4 > pkt_len) return -1;   /* QTYPE + QCLASS must both fit */
+
+    size_t nlen = domain_normalize(name_out, name_cap, raw, raw_len);
+    if (nlen == 0) return -1;
+    *name_len_out = nlen;
+    return offset + 4;
+}
+
 /* Any single-label name (no dot) is treated as a bare TLD and never blocked. */
 bool domain_is_bare_tld(const char *name, size_t len)
 {

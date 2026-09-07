@@ -17,6 +17,23 @@ extern "C" {
 size_t domain_normalize(char *buf, size_t buf_size, const char *src, size_t src_len);
 
 /*
+ * Parse an RFC 1035 §4.1.2 question QNAME starting at pkt[offset] (no
+ * compression allowed — a question section never uses it), normalize it into
+ * name_out, and return the offset just past QTYPE+QCLASS, or -1 on any
+ * malformed input. (#109) The single parser for both the socket path
+ * (dns_server.cpp, flash-resident) and the L2 fast path (dns_sink.cpp,
+ * IRAM_ATTR) — they used to be two independent copies whose bounds checks
+ * had already drifted (functionally equivalent, but only by accident; #42/L5
+ * needed a human to notice and mirror a fix by hand).
+ * IRAM_ATTR tag lives on the definition in domain.c only — repeating it here
+ * mints a second, conflicting section name for the same symbol and fails the
+ * build under -Werror=attributes (see dns_cache_l2_get's declaration in
+ * dns_server.h for the same rule, learned there first).
+ */
+int dns_extract_qname(const uint8_t *pkt, int pkt_len, int offset,
+                      char *name_out, size_t name_cap, size_t *name_len_out);
+
+/*
  * Return true if name is a bare TLD (single label with no dots) that we
  * should not block even if it appears in the blocklist.
  */

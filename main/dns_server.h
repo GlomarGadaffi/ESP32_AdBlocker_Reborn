@@ -7,6 +7,12 @@
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 
+/* TTL stamped on every blocked/sinkholed answer — the socket path's cache
+ * entries (dns_server.cpp) and the L2 hook's own directly-built blocked reply
+ * (dns_sink.cpp) must agree, or the two verdict paths hand out inconsistent
+ * TTLs for the exact same block decision (#109). */
+static constexpr uint32_t BLOCKED_TTL_S = 10;
+
 /* Build the DNS response flags word from a query flags word (host byte order).
  * QR=1, OPCODE echoed, AA=1, TC=0, RD echoed, RA=1, Z=0, RCODE as given. */
 static inline uint16_t dns_resp_flags(uint16_t qflags, uint8_t rcode)
