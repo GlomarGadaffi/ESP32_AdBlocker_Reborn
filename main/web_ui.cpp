@@ -587,13 +587,43 @@ static esp_err_t handle_status(httpd_req_t *r)
         "schedRefresh();"
         "}"
         /* Only the Dashboard shows live counters, so only the Dashboard needs
-         * reloading. On the config tabs a reload is pure harm — it would throw
-         * away whatever you were typing. location.reload() keeps the fragment,
-         * unlike the <meta refresh> this replaced. */
+         * refreshing. On the config tabs a refresh is pure harm — it would
+         * throw away whatever you were typing.
+         * (#105/#108) This used to be location.reload() every 10s, which
+         * wiped the Dashboard's own Check-domain/Add-to-whitelist inputs
+         * exactly the same way, plus re-walked and re-escaped all ~16KB of
+         * every OTHER tab's markup on the single-task httpd just to repaint
+         * five stat chips. Polling /metrics and patching the five #st-*
+         * elements in place fixes both: nothing on the page is ever
+         * replaced, so a half-typed input survives, and the response is a
+         * few hundred bytes of JSON already built for /metrics/view instead
+         * of the whole page. */
         "function schedRefresh(){"
         "if(RT){clearTimeout(RT);RT=null;}"
         "var a=document.querySelector('.tab.active');"
-        "if(a&&a.id=='tab-dashboard'){RT=setTimeout(function(){location.reload();},10000);}"
+        "if(a&&a.id=='tab-dashboard'){RT=setTimeout(refreshDash,10000);}"
+        "}"
+        /* Same Response.redirected check as /metrics/view (#126/#127): an
+         * expired session answers this GET with a 303 to /login that fetch()
+         * follows and hands back as 200 HTML, so a naive .json() parse would
+         * fail confusingly instead of just sending the user back to sign in. */
+        "function refreshDash(){"
+        "fetch('/metrics',{cache:'no-store'}).then(function(r){"
+        "if(r.redirected){location.reload();return null;}return r.json();"
+        "}).then(function(m){"
+        "if(!m)return;"
+        "document.getElementById('st-domains').textContent=m.blocklist_count;"
+        "document.getElementById('st-queries').textContent=m.queries_total;"
+        "document.getElementById('st-blocked').textContent=m.blocked;"
+        "var pct=m.queries_total>0?(100*m.blocked/m.queries_total):0;"
+        "document.getElementById('st-rate').textContent=pct.toFixed(1)+'%%';"
+        "var degraded=(m.blocklist_dropped>0)||(m.blocklist_feed_failures>0);"
+        "var cls=m.blocklist_loading?'warn':(m.blocklist_paused?'warn':(degraded?'warn':'ok'));"
+        "var txt=m.blocklist_loading?'Reloading':(m.blocklist_paused?'Paused':(degraded?'Degraded':'Active'));"
+        "var st=document.getElementById('st-status');"
+        "st.className='val '+cls;st.textContent=txt;"
+        "}).catch(function(){});"
+        "schedRefresh();"
         "}"
         "window.onload=function(){"
         "var id=location.hash?location.hash.substring(1):'';"
@@ -631,11 +661,11 @@ static esp_err_t handle_status(httpd_req_t *r)
     const char *status_txt = loading ? "Reloading" : (paused ? "Paused" : (degraded ? "Degraded" : "Active"));
     page_appendf(page, sizeof(page), &n,
         "<div class=stats>"
-        "<div class=stat><div class=val>%" PRIu32 "</div><div class=lbl>Domains</div></div>"
-        "<div class=stat><div class=val>%" PRIu32 "</div><div class=lbl>Queries</div></div>"
-        "<div class=stat><div class=val>%" PRIu32 "</div><div class=lbl>Blocked</div></div>"
-        "<div class=stat><div class=val>%.1f%%</div><div class=lbl>Block rate</div></div>"
-        "<div class=stat><div class='val %s'>%s</div><div class=lbl>Status</div></div>"
+        "<div class=stat><div class=val id=st-domains>%" PRIu32 "</div><div class=lbl>Domains</div></div>"
+        "<div class=stat><div class=val id=st-queries>%" PRIu32 "</div><div class=lbl>Queries</div></div>"
+        "<div class=stat><div class=val id=st-blocked>%" PRIu32 "</div><div class=lbl>Blocked</div></div>"
+        "<div class=stat><div class=val id=st-rate>%.1f%%</div><div class=lbl>Block rate</div></div>"
+        "<div class=stat><div class='val %s' id=st-status>%s</div><div class=lbl>Status</div></div>"
         "</div>",
         domains, total, blocked, pct,
         status_cls, status_txt);
@@ -672,8 +702,10 @@ static esp_err_t handle_status(httpd_req_t *r)
         "<a href='/log'>Query log</a> &nbsp; <a href='/top'>Top lists</a>"
         " &nbsp; <a href='/metrics/view'>Metrics</a>"
         " (<a href='/metrics'>JSON</a>)"
-        "<p><small>This tab auto-refreshes every 10s; the other tabs don't, so "
-        "they won't reload while you're editing.</small></p>",
+        "<p><small>The stat chips above refresh every 10s while this tab is "
+        "open — nothing on the page reloads, so it's safe to leave the "
+        "Check-domain or Add-to-whitelist fields half-filled. The other tabs "
+        "don't poll at all.</small></p>",
         paused ? 0 : 1, paused ? "Resume blocking" : "Pause blocking");
 
     /* (#48) Timed, scoped pause. Default scope is the device viewing the page
