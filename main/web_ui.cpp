@@ -364,6 +364,19 @@ static void form_field(const char *body, const char *key, char *dst, size_t cap)
     }
 }
 
+/* Read a form body field as a bounded integer. Leaves *out unchanged and
+ * returns false if the field is missing, unparseable, or outside [lo, hi]. */
+static bool form_int(const char *body, const char *key, int *out, int lo, int hi)
+{
+    char buf[12];
+    form_field(body, key, buf, sizeof(buf));
+    if (buf[0] == '\0') return false;
+    char *end; long v = strtol(buf, &end, 10);
+    if (end == buf || v < lo || v > hi) return false;
+    *out = (int)v;
+    return true;
+}
+
 /* (#48) The address the current request came from, host order, 0 if unknown.
  * Read from the TCP connection itself — never from anything the client sent —
  * because it decides whose blocking a default-scope pause switches off. The
@@ -1776,12 +1789,7 @@ static esp_err_t handle_check(httpd_req_t *r)
     if (got <= 0) { httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST, ""); return ESP_FAIL; }
 
     /* parse domain=xxx from form body */
-    const char *key = "domain="; const char *p = strstr(body, key);
-    if (!p) { httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST, ""); return ESP_FAIL; }
-    p += strlen(key);
-    size_t dlen = strlen(p); while (dlen > 0 && (p[dlen-1] == '\r'||p[dlen-1]=='\n')) dlen--;
-
-    char decoded[256]; url_decode(decoded, sizeof(decoded), p, dlen);
+    char decoded[256]; form_field(body, "domain", decoded, sizeof(decoded));
     char norm[256]; size_t nlen = domain_normalize(norm, sizeof(norm), decoded, strlen(decoded));
     /* Match the real verdict path (dns_server.cpp): main list OR custom rules.
      * Previously checked only the main list, so a domain blocked solely by a
@@ -1809,14 +1817,9 @@ static esp_err_t handle_wl_add(httpd_req_t *r)
         httpd_resp_send_err(r, HTTPD_403_FORBIDDEN, "CSRF"); return ESP_FAIL;
     }
     char body[256] = {}; httpd_req_recv(r, body, sizeof(body) - 1);
-    const char *p = strstr(body, "domain=");
-    if (p) {
-        p += 7;
-        size_t dlen = strlen(p); while (dlen && (p[dlen-1]=='\r'||p[dlen-1]=='\n')) dlen--;
-        char decoded[256]; url_decode(decoded, sizeof(decoded), p, dlen);
-        char norm[256]; size_t nlen = domain_normalize(norm, sizeof(norm), decoded, strlen(decoded));
-        if (nlen > 0) blocklist_whitelist_add(norm);
-    }
+    char decoded[256]; form_field(body, "domain", decoded, sizeof(decoded));
+    char norm[256]; size_t nlen = domain_normalize(norm, sizeof(norm), decoded, strlen(decoded));
+    if (nlen > 0) blocklist_whitelist_add(norm);
     httpd_resp_set_status(r, "303 See Other");
     httpd_resp_set_hdr(r, "Location", "/");
     httpd_resp_send(r, nullptr, 0);
@@ -1830,14 +1833,9 @@ static esp_err_t handle_wl_remove(httpd_req_t *r)
         httpd_resp_send_err(r, HTTPD_403_FORBIDDEN, "CSRF"); return ESP_FAIL;
     }
     char body[256] = {}; httpd_req_recv(r, body, sizeof(body) - 1);
-    const char *p = strstr(body, "domain=");
-    if (p) {
-        p += 7;
-        size_t dlen = strlen(p); while (dlen && (p[dlen-1]=='\r'||p[dlen-1]=='\n')) dlen--;
-        char decoded[256]; url_decode(decoded, sizeof(decoded), p, dlen);
-        char norm[256]; size_t nlen = domain_normalize(norm, sizeof(norm), decoded, strlen(decoded));
-        if (nlen > 0) blocklist_whitelist_remove(norm);
-    }
+    char decoded[256]; form_field(body, "domain", decoded, sizeof(decoded));
+    char norm[256]; size_t nlen = domain_normalize(norm, sizeof(norm), decoded, strlen(decoded));
+    if (nlen > 0) blocklist_whitelist_remove(norm);
     httpd_resp_set_status(r, "303 See Other");
     httpd_resp_set_hdr(r, "Location", "/");
     httpd_resp_send(r, nullptr, 0);
@@ -1851,10 +1849,10 @@ static esp_err_t handle_dot_set(httpd_req_t *r)
     char body[256] = {}; httpd_req_recv(r, body, sizeof(body) - 1);
     bool enabled = (strstr(body, "enabled=1") != nullptr);
     char server[64] = "1.1.1.1", sni[64] = "one.one.one.one";
-    const char *ps = strstr(body, "server=");
-    if (ps) { ps += 7; size_t l=0; char raw[64]={0}; for(;ps[l]&&ps[l]!='&'&&ps[l]!='\r'&&l<63;l++) raw[l]=ps[l]; url_decode(server,sizeof(server),raw,l); }
-    const char *pn = strstr(body, "sni=");
-    if (pn) { pn += 4; size_t l=0; char raw[64]={0}; for(;pn[l]&&pn[l]!='&'&&pn[l]!='\r'&&l<63;l++) raw[l]=pn[l]; url_decode(sni,sizeof(sni),raw,l); }
+    char sv[64]; form_field(body, "server", sv, sizeof(sv));
+    if (sv[0]) snprintf(server, sizeof(server), "%s", sv);
+    char sn[64]; form_field(body, "sni", sn, sizeof(sn));
+    if (sn[0]) snprintf(sni, sizeof(sni), "%s", sn);
     /* (#94) Defence in depth behind the escaping: neither field can legitimately
      * hold anything but a dotted quad and a hostname, so reject the rest at the
      * door instead of storing it in NVS and re-rendering it forever. */
@@ -1906,17 +1904,10 @@ static esp_err_t handle_net_static_set(httpd_req_t *r, const char *iface)
     bool dhcp = (strstr(body, "mode=dhcp") != nullptr);
     char ip[16]="", nm[16]="", gw[16]="", dns_ip[16]="";
     struct { const char *key; char *out; size_t cap; } fields[] = {
-        {"ip=", ip, sizeof(ip)}, {"nm=", nm, sizeof(nm)},
-        {"gw=", gw, sizeof(gw)}, {"dns=", dns_ip, sizeof(dns_ip)},
+        {"ip", ip, sizeof(ip)}, {"nm", nm, sizeof(nm)},
+        {"gw", gw, sizeof(gw)}, {"dns", dns_ip, sizeof(dns_ip)},
     };
-    for (auto &f : fields) {
-        const char *p = strstr(body, f.key);
-        if (!p) continue;
-        p += strlen(f.key);
-        size_t l = 0; char raw[32] = {0};
-        for (; p[l] && p[l] != '&' && p[l] != '\r' && l < 31; l++) raw[l] = p[l];
-        url_decode(f.out, f.cap, raw, l);
-    }
+    for (auto &f : fields) form_field(body, f.key, f.out, f.cap);
     if (!dns_sink_net_set_static(iface, dhcp, ip, nm, gw, dns_ip)) {
         httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST, "Invalid IP/netmask/gateway/DNS");
         return ESP_FAIL;
@@ -2045,10 +2036,8 @@ static esp_err_t handle_wifi_connect(httpd_req_t *r)
     if (!csrf_ok(r)) { httpd_resp_send_err(r, HTTPD_403_FORBIDDEN, "CSRF"); return ESP_FAIL; }
     char body[512] = {}; httpd_req_recv(r, body, sizeof(body) - 1);
     char ssid[33] = "", pass[65] = "";
-    const char *ps = strstr(body, "ssid=");
-    if (ps) { ps += 5; size_t l=0; char raw[128]={0}; for(;ps[l]&&ps[l]!='&'&&ps[l]!='\r'&&l<127;l++) raw[l]=ps[l]; url_decode(ssid,sizeof(ssid),raw,l); }
-    const char *pp = strstr(body, "password=");
-    if (pp) { pp += 9; size_t l=0; char raw[256]={0}; for(;pp[l]&&pp[l]!='&'&&pp[l]!='\r'&&l<255;l++) raw[l]=pp[l]; url_decode(pass,sizeof(pass),raw,l); }
+    form_field(body, "ssid", ssid, sizeof(ssid));
+    form_field(body, "password", pass, sizeof(pass));
     dns_sink_wifi_set_creds(ssid, pass);
     httpd_resp_set_status(r, "303 See Other"); httpd_resp_set_hdr(r, "Location", "/#network"); httpd_resp_send(r,nullptr,0); return ESP_OK;
 }
@@ -2058,8 +2047,7 @@ static esp_err_t handle_acl_add(httpd_req_t *r)
 {
     if (!csrf_ok(r)) { httpd_resp_send_err(r, HTTPD_403_FORBIDDEN, "CSRF"); return ESP_FAIL; }
     char body[64] = {}; httpd_req_recv(r, body, sizeof(body) - 1);
-    const char *p = strstr(body, "ip=");
-    if (p) { p += 3; char ip[24]={0}; size_t l=0; for(;p[l]&&p[l]!='&'&&p[l]!='\r'&&l<23;l++) ip[l]=p[l]; ip[l]=0; acl_add(ip); }
+    char ip[24]; form_field(body, "ip", ip, sizeof(ip)); acl_add(ip);
     httpd_resp_set_status(r, "303 See Other"); httpd_resp_set_hdr(r, "Location", "/"); httpd_resp_send(r,nullptr,0); return ESP_OK;
 }
 
@@ -2068,8 +2056,7 @@ static esp_err_t handle_acl_remove(httpd_req_t *r)
 {
     if (!csrf_ok(r)) { httpd_resp_send_err(r, HTTPD_403_FORBIDDEN, "CSRF"); return ESP_FAIL; }
     char body[64] = {}; httpd_req_recv(r, body, sizeof(body) - 1);
-    const char *p = strstr(body, "ip=");
-    if (p) { p += 3; char ip[24]={0}; size_t l=0; for(;p[l]&&p[l]!='&'&&p[l]!='\r'&&l<23;l++) ip[l]=p[l]; ip[l]=0; acl_remove(ip); }
+    char ip[24]; form_field(body, "ip", ip, sizeof(ip)); acl_remove(ip);
     httpd_resp_set_status(r, "303 See Other"); httpd_resp_set_hdr(r, "Location", "/"); httpd_resp_send(r,nullptr,0); return ESP_OK;
 }
 
@@ -2087,8 +2074,7 @@ static esp_err_t handle_bypass_add(httpd_req_t *r)
 {
     if (!csrf_ok(r)) { httpd_resp_send_err(r, HTTPD_403_FORBIDDEN, "CSRF"); return ESP_FAIL; }
     char body[64] = {}; httpd_req_recv(r, body, sizeof(body) - 1);
-    const char *p = strstr(body, "ip=");
-    if (p) { p += 3; char ip[24]={0}; size_t l=0; for(;p[l]&&p[l]!='&'&&p[l]!='\r'&&l<23;l++) ip[l]=p[l]; ip[l]=0; bypass_add(ip); }
+    char ip[24]; form_field(body, "ip", ip, sizeof(ip)); bypass_add(ip);
     httpd_resp_set_status(r, "303 See Other"); httpd_resp_set_hdr(r, "Location", "/"); httpd_resp_send(r,nullptr,0); return ESP_OK;
 }
 
@@ -2097,8 +2083,7 @@ static esp_err_t handle_bypass_remove(httpd_req_t *r)
 {
     if (!csrf_ok(r)) { httpd_resp_send_err(r, HTTPD_403_FORBIDDEN, "CSRF"); return ESP_FAIL; }
     char body[64] = {}; httpd_req_recv(r, body, sizeof(body) - 1);
-    const char *p = strstr(body, "ip=");
-    if (p) { p += 3; char ip[24]={0}; size_t l=0; for(;p[l]&&p[l]!='&'&&p[l]!='\r'&&l<23;l++) ip[l]=p[l]; ip[l]=0; bypass_remove(ip); }
+    char ip[24]; form_field(body, "ip", ip, sizeof(ip)); bypass_remove(ip);
     httpd_resp_set_status(r, "303 See Other"); httpd_resp_set_hdr(r, "Location", "/"); httpd_resp_send(r,nullptr,0); return ESP_OK;
 }
 
@@ -2121,12 +2106,9 @@ static esp_err_t handle_custom_rules(httpd_req_t *r)
     int got = httpd_req_recv(r, body, sizeof(body) - 1);
     if (got <= 0) { httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST, ""); return ESP_FAIL; }
     body[got] = '\0';
-    const char *p = strstr(body, "rules=");
-    if (!p) { httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST, ""); return ESP_FAIL; }
-    p += 6;
     /* url-decode into a temp buffer */
     static EXT_RAM_BSS_ATTR char decoded[CUSTOM_RULES_CAP + 4];
-    url_decode(decoded, sizeof(decoded), p, strlen(p));
+    form_field(body, "rules", decoded, sizeof(decoded));
     blocklist_custom_set(decoded);
     httpd_resp_set_status(r, "303 See Other");
     httpd_resp_set_hdr(r, "Location", "/");
@@ -2325,21 +2307,13 @@ static esp_err_t handle_rw_set(httpd_req_t *r)
     }
     char body[256] = {}; httpd_req_recv(r, body, sizeof(body) - 1);
     /* parse: domain=foo.local&ip=192.168.1.5 */
-    const char *pd = strstr(body, "domain=");
-    const char *pi = strstr(body, "ip=");
-    if (!pd || !pi) { httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST, ""); return ESP_FAIL; }
-    pd += 7; pi += 3;
-    /* extract domain value (ends at '&' or '\0') */
-    char raw_d[64] = {};
-    size_t dl = 0;
-    for (const char *c = pd; *c && *c != '&' && *c != '\r' && *c != '\n' && dl < 63; c++, dl++)
-        raw_d[dl] = *c;
-    char decoded_d[64]; url_decode(decoded_d, sizeof(decoded_d), raw_d, dl);
+    char decoded_d[64]; form_field(body, "domain", decoded_d, sizeof(decoded_d));
     char norm[64]; size_t nlen = domain_normalize(norm, sizeof(norm), decoded_d, strlen(decoded_d));
     if (nlen == 0) { httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST, "bad domain"); return ESP_FAIL; }
     /* extract IP value — require all four octets to parse and be in range */
+    char ipv[24]; form_field(body, "ip", ipv, sizeof(ipv));
     unsigned b0=0,b1=0,b2=0,b3=0;
-    if (sscanf(pi, "%u.%u.%u.%u", &b0, &b1, &b2, &b3) != 4 ||
+    if (sscanf(ipv, "%u.%u.%u.%u", &b0, &b1, &b2, &b3) != 4 ||
         b0 > 255 || b1 > 255 || b2 > 255 || b3 > 255) {
         httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST, "bad ip"); return ESP_FAIL;
     }
@@ -2359,13 +2333,7 @@ static esp_err_t handle_rw_clear(httpd_req_t *r)
         httpd_resp_send_err(r, HTTPD_403_FORBIDDEN, "CSRF"); return ESP_FAIL;
     }
     char body[128] = {}; httpd_req_recv(r, body, sizeof(body) - 1);
-    const char *pd = strstr(body, "domain=");
-    if (!pd) { httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST, ""); return ESP_FAIL; }
-    pd += 7;
-    char raw[64] = {}; size_t dl = 0;
-    for (const char *c = pd; *c && *c != '&' && *c != '\r' && *c != '\n' && dl < 63; c++, dl++)
-        raw[dl] = *c;
-    char decoded[64]; url_decode(decoded, sizeof(decoded), raw, dl);
+    char decoded[64]; form_field(body, "domain", decoded, sizeof(decoded));
     char norm[64]; size_t nlen = domain_normalize(norm, sizeof(norm), decoded, strlen(decoded));
     if (nlen > 0) rewrite_set(norm, 0);
     httpd_resp_set_status(r, "303 See Other");
@@ -2382,14 +2350,11 @@ static esp_err_t handle_bl_url_set(httpd_req_t *r)
     }
     char body[512] = {}; httpd_req_recv(r, body, sizeof(body) - 1);
     /* parse: idx=0&url=https://... */
-    const char *pidx = strstr(body, "idx=");
-    const char *purl = strstr(body, "url=");
-    if (!pidx || !purl) { httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST, ""); return ESP_FAIL; }
-    int idx = (int)strtol(pidx + 4, nullptr, 10);
-    purl += 4;
-    size_t ulen = strlen(purl);
-    while (ulen && (purl[ulen-1] == '\r' || purl[ulen-1] == '\n')) ulen--;
-    char decoded[BLOCKLIST_URL_CAP]; url_decode(decoded, sizeof(decoded), purl, ulen);
+    int idx;
+    if (!form_int(body, "idx", &idx, 0, BLOCKLIST_EXTRA_MAX - 1)) {
+        httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST, "bad idx"); return ESP_FAIL;
+    }
+    char decoded[BLOCKLIST_URL_CAP]; form_field(body, "url", decoded, sizeof(decoded));
     /* F10: the preset <select>'s placeholder option has value=''. A stale page
      * (render-time free_slot baked into the form's hidden idx) submitted with
      * the placeholder still selected posts idx=N&url= — which used to call
@@ -2423,9 +2388,10 @@ static esp_err_t handle_bl_url_clear(httpd_req_t *r)
         httpd_resp_send_err(r, HTTPD_403_FORBIDDEN, "CSRF"); return ESP_FAIL;
     }
     char body[64] = {}; httpd_req_recv(r, body, sizeof(body) - 1);
-    const char *pidx = strstr(body, "idx=");
-    if (!pidx) { httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST, ""); return ESP_FAIL; }
-    int idx = (int)strtol(pidx + 4, nullptr, 10);
+    int idx;
+    if (!form_int(body, "idx", &idx, 0, BLOCKLIST_EXTRA_MAX - 1)) {
+        httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST, "bad idx"); return ESP_FAIL;
+    }
     blocklist_extra_url_set(idx, "");
     httpd_resp_set_status(r, "303 See Other");
     httpd_resp_set_hdr(r, "Location", "/");
@@ -2441,9 +2407,10 @@ static esp_err_t handle_bl_url_toggle(httpd_req_t *r)
         httpd_resp_send_err(r, HTTPD_403_FORBIDDEN, "CSRF"); return ESP_FAIL;
     }
     char body[64] = {}; httpd_req_recv(r, body, sizeof(body) - 1);
-    const char *pidx = strstr(body, "idx=");
-    if (!pidx) { httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST, ""); return ESP_FAIL; }
-    int idx = (int)strtol(pidx + 4, nullptr, 10);
+    int idx;
+    if (!form_int(body, "idx", &idx, 0, BLOCKLIST_EXTRA_MAX - 1)) {
+        httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST, "bad idx"); return ESP_FAIL;
+    }
     blocklist_extra_enabled_set(idx, !blocklist_extra_enabled_get(idx));
     httpd_resp_set_status(r, "303 See Other");
     httpd_resp_set_hdr(r, "Location", "/");
