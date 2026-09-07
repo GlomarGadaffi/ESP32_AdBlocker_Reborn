@@ -11,12 +11,14 @@
 #include "dot.h"
 #include "localzone.h"
 #include "query_log.h"
+#include "census.h"
 #include "crashlog.h"
 #include "lwip/sockets.h"
 #include "esp_http_server.h"
 #include "esp_https_server.h"
 #include "esp_log.h"
 #include "esp_attr.h"
+#include "esp_timer.h"
 #include "esp_ota_ops.h"
 #include "nvs_flash.h"
 #include "nvs.h"
@@ -795,6 +797,7 @@ static esp_err_t handle_status(httpd_req_t *r)
         "roughly 1 domain in 350,000. Whitelisting is the fix &mdash; it is checked "
         "ahead of the blocklist.</small></p>"
         "<a href='/log'>Query log</a> &nbsp; <a href='/top'>Top lists</a>"
+        " &nbsp; <a href='/census'>LAN census</a>"
         " &nbsp; <a href='/metrics/view'>Metrics</a>"
         " (<a href='/metrics'>JSON</a>)"
         "<p><small>The stat chips, Stop-load button, and the pause countdown "
@@ -1426,8 +1429,10 @@ static esp_err_t handle_metrics_view(httpd_req_t *r)
     " ['l2_blocked','Blocked in the L2 hook','n',0],\n"
     " ['l2_cached','Cache hits in the L2 hook','n',0],\n"
     " ['l2_fallthrough','Handed to lwIP','n',0],\n"
+    " ['l2_dns_fallthrough','...of which, confirmed DNS','n',0],\n"
     " ['l2_tx_fail','Transmit failures','n',1],\n"
     " ['l2_log_dropped','Query-log entries dropped','n',1],\n"
+    " ['census_dropped','Census sightings dropped','n',1],\n"
     " ['wd_restarts','Watchdog restarts','n',1]]],\n"
     "['Forward cache',[\n"
     " ['cache_probes','Probes','n',0],\n"
@@ -2169,6 +2174,75 @@ static esp_err_t handle_log(httpd_req_t *r)
     return ESP_OK;
 }
 
+/* ── GET /census — passive L2 census (#73 foundation) ────────────── */
+static esp_err_t handle_census(httpd_req_t *r)
+{
+    static EXT_RAM_BSS_ATTR CensusClient entries[CENSUS_MAX];
+    uint32_t n = census_snapshot(entries, CENSUS_MAX);
+    uint32_t now_s = (uint32_t)(esp_timer_get_time() / 1000000ULL);
+
+    /* Most-recently-seen first, so the newest device is easy to find and the
+     * next one due for LRU eviction (census_observe's policy) is at the
+     * bottom. Insertion sort, same shape as query_log_top_domains — n is
+     * at most CENSUS_MAX (64). */
+    for (uint32_t i = 1; i < n; i++) {
+        CensusClient key = entries[i]; int j = (int)i - 1;
+        while (j >= 0 && entries[j].last_seen_s < key.last_seen_s) { entries[j+1] = entries[j]; j--; }
+        entries[j+1] = key;
+    }
+
+    static EXT_RAM_BSS_ATTR char page[12288];
+    int pg = 0;
+    page_appendf(page, sizeof(page), &pg,
+        "<!DOCTYPE html><html><head><meta charset=utf-8>"
+        "<title>LAN Census</title>"
+        "<style>body{font-family:monospace;max-width:900px;margin:1em auto}"
+        "table{border-collapse:collapse;width:100%%}"
+        "td,th{border:1px solid #ccc;padding:.3em .6em;font-size:.85em}"
+        "th{background:#222;color:#eee}.warn{color:#b58900}</style></head><body>"
+        "<h2>LAN Census <small>(<a href='/'>home</a>)</small></h2>"
+        "<p>Sightings on the wire (ARP/DHCP/DNS), not a verdict — a client "
+        "flagged <b class='warn'>suspected bypass</b> has been seen on the "
+        "LAN for over %d minutes but has never sent this board a DNS query; "
+        "that means it may be using another resolver, not that it is doing "
+        "anything wrong. IP and hostname are last-writer-wins across sighting "
+        "kinds, so either can briefly show a stale value after a lease "
+        "change.</p>"
+        "<table><tr><th>MAC</th><th>IP</th><th>Hostname</th>"
+        "<th>First seen</th><th>Last seen</th>"
+        "<th>ARP</th><th>DHCP</th><th>Queries</th><th></th></tr>",
+        CENSUS_GRACE_S / 60);
+    uint32_t shown = 0;
+    for (uint32_t i = 0; i < n && pg < (int)sizeof(page) - 256; i++, shown++) {
+        CensusClient *c = &entries[i];
+        char host[64]; html_escape(host, sizeof(host), c->hostname[0] ? c->hostname : "-");
+        uint32_t age_s = now_s - c->first_seen_s;
+        bool bypass = (c->arp_count || c->dhcp_count) && !c->query_count &&
+                      age_s >= CENSUS_GRACE_S;
+        page_appendf(page, sizeof(page), &pg,
+            "<tr><td>%02x:%02x:%02x:%02x:%02x:%02x</td><td>%u.%u.%u.%u</td>"
+            "<td>%s</td><td>%lus ago</td><td>%lus ago</td>"
+            "<td>%" PRIu32 "</td><td>%" PRIu32 "</td><td>%" PRIu32 "</td>"
+            "<td class='warn'>%s</td></tr>",
+            c->mac[0], c->mac[1], c->mac[2], c->mac[3], c->mac[4], c->mac[5],
+            (unsigned)((c->ip>>24)&0xFF),(unsigned)((c->ip>>16)&0xFF),
+            (unsigned)((c->ip>>8)&0xFF),(unsigned)(c->ip&0xFF),
+            host,
+            (unsigned long)age_s, (unsigned long)(now_s - c->last_seen_s),
+            c->arp_count, c->dhcp_count, c->query_count,
+            bypass ? "suspected bypass" : "");
+    }
+    page_appendf(page, sizeof(page), &pg, "</table>");
+    if (shown < n) {
+        page_appendf(page, sizeof(page), &pg,
+            "<p><b>%" PRIu32 " of %" PRIu32 " clients shown</b> — the page "
+            "buffer filled before the rest would fit.</p>", shown, n);
+    }
+    page_appendf(page, sizeof(page), &pg, "</body></html>");
+    send_html(r, page);
+    return ESP_OK;
+}
+
 /* ── GET /top — top domains, clients + live history graph (#7,#11) ─ */
 static esp_err_t handle_top(httpd_req_t *r)
 {
@@ -2473,7 +2547,7 @@ bool web_ui_start(DnsSinkServer *dns)
     cfg.prvtkey_pem      = (const uint8_t *)key;
     cfg.prvtkey_len      = key_len;
     cfg.port_secure      = 443;
-    cfg.httpd.max_uri_handlers = 48;   /* 43 registered as of #126 — keep headroom */
+    cfg.httpd.max_uri_handlers = 48;   /* 44 registered as of #73 — keep headroom */
     cfg.httpd.max_resp_headers = 16;   /* 5 hardening headers + cookie + Location + type */
     cfg.httpd.stack_size       = 16384;
     /* Recycle the least-recently-used connection instead of refusing new ones
@@ -2528,6 +2602,7 @@ bool web_ui_start(DnsSinkServer *dns)
         { "/rewrite/set",         HTTP_POST, H(handle_rw_set)        },
         { "/rewrite/clear",       HTTP_POST, H(handle_rw_clear)      },
         { "/log",                 HTTP_GET,  H(handle_log)           },
+        { "/census",              HTTP_GET,  H(handle_census)        },
         { "/top",                 HTTP_GET,  H(handle_top)           },
         { "/custom/rules",        HTTP_POST, H(handle_custom_rules)  },
         { "/acl/add",             HTTP_POST, H(handle_acl_add)       },

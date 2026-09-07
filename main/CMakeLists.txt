@@ -11,6 +11,7 @@ idf_component_register(
         "bypass.c"
         "pause.c"
         "query_log.c"
+        "census.c"
         "crashlog.c"
         "timesync.c"
         "http_fetch.c"
