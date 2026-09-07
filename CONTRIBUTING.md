@@ -24,13 +24,23 @@ A query can be answered from either of two places, in different tasks:
 
 The asymmetry that makes this safe is that **the L2 hook may only answer a query
 it can classify exactly as the socket path would, and must otherwise hand the
-frame over**. It answers in exactly two cases — a BLOCK verdict from
-`blocklist_is_blocked_nb()`, or a live forward-cache hit from
+frame over**. It answers in exactly two cases — a proven verdict from
+`blocklist_verdict_nb()`, or a live forward-cache hit from
 `dns_cache_l2_get()` — and *every other outcome falls through* to
 `esp_netif_receive()`, where the socket path runs the full ladder
-(ACL, rewrites, `blocklist_is_blocked() || blocklist_custom_is_blocked()`,
-upstream forward). So the hook's cheaper check set is not a divergence: it is a
-short-circuit that only fires where the full ladder would agree.
+(ACL, rewrites, `blocklist_verdict()`, upstream forward). So the hook's cheaper
+check set is not a divergence: it is a short-circuit that only fires where the
+full ladder would agree.
+
+**`blocklist_verdict{,_nb}()` (#117) is *the* verdict call, both paths.** It
+resolves the feed block table, the NVS whitelist, and custom rules — including
+`@@` exceptions and `$important` — into one rank-ordered answer instead of a
+hand-copied boolean OR; there is no second ladder left to drift out of sync.
+The `_nb` variant never blocks: it returns a proven verdict, or one of two
+distinct defer signals (`BL_DEFER_LOCK_BUSY`, `BL_DEFER_SNAPSHOT` —
+`dns_sink.cpp`'s `l2_defer_lock_busy` / `l2_defer_snapshot` counters, surfaced
+in `/metrics`) that fold into the same `break`-to-lwIP rule as everything else
+in this hook.
 
 Everything the hook cannot vouch for `break`s, and every `break` means "let lwIP
 have it" — never "drop it". That covers a header it will not trust, a lock it
@@ -45,12 +55,19 @@ provable ACL pass from `acl_permits_nb()`; and no matching entry in
 answer, only a slower one.
 
 If you add a rule that can turn a BLOCK into an ALLOW — a new whitelist-like
-exemption — it must be visible to `blocklist_is_blocked_nb()`, or the L2 hook
+exemption — it must be visible to `blocklist_verdict_nb()`, or the L2 hook
 will sinkhole something the socket path would have let through. A rule that
 *changes* the answer rather than allowing it (rewrites) must make the hook
-defer, not answer. Adding a rule that only ever creates *more* blocking (like
-the custom inline rules) is safe to leave off the hook; it just doesn't get the
-fast path.
+defer, not answer. **A custom or feed rule that only ever creates *more*
+blocking is safe to leave off the hook — that half is still true — but it stops
+being the whole story the moment the same table can also carry an ALLOW
+(`@@`).** A BLOCK-kind entry costs the fast path nothing extra; an ALLOW-kind
+entry rides the whitelist's single zero-wait take (`s_wl_mutex`, one take for
+the whole suffix walk that also covers the custom-rule table — an empty
+custom table just means a zero-iteration probe once that take succeeds) and,
+if the take is busy, the hook defers unconditionally rather than trust an
+unlocked read of whether an exception exists — see `blocklist_verdict_nb()`'s
+own comment for why.
 
 The ACL gap this file used to document — a non-ACL client still getting
 sinkhole replies and cache hits over Ethernet — was #87, and is fixed.

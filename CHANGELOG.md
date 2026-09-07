@@ -5,7 +5,60 @@ firmware's `esp_app_desc` version string comes from `version.txt`.
 
 ## [Unreleased]
 
+### Behaviour changes
+
+- **The NVS whitelist now outranks a feed block, for every subdomain, not just
+  itself (#117).** Previously the whitelist was *depth*-dominant: with
+  whitelist `example.com` and a feed listing `ads.example.com`,
+  `ads.example.com` stayed BLOCKED — an undocumented second ordering next to
+  the feed/custom-rules composition. Under the one shared rank-ordered
+  verdict every source now goes through, the whitelist is an exception rule
+  (rank 1), and rank always beats depth: `ads.example.com` is now ALLOWED.
+  This is the point of the change, not a side effect of it — "my whitelist
+  entry isn't working" is the complaint this closes. If a subdomain
+  genuinely needs to stay blocked despite a broader whitelist entry, add a
+  custom rule `||ads.example.com^$important` (rank 2) — the escape hatch.
+- **A name whose own verdict is ALLOW (a custom `@@` rule, or the whitelist)
+  no longer has its CNAME chain inspected for cloaking (#117).** Previously
+  `process_reply`'s cloaking check ran regardless of the queried name's own
+  verdict, so an explicitly-allowed name that CNAME-cloaked to a blocklisted
+  target was sinkholed anyway — exactly the outcome an explicit allow exists
+  to prevent. Same reasoning, same code path, as the existing pause exemption.
+
 ### Added
+
+- **The AdGuard DNS rule-grammar subset (#117): custom rules can now write
+  `@@` exceptions and `$important`, not just block-only entries.** A custom
+  rule stack now resolves through one rank-ordered verdict — see the
+  behaviour changes above — instead of the plain boolean OR that made an
+  exception feature structurally impossible to add (`false` couldn't mean
+  both "no rule matched" and "a rule explicitly allows this"). `POST /check`
+  now reports which source decided a verdict (`BLOCKED (feed)`,
+  `ALLOWED (whitelist)`, ...) and a matching rewrite (`REWRITE -> ip`)
+  instead of only ever consulting the main blocklist (#103). `$important` on
+  a *feed* block rule still can't be honoured (the block-table entry has no
+  spare bit for it — a later change) and is rejected and counted rather than
+  silently accepted-and-ignored; a census of the four configured feeds found
+  5 such lines total, all in the AdGuard DNS filter, and — since today's
+  parser already rejects any line containing `$` outright — all 5 were
+  already being dropped before this change. Nothing that worked stops
+  working; the drop is just visible now (`rejected.important_block`).
+- **Hosts-format feed lines with more than one domain are no longer
+  truncated to the first.** `0.0.0.0 a.com b.com` now yields two block
+  entries; previously only `a.com` was ever stored.
+- **Per-reason blocklist-reject counters, surfaced in `/metrics`.** A feed
+  that's mostly regex/wildcard/unsupported-modifier syntax — content this
+  firmware can't act on — now shows up as such (`rejected.regex`,
+  `.wildcard`, `.modifier`, `.cosmetic`, `.cidr`, `.too_wide`,
+  `.important_block`) instead of just a smaller-than-expected domain count.
+  `exceptions_skipped` counts `@@` lines seen in a feed that have nowhere to
+  be stored yet — feed-level exceptions are a separate, later change; a
+  feed's own `@@` lines have no effect at all until then, and this number is
+  how that gap stays visible instead of silent.
+- **L2 fast-path defer counters** (`l2_defer_lock_busy`, `l2_defer_snapshot`,
+  `/metrics`): the Ethernet fast path now defers to the socket path rather
+  than answer on a guess whenever it can't prove a verdict without
+  stalling — see Fixed, below.
 
 - **Timed, scoped "pause blocking" (#48).** A pause can now be taken for a set
   number of minutes, capped at 24 hours and enforced on the device rather than
@@ -40,6 +93,19 @@ firmware's `esp_app_desc` version string comes from `version.txt`.
   now skip that check and are excluded from request coalescing, so no other
   client can ride or inherit an unfiltered answer. Found on hardware; every
   host-side check had passed.
+- **A whitelisted name could be sinkholed — and the wrong answer cached — for
+  the ~2 ms window of a whitelist or custom-rule NVS commit (#99-class,
+  #117).** `blocklist_whitelist_contains()`'s bounded take already failed
+  open (fail-*closed* for a name that should have been allowed) on a busy
+  mutex; the L2 hook's "busy -> report whitelisted" special case existed
+  specifically to paper over that on the fast path, but the socket path had
+  no such cover and would sinkhole the name outright. The new
+  `blocklist_verdict{,_nb}()` closes this properly instead of hiding it: a
+  busy take now reports `.unproven` (socket path) or defers outright (L2
+  path, `l2_defer_lock_busy`), so the caller forwards the query and never
+  caches a guessed verdict, on either path.
+- **`0.0.0.0 a.com b.com`-style hosts entries only ever stored the first
+  domain.** See Added, above.
 - **Five mutating web-UI handlers discarded a "refused" return and answered
   303 anyway (#92).** `/whitelist/add`, `/rewrite/set`, `/acl/add`,
   `/wifi/connect`, and `/blocklist/url/set` all ignored a `bool` meaning the
