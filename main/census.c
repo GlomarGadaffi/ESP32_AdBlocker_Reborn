@@ -64,10 +64,11 @@ void census_observe(const uint8_t mac[6], uint32_t ip, int kind,
     CensusClient *c = &s_table[idx];
     c->last_seen_s = now_s;
     if (ip) c->ip = ip;
+    /* Unlike census_stage's raw per-event copy, an absent hostname here must
+     * NOT clear a previously learned one — only DHCP sightings ever carry a
+     * hostname, and an ARP/QUERY sighting in between shouldn't erase it. */
     if (hostname && hostname_len > 0) {
-        size_t cl = hostname_len < sizeof(c->hostname) - 1 ? hostname_len : sizeof(c->hostname) - 1;
-        memcpy(c->hostname, hostname, cl);
-        c->hostname[cl] = '\0';
+        census_copy_hostname(c->hostname, hostname, hostname_len);
     }
     switch (kind) {
         case CENSUS_SEEN_ARP:   c->arp_count++;   break;

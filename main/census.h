@@ -6,6 +6,7 @@ extern "C" {
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <string.h>
 
 /* Passive L2 census (#73 foundation) — a MAC-keyed table of LAN clients seen
  * via ARP, DHCP, or a DNS query, built from sightings staged by dns_sink.cpp's
@@ -14,8 +15,9 @@ extern "C" {
  * IRAM_ATTR eth-RX hot path, so a plain mutex is enough; no seqlock needed). */
 #define CENSUS_MAX 64
 
-/* Must match dns_sink.cpp's internal CensusKind values exactly — the two
- * sides cross an extern "C" int boundary, not a shared enum type. */
+/* The one place these sighting-kind values are defined — dns_sink.cpp's
+ * producer includes this header and uses them directly rather than keeping
+ * its own copy in sync by comment. */
 #define CENSUS_SEEN_ARP   0
 #define CENSUS_SEEN_DHCP  1
 #define CENSUS_SEEN_QUERY 2
@@ -35,6 +37,17 @@ typedef struct {
     uint32_t dhcp_count;
     uint32_t query_count;
 } CensusClient;
+
+/* Bounded copy-and-NUL-terminate into a fixed 32-byte hostname field — shared
+ * by census_stage() (dns_sink.cpp, the producer) and census_observe()
+ * (census.c, the consumer) so a fix to the clamp math only happens once. */
+static inline void census_copy_hostname(char dst[32], const char *src, size_t src_len)
+{
+    if (!src || src_len == 0) { dst[0] = '\0'; return; }
+    size_t cl = src_len < 31 ? src_len : 31;
+    memcpy(dst, src, cl);
+    dst[cl] = '\0';
+}
 
 bool census_init(void);
 

@@ -33,6 +33,7 @@ static const char *TAG = "dns_server";
  * unconditionally even on the Wi-Fi-only board, where it just always
  * returns 0 (the hook that increments it isn't compiled in there). */
 extern "C" uint32_t dns_sink_l2_fallthrough(void);
+extern "C" uint32_t dns_sink_l2_dns_fallthrough(void);
 extern "C" bool     dns_sink_l2log_drain(char *domain_out, size_t domain_cap,
                                          uint16_t *qtype_out, uint32_t *client_ip_out,
                                          bool *blocked_out);
@@ -1541,38 +1542,69 @@ void DnsSinkServer::run_loop()
                 tcp_conn_close();   /* idle/stuck client can't hold the slot */
 
             /* ── L2 socket-path watchdog (#77) ───────────────────────
-             * Wire traffic proves the link and lwIP's netif are alive; our
-             * own query counter proves THESE sockets are making progress.
-             * If the L2 hook's fall-through counter keeps moving while ours
-             * doesn't for several consecutive ticks, csock/usock are likely
-             * wedged (a stuck PCB, not a dead cable) — recreate them,
-             * in-task, never touching another task's fd. Does not cover a
-             * fully wedged dns_task itself (nothing watches this task with
-             * esp_task_wdt today); this covers "task fine, socket dead". */
+             * Genuine DNS demand proves lwIP handed this task something to
+             * do; our own query counter proves THESE sockets are making
+             * progress. If confirmed demand keeps accumulating with zero
+             * progress, csock/usock are likely wedged (a stuck PCB, not a
+             * dead cable) — recreate them, in-task, never touching another
+             * task's fd. Does not cover a fully wedged dns_task itself
+             * (nothing watches this task with esp_task_wdt today); this
+             * covers "task fine, socket dead".
+             *
+             * (#128) "traffic" used to be dns_sink_l2_fallthrough() — every
+             * frame the L2 hook declined to answer, DNS or not. On a board
+             * with ordinary ARP/mDNS/SSDP broadcast noise but only a query
+             * every several seconds, that counter moved almost every tick
+             * regardless of DNS activity, so a 2s DNS-quiet gap read
+             * identically to "wedged". dns_sink_l2_dns_fallthrough() counts
+             * only confirmed, well-formed DNS queries the hook deferred to
+             * lwIP — link noise no longer arms this watchdog, only actual
+             * demand on the sockets it's checking. */
             {
-                static uint32_t s_wd_last_l2 = 0, s_wd_last_total = 0, s_wd_stall = 0;
+                /* (#128) The old design counted 20 CONSECUTIVE ticks where
+                 * "traffic" was true — sound when "traffic" moved almost
+                 * every tick from background link noise, but genuine DNS
+                 * demand is naturally sparse (one query every several
+                 * seconds is ordinary), so requiring it to occur in every
+                 * single 100ms tick for a full 2s would make this watchdog
+                 * nearly impossible to trip under realistic traffic. Instead
+                 * accumulate unanswered demand — how many confirmed queries
+                 * dns_sink_l2_dns_fallthrough() has counted since progress
+                 * last moved — and trip once that reaches the threshold,
+                 * however long it takes to arrive. A working socket keeps
+                 * this near zero (progress resets it on every real answer);
+                 * a wedged one only ever accumulates. */
+                static uint32_t s_wd_last_l2 = 0, s_wd_last_total = 0, s_wd_unanswered = 0;
                 static bool     s_wd_ever_served = false;
-                uint32_t l2_now = dns_sink_l2_fallthrough();
-                bool traffic  = (l2_now != s_wd_last_l2);
+                uint32_t l2_now = dns_sink_l2_dns_fallthrough();
+                uint32_t l2_delta = l2_now - s_wd_last_l2;
                 bool progress = (s_cnt_total != s_wd_last_total);
                 s_wd_last_l2 = l2_now;
                 s_wd_last_total = s_cnt_total;
                 if (s_cnt_total > 0) s_wd_ever_served = true;
                 /* (#77 follow-up, found live on the LilyGo's first post-reflash
                  * boot) Right after boot, ordinary household broadcast/ARP
-                 * traffic keeps l2_fallthrough moving before this board's own
-                 * first DNS query happens to land — with s_cnt_total still at
-                 * its initial 0, that reads identically to "traffic arriving,
-                 * no progress" and fired the watchdog on a board that was
-                 * never actually wedged. Harmless (create-before-close made
-                 * the false recreate a no-op), but not what this check is for.
-                 * Gate the whole thing on having served at least one query
-                 * since boot — a stall on a socket that has never worked yet
-                 * isn't the "was fine, now stuck" case this watchdog targets. */
-                if (s_wd_ever_served && traffic && !progress) {
-                    if (++s_wd_stall >= 20) {   /* ~2s at the 100ms select() timeout */
-                        ESP_LOGE(TAG, "L2 watchdog: wire traffic arriving, no query "
-                                      "progress for ~2s — reopening csock/usock");
+                 * traffic used to keep the old counter moving before this
+                 * board's own first DNS query happened to land — with
+                 * s_cnt_total still at its initial 0, that read identically to
+                 * "traffic arriving, no progress" and fired the watchdog on a
+                 * board that was never actually wedged. Gate the whole thing
+                 * on having served at least one query since boot — a stall on
+                 * a socket that has never worked yet isn't the "was fine, now
+                 * stuck" case this watchdog targets. (Since #128, l2_delta is
+                 * DNS-demand-specific rather than link noise, so this gate is
+                 * now more belt-and-suspenders than load-bearing — kept for
+                 * the same boot-window reason it was added.) */
+                if (progress) {
+                    s_wd_unanswered = 0;
+                } else if (s_wd_ever_served) {
+                    s_wd_unanswered += l2_delta;
+                }
+                if (s_wd_unanswered >= 5) {
+                        ESP_LOGE(TAG, "L2 watchdog: %" PRIu32 " confirmed DNS quer%s "
+                                      "arrived with no socket-path progress — "
+                                      "reopening csock/usock", s_wd_unanswered,
+                                      s_wd_unanswered == 1 ? "y" : "ies");
                         /* Bind the replacement BEFORE closing the original: a failed
                          * rebind then leaves dns_task on the socket it already had,
                          * never with none. SO_REUSEADDR lets the new socket share
@@ -1625,10 +1657,7 @@ void DnsSinkServer::run_loop()
                             esp_restart();
                         }
                         s_cnt_wd_restarts++;
-                        s_wd_stall = 0;
-                    }
-                } else {
-                    s_wd_stall = 0;
+                        s_wd_unanswered = 0;
                 }
             }
 
@@ -2337,7 +2366,7 @@ int dns_server_metrics_json(char *out, size_t cap)
         "\"queries_total\":%" PRIu32 ",\"blocked\":%" PRIu32 ",\"forwarded\":%" PRIu32 ","
         "\"tcp_queries\":%" PRIu32 ","
         "\"l2_blocked\":%" PRIu32 ",\"l2_cached\":%" PRIu32 ",\"l2_tx_fail\":%" PRIu32 ","
-        "\"l2_fallthrough\":%" PRIu32 ",\"wd_restarts\":%" PRIu32 ","
+        "\"l2_fallthrough\":%" PRIu32 ",\"l2_dns_fallthrough\":%" PRIu32 ",\"wd_restarts\":%" PRIu32 ","
         "\"l2_log_dropped\":%" PRIu32 ","
         "\"census_dropped\":%" PRIu32 ","
         "\"case_mismatch\":%" PRIu32 ","
@@ -2364,7 +2393,7 @@ int dns_server_metrics_json(char *out, size_t cap)
         s_cnt_total, s_cnt_blocked, s_cnt_forwarded,
         s_cnt_tcp,
         dns_sink_l2_blocked(), dns_sink_l2_cached(), dns_sink_l2_tx_fail(),
-        dns_sink_l2_fallthrough(), s_cnt_wd_restarts,
+        dns_sink_l2_fallthrough(), dns_sink_l2_dns_fallthrough(), s_cnt_wd_restarts,
         dns_sink_l2log_dropped(),
         dns_sink_census_dropped(),
         s_cnt_case_mismatch,

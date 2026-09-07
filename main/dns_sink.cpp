@@ -1170,10 +1170,22 @@ static uint32_t s_l2_tx_fail = 0;   /* esp_eth_transmit() refused a fast-path re
  * boards (this hook doesn't exist on the Wi-Fi-only build); the getter below
  * is unconditional so dns_server.cpp needs no #ifdef to call it. */
 static uint32_t s_l2_fallthrough = 0;
+/* (#128) Same idea as s_l2_fallthrough, but counts only frames confirmed to be
+ * a genuine, well-formed, single-question DNS query — not ARP, not DHCP, not
+ * any other non-DNS traffic l2_fallthrough also counts. l2_fallthrough moving
+ * proves the *link* is alive; this one moving proves DNS *demand* actually
+ * reached the hook and needed the socket path (a query L2 answered itself
+ * via l2_blocked/l2_cached never reaches this counter either, since those
+ * paths return before the common fall-through site). The #77 watchdog uses
+ * THIS counter, not l2_fallthrough, so an ARP/mDNS/SSDP broadcast burst can
+ * no longer read as "traffic" on a board that simply has no DNS queries to
+ * answer right now — see #128. */
+static uint32_t s_l2_dns_fallthrough = 0;
 extern "C" uint32_t dns_sink_l2_tx_fail(void) { return s_l2_tx_fail; }
 extern "C" uint32_t dns_sink_l2_blocked(void) { return s_l2_blocked; }
 extern "C" uint32_t dns_sink_l2_cached(void)  { return s_l2_cached; }
 extern "C" uint32_t dns_sink_l2_fallthrough(void) { return s_l2_fallthrough; }
+extern "C" uint32_t dns_sink_l2_dns_fallthrough(void) { return s_l2_dns_fallthrough; }
 
 /* Query-log staging ring (feature request, 2026-09-06): l2_input_cb answers
  * most blocked/cached queries on Ethernet boards WITHOUT ever calling
@@ -1291,7 +1303,7 @@ extern "C" uint32_t dns_sink_l2log_dropped(void) { return 0; }
  *      sighting is deliberately NOT gated behind checks that exist to decide
  *      whether this hook may safely ANSWER a query, because a sighting
  *      answers nothing.
- *   2. A one-line census_stage(..., CENSUS_QUERY, ...) call once l2_qname
+ *   2. A one-line census_stage(..., CENSUS_SEEN_QUERY, ...) call once l2_qname
  *      has confirmed a well-formed A/AAAA/IN question — this is the "did
  *      this MAC ever ask us anything" half of bypass-by-absence, and it
  *      falls out of state the ladder already computed (src MAC, src IP),
@@ -1311,19 +1323,21 @@ extern "C" uint32_t dns_sink_l2log_dropped(void) { return 0; }
  * feed it at all. */
 #if CONFIG_ADBLOCK_NET_ETH
 #define CENSUS_RING 32
-typedef enum { CENSUS_ARP = 0, CENSUS_DHCP = 1, CENSUS_QUERY = 2 } CensusKind;
+/* kind is one of census.h's CENSUS_SEEN_* constants — shared with the
+ * consumer via that header rather than a second, comment-synced enum here,
+ * so the two sides can't drift silently. */
 typedef struct {
-    uint8_t    mac[6];
-    uint32_t   ip;            /* host byte order; 0 if this event carries none */
-    CensusKind kind;
-    char       hostname[32];  /* DHCP option 12 value; empty for ARP/QUERY */
+    uint8_t  mac[6];
+    uint32_t ip;            /* host byte order; 0 if this event carries none */
+    int      kind;
+    char     hostname[32];  /* DHCP option 12 value; empty for ARP/QUERY */
 } CensusEvent;
 static CensusEvent           s_census_ring[CENSUS_RING];
 static std::atomic<uint32_t> s_census_head{0};    /* producer-owned (eth RX task) */
 static std::atomic<uint32_t> s_census_tail{0};    /* consumer-owned (dns_task) */
 static std::atomic<uint32_t> s_census_dropped{0}; /* producer increments, httpd task reads */
 
-static void IRAM_ATTR census_stage(const uint8_t *mac, uint32_t ip, CensusKind kind,
+static void IRAM_ATTR census_stage(const uint8_t *mac, uint32_t ip, int kind,
                                    const char *hostname, size_t hostname_len)
 {
     uint32_t head = s_census_head.load(std::memory_order_relaxed);
@@ -1336,13 +1350,7 @@ static void IRAM_ATTR census_stage(const uint8_t *mac, uint32_t ip, CensusKind k
     memcpy(e->mac, mac, 6);
     e->ip = ip;
     e->kind = kind;
-    if (hostname && hostname_len > 0) {
-        size_t cl = hostname_len < sizeof(e->hostname) - 1 ? hostname_len : sizeof(e->hostname) - 1;
-        memcpy(e->hostname, hostname, cl);
-        e->hostname[cl] = '\0';
-    } else {
-        e->hostname[0] = '\0';
-    }
+    census_copy_hostname(e->hostname, hostname, hostname_len);
     s_census_head.store(head + 1, std::memory_order_release);
 }
 
@@ -1360,7 +1368,7 @@ static void IRAM_ATTR l2_census_frame(const uint8_t *buf, uint32_t len)
         uint32_t spa = ((uint32_t)buf[28] << 24) | ((uint32_t)buf[29] << 16) |
                        ((uint32_t)buf[30] << 8)  |  (uint32_t)buf[31];
         if (spa == 0) return;   /* ARP probe (RFC 5227): sender has no IP yet */
-        census_stage(mac, spa, CENSUS_ARP, nullptr, 0);
+        census_stage(mac, spa, CENSUS_SEEN_ARP, nullptr, 0);
         return;
     }
 
@@ -1369,6 +1377,13 @@ static void IRAM_ATTR l2_census_frame(const uint8_t *buf, uint32_t len)
     if ((buf[14] >> 4) != 4) return;
     int ihl = (buf[14] & 0x0F) * 4;
     if (ihl < 20 || 14 + (uint32_t)ihl + 8 > len) return;
+    /* (#106) Length comes from the IP header, never from the frame — Ethernet
+     * pads short frames to 60 bytes, so a UDP length that fits within the raw
+     * `len` budget can still extend into that padding and get parsed as DHCP
+     * option TLVs (including option 12, the hostname). Same cross-check
+     * l2_input_cb makes against its own `iptot`. */
+    int iptot = (buf[16] << 8) | buf[17];
+    if (iptot < ihl + 8 || 14 + iptot > (int)len) return;
     /* A non-first fragment carries no UDP header at this offset at all — the
      * bytes below would be raw payload continuation, not sport/dport, and
      * could coincidentally read as 68/67 and stage a garbage DHCP sighting
@@ -1380,7 +1395,7 @@ static void IRAM_ATTR l2_census_frame(const uint8_t *buf, uint32_t len)
     uint16_t dport = (buf[udp + 2] << 8) | buf[udp + 3];
     if (sport != 68 || dport != 67) return;           /* DHCP client -> server only */
     int udplen = (buf[udp + 4] << 8) | buf[udp + 5];
-    if (udplen < 8 + 240 || (uint32_t)udp + (uint32_t)udplen > len) return;
+    if (udplen < 8 + 240 || udp + udplen > 14 + iptot) return;
     const uint8_t *dhcp = buf + udp + 8;
     uint32_t dhcp_len = (uint32_t)udplen - 8;
     /* BOOTP fixed header is 236 bytes (RFC 951/2131), then a 4-byte magic
@@ -1407,7 +1422,7 @@ static void IRAM_ATTR l2_census_frame(const uint8_t *buf, uint32_t len)
         }
         off += 2 + olen;
     }
-    census_stage(mac, 0, CENSUS_DHCP, hostname, hostname_len);
+    census_stage(mac, 0, CENSUS_SEEN_DHCP, hostname, hostname_len);
 }
 
 /* Consumer, called from dns_task: pulls one staged event, if any. Returns
@@ -1423,10 +1438,12 @@ extern "C" bool dns_sink_census_drain(uint8_t mac_out[6], uint32_t *ip_out,
     memcpy(mac_out, e->mac, 6);
     *ip_out = e->ip;
     *kind_out = (int)e->kind;
-    size_t cl = strnlen(e->hostname, sizeof(e->hostname));
-    if (cl >= hostname_cap) cl = hostname_cap - 1;
-    memcpy(hostname_out, e->hostname, cl);
-    hostname_out[cl] = '\0';
+    if (hostname_cap > 0) {   /* 0 means the caller wants no hostname — nothing to write */
+        size_t cl = strnlen(e->hostname, sizeof(e->hostname));
+        if (cl >= hostname_cap) cl = hostname_cap - 1;
+        memcpy(hostname_out, e->hostname, cl);
+        hostname_out[cl] = '\0';
+    }
     s_census_tail.store(tail + 1, std::memory_order_release);
     return true;
 }
@@ -1491,6 +1508,9 @@ static esp_err_t IRAM_ATTR l2_input_cb(esp_eth_handle_t h, uint8_t *buf, uint32_
     (void)info;
     static uint8_t  tx[600];
     static char     name[256];
+    bool query_confirmed = false;   /* (#128) set true once this is known to be
+                                      * a genuine, well-formed DNS query — see
+                                      * s_l2_dns_fallthrough's comment above. */
     /* #73: runs unconditionally, before any of the classification below.
      * A census sighting is not a verdict — it never answers anything, so it
      * must not be gated behind checks that exist to decide whether THIS hook
@@ -1555,6 +1575,10 @@ static esp_err_t IRAM_ATTR l2_input_cb(esp_eth_handle_t h, uint8_t *buf, uint32_
         int dns = udp + 8, dns_len = udplen - 8;
         if (buf[dns + 2] & 0x80) break;                  /* must be a query (QR=0) */
         if (((buf[dns + 4] << 8) | buf[dns + 5]) != 1) break;    /* qdcount==1 */
+        /* (#128) Reached only for a genuine, well-formed, single-question DNS
+         * query — everything that falls through from here on is real DNS
+         * demand, not link noise. See s_l2_dns_fallthrough's comment. */
+        query_confirmed = true;
         /* #73 (call site 2 of 2): this MAC has now sent us a well-formed
          * single-question DNS query — the "queried us" half of
          * bypass-by-absence. Staged here, before the A/AAAA/IN narrowing
@@ -1563,7 +1587,7 @@ static esp_err_t IRAM_ATTR l2_input_cb(esp_eth_handle_t h, uint8_t *buf, uint32_
          * sighting. A client that only ever sends PTR/TXT/type-65 queries in
          * a census window is not silent — staging after the narrowing would
          * have missed it and produced a false "suspected bypass". */
-        census_stage(buf + 6, src_hbo, CENSUS_QUERY, nullptr, 0);
+        census_stage(buf + 6, src_hbo, CENSUS_SEEN_QUERY, nullptr, 0);
         size_t nlen = 0;
         int qend = dns_extract_qname(buf + dns, dns_len, 12, name, sizeof(name), &nlen);
         if (qend < 0) break;
@@ -1633,6 +1657,7 @@ static esp_err_t IRAM_ATTR l2_input_cb(esp_eth_handle_t h, uint8_t *buf, uint32_
     } while (0);
 
     s_l2_fallthrough++;   /* (#77) every `break` above lands here — link is alive */
+    if (query_confirmed) s_l2_dns_fallthrough++;   /* (#128) — see comment above */
     return esp_netif_receive((esp_netif_t *)priv, buf, len, NULL);
 }
 #endif /* CONFIG_ADBLOCK_NET_ETH — L2 fast-path hook */

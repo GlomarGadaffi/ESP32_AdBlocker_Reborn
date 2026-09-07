@@ -108,6 +108,7 @@ A single JSON object. Field names are exactly as emitted.
 | `l2_cached` | int | Forward-cache hits sent straight from the Ethernet RX hook. |
 | `l2_tx_fail` | int | Fast-path replies `esp_eth_transmit()` refused (#101). |
 | `l2_fallthrough` | int | Frames the L2 hook handed to lwIP unanswered — DNS or not. Proof the link is alive, independent of whether `dns_task`'s own sockets are progressing (#77). |
+| `l2_dns_fallthrough` | int | Subset of `l2_fallthrough`: only confirmed, well-formed DNS queries the hook deferred to lwIP, not ARP/DHCP/other link noise. This, not `l2_fallthrough`, is what the #77 watchdog (#128) checks against `queries_total` for progress. |
 | `wd_restarts` | int | Times the socket-path watchdog (#77) recreated `csock`/`usock` because wire traffic was arriving with no query progress for ~2s. Not reset by `/metrics/reset` (same convention as the `l2_*` counters). |
 | `case_mismatch` | int | DNS 0x20 (#72): replies whose question section didn't echo the exact case we sent. Observability only — never rejected; see `process_reply()`'s H2 check for why a hard reject isn't safe without first proving this stays ~0 against the real configured upstream. |
 | `l2_log_dropped` | int | L2 query-log staging ring (#124) overflows: entries the L2 hook couldn't hand to `dns_task` before the next tick because the 32-slot ring was still full. Dropped, not blocked — the L2 hook never waits on the log. A nonzero count means a burst outran the drain rate for that window, not a bug; which specific queries were lost isn't recorded, only the count. |

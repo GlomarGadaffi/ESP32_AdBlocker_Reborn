@@ -1429,6 +1429,7 @@ static esp_err_t handle_metrics_view(httpd_req_t *r)
     " ['l2_blocked','Blocked in the L2 hook','n',0],\n"
     " ['l2_cached','Cache hits in the L2 hook','n',0],\n"
     " ['l2_fallthrough','Handed to lwIP','n',0],\n"
+    " ['l2_dns_fallthrough','...of which, confirmed DNS','n',0],\n"
     " ['l2_tx_fail','Transmit failures','n',1],\n"
     " ['l2_log_dropped','Query-log entries dropped','n',1],\n"
     " ['census_dropped','Census sightings dropped','n',1],\n"
