@@ -8,6 +8,7 @@
 #include "dot.h"
 #include "localzone.h"
 #include "query_log.h"
+#include "census.h"
 #include "timesync.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -36,6 +37,9 @@ extern "C" bool     dns_sink_l2log_drain(char *domain_out, size_t domain_cap,
                                          uint16_t *qtype_out, uint32_t *client_ip_out,
                                          bool *blocked_out);
 extern "C" uint32_t dns_sink_l2log_dropped(void);
+extern "C" bool     dns_sink_census_drain(uint8_t mac_out[6], uint32_t *ip_out,
+                                          int *kind_out, char *hostname_out, size_t hostname_cap);
+extern "C" uint32_t dns_sink_census_dropped(void);
 
 /* ── Metrics: lock-free counters + power-of-2 µs histograms ───────── */
 /* Single dns_task writes; httpd task reads. 32-bit aligned reads are
@@ -1692,6 +1696,18 @@ void DnsSinkServer::run_loop()
                 }
             }
 
+            /* Drain the L2 hook's staged census sightings (#73): pure
+             * bookkeeping for the census table, nothing here affects DNS
+             * correctness, so this runs after every drain above it. */
+            {
+                uint8_t c_mac[6]; uint32_t c_ip; int c_kind; char c_host[32];
+                for (int cn = 0; cn < 32; cn++) {
+                    if (!dns_sink_census_drain(c_mac, &c_ip, &c_kind, c_host, sizeof(c_host)))
+                        break;
+                    census_observe(c_mac, c_ip, c_kind, c_host, strlen(c_host));
+                }
+            }
+
             /* ── Hedged retransmits (#69): flights past their p95 deadline ──
              * Deliberately AFTER the reply drains rather than literally beside
              * upstream_evict_expired(): any reply that was already sitting in
@@ -2323,6 +2339,7 @@ int dns_server_metrics_json(char *out, size_t cap)
         "\"l2_blocked\":%" PRIu32 ",\"l2_cached\":%" PRIu32 ",\"l2_tx_fail\":%" PRIu32 ","
         "\"l2_fallthrough\":%" PRIu32 ",\"wd_restarts\":%" PRIu32 ","
         "\"l2_log_dropped\":%" PRIu32 ","
+        "\"census_dropped\":%" PRIu32 ","
         "\"case_mismatch\":%" PRIu32 ","
         "\"cache_probes\":%" PRIu32 ",\"cache_hits\":%" PRIu32 ",\"cache_hit_rate\":%.1f,"
         "\"cache_evictions\":%" PRIu32 ",\"cache_too_big\":%" PRIu32 ","
@@ -2349,6 +2366,7 @@ int dns_server_metrics_json(char *out, size_t cap)
         dns_sink_l2_blocked(), dns_sink_l2_cached(), dns_sink_l2_tx_fail(),
         dns_sink_l2_fallthrough(), s_cnt_wd_restarts,
         dns_sink_l2log_dropped(),
+        dns_sink_census_dropped(),
         s_cnt_case_mismatch,
         probes, hits, hitrate,
         s_cnt_cache_evict, s_cnt_cache_toobig,

@@ -54,6 +54,7 @@
 #include "dot.h"
 #include "localzone.h"
 #include "query_log.h"
+#include "census.h"
 #include "crashlog.h"
 #include "timesync.h"
 #include "dns_server.h"
@@ -1810,6 +1811,7 @@ extern "C" void app_main(void)
     bypass_init();
     pause_init();
     query_log_init();
+    census_init();
 
 #if CONFIG_ADBLOCK_NET_ETH
     /* Mount SD card (SPI3 — separate bus from W5500) */

@@ -67,6 +67,7 @@ metrics fields from `dns_server_metrics_json()` in `dns_server.cpp`.
 | POST | `/rewrite/clear` | Remove one rewrite entry, given `domain=<name>` (the name it was set on). Despite the name, this does not clear the whole table — there is no whole-table-clear route; remove entries one at a time. A body without `domain=` 400s. |
 | GET | `/log` | Recent query log (512-entry ring, wall-clock timestamps). |
 | GET | `/top` | Top domains/clients plus the 60-bucket per-minute CSS bar graph. |
+| GET | `/census` | Passive L2 census (#73): every client seen via ARP, DHCP, or a DNS query, up to 64 MAC-keyed entries. Flags a client "suspected bypass" if it's been on the LAN over 2 minutes but has never sent this board a DNS query — a signal, not proof; it may simply be using another resolver. IP and hostname are last-writer-wins across sighting kinds, so either can briefly show a stale value after a lease change. |
 | POST | `/custom/rules` | Save the custom block-rules textarea (hosts format or bare domains). |
 | POST | `/acl/add` | Add a client IP to the ACL. |
 | POST | `/acl/remove` | Remove one ACL entry. |
@@ -110,6 +111,7 @@ A single JSON object. Field names are exactly as emitted.
 | `wd_restarts` | int | Times the socket-path watchdog (#77) recreated `csock`/`usock` because wire traffic was arriving with no query progress for ~2s. Not reset by `/metrics/reset` (same convention as the `l2_*` counters). |
 | `case_mismatch` | int | DNS 0x20 (#72): replies whose question section didn't echo the exact case we sent. Observability only — never rejected; see `process_reply()`'s H2 check for why a hard reject isn't safe without first proving this stays ~0 against the real configured upstream. |
 | `l2_log_dropped` | int | L2 query-log staging ring (#124) overflows: entries the L2 hook couldn't hand to `dns_task` before the next tick because the 32-slot ring was still full. Dropped, not blocked — the L2 hook never waits on the log. A nonzero count means a burst outran the drain rate for that window, not a bug; which specific queries were lost isn't recorded, only the count. |
+| `census_dropped` | int | Passive L2 census staging ring (#73) overflows — same shape and same caveat as `l2_log_dropped`, for ARP/DHCP/DNS-query sightings instead of the query log. |
 | `cache_probes` | int | Forward-cache lookups. |
 | `cache_hits` | int | Forward-cache hits. |
 | `cache_hit_rate` | float | `cache_hits / cache_probes` as a percentage, one decimal. |
