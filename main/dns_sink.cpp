@@ -1181,11 +1181,23 @@ static uint32_t s_l2_fallthrough = 0;
  * no longer read as "traffic" on a board that simply has no DNS queries to
  * answer right now — see #128. */
 static uint32_t s_l2_dns_fallthrough = 0;
+/* (#117) blocklist_verdict_nb() returned -1: the hook could not prove an
+ * answer without stalling, so it deferred to lwIP rather than guess.
+ * l2_defer_lock_busy: the zero-wait s_wl_mutex take failed (an admin write
+ * to the whitelist or custom rules is in flight — see blocklist_verdict_nb's
+ * own comment for why this defers unconditionally rather than checking
+ * table counts first). l2_defer_snapshot: a reload published underneath
+ * the walk. Both flat in steady state; nonzero only during the admin
+ * action or reload that caused them, never a sign of a stuck hook. */
+static uint32_t s_l2_defer_lock_busy = 0;
+static uint32_t s_l2_defer_snapshot  = 0;
 extern "C" uint32_t dns_sink_l2_tx_fail(void) { return s_l2_tx_fail; }
 extern "C" uint32_t dns_sink_l2_blocked(void) { return s_l2_blocked; }
 extern "C" uint32_t dns_sink_l2_cached(void)  { return s_l2_cached; }
 extern "C" uint32_t dns_sink_l2_fallthrough(void) { return s_l2_fallthrough; }
 extern "C" uint32_t dns_sink_l2_dns_fallthrough(void) { return s_l2_dns_fallthrough; }
+extern "C" uint32_t dns_sink_l2_defer_lock_busy(void) { return s_l2_defer_lock_busy; }
+extern "C" uint32_t dns_sink_l2_defer_snapshot(void)  { return s_l2_defer_snapshot; }
 
 /* Query-log staging ring (feature request, 2026-09-06): l2_input_cb answers
  * most blocked/cached queries on Ethernet boards WITHOUT ever calling
@@ -1626,7 +1638,16 @@ static esp_err_t IRAM_ATTR l2_input_cb(esp_eth_handle_t h, uint8_t *buf, uint32_
             uint32_t rw = 0;
             if (rewrite_lookup_nb(name, nlen, &rw) != 0) break;
         }
-        if (!blocklist_is_blocked_nb(name, nlen)) {      /* not blocked → try L2 cache, else lwIP */
+        /* (#117) Shared rank-ordered verdict — feed + whitelist + custom
+         * rules, including @@ exceptions and $important — instead of the
+         * block-only blocklist_is_blocked_nb() this used to call. A defer
+         * (must not guess) falls through to lwIP exactly like every other
+         * `break` in this hook. */
+        bl_verdict_t v;
+        int vr = blocklist_verdict_nb(name, nlen, &v);
+        if (vr == BL_DEFER_LOCK_BUSY)      { s_l2_defer_lock_busy++; break; }
+        if (vr == BL_DEFER_SNAPSHOT)       { s_l2_defer_snapshot++;  break; }
+        if (v.state != BL_BLOCK) {      /* not blocked → try L2 cache, else lwIP */
             /* Forward-cache hit answered straight from L2, skipping lwIP — the
              * same socket-stack overhead the blocked path already bypasses. Lay
              * the eth+ip+udp headers into tx, then the seqlock-protected reader
