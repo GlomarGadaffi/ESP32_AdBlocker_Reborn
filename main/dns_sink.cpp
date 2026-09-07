@@ -1554,20 +1554,21 @@ static esp_err_t IRAM_ATTR l2_input_cb(esp_eth_handle_t h, uint8_t *buf, uint32_
         uint32_t src_hbo = ((uint32_t)buf[26] << 24) | ((uint32_t)buf[27] << 16) |
                            ((uint32_t)buf[28] << 8)  |  (uint32_t)buf[29];
         if (src_hbo == 0 || src_hbo == 0xFFFFFFFFu || (buf[26] & 0xF0) == 0xE0) break;
-        /* (#87) The ACL guards the socket path but never this one, so a client
-         * excluded from DNS still got blocked verdicts and cached answers over
-         * Ethernet — the fast path only failed to answer on a cold miss, where
-         * it fell through to the ACL-protected socket. Provable permission is
-         * required to answer here; denied OR unknown defers to that socket,
-         * which drops the query if it really is denied. */
-        if (!acl_permits_nb(src_hbo)) break;
-        /* (#48/#74) A client under a timed pause, or on the standing bypass
-         * list, must get the real answer, which only the socket path can
-         * fetch. Deferring here (rather than answering "not blocked") keeps
-         * this hook's rule intact: it never forwards, and it never answers
-         * on a verdict the socket path would override. The socket path
-         * re-derives both from the same tables. */
-        if (pause_active_for(src_hbo) || bypass_active_for_nb(src_hbo)) break;
+        /* (#73/#128, moved here on review) Recognize "this is a genuine,
+         * well-formed, single-question DNS query" BEFORE the ACL/pause/bypass
+         * gates below. Those gates decide whether THIS hook may ANSWER —
+         * they say nothing about whether a frame counts as a query. Staging
+         * the census sighting and setting query_confirmed only AFTER those
+         * gates (their original position) meant an ACL-denied, paused, or
+         * bypassed client's ordinary DNS queries never reached this code at
+         * all: the ladder above already `break`s for them one line earlier.
+         * That produced a false "suspected bypass" flag for exactly the
+         * clients an admin explicitly allowed or paused — the category
+         * least likely to actually be bypassing this resolver — and made
+         * #128's dns_fallthrough undercount real demand from the same
+         * clients. `udp`/`dns`/`dns_len` computed here are reused unchanged
+         * by the answer-path code below; nothing about which frames end up
+         * answered vs. deferred changes — only when a sighting is staged. */
         int udp = 14 + ihl;
         if (((buf[udp + 2] << 8) | buf[udp + 3]) != 53) break;   /* dst port 53 */
         int udplen = (buf[udp + 4] << 8) | buf[udp + 5];         /* (#106) */
@@ -1582,12 +1583,29 @@ static esp_err_t IRAM_ATTR l2_input_cb(esp_eth_handle_t h, uint8_t *buf, uint32_
         /* #73 (call site 2 of 2): this MAC has now sent us a well-formed
          * single-question DNS query — the "queried us" half of
          * bypass-by-absence. Staged here, before the A/AAAA/IN narrowing
-         * below, deliberately: that narrowing exists to decide whether THIS
-         * hook may answer, not to decide whether a question counts as a
-         * sighting. A client that only ever sends PTR/TXT/type-65 queries in
-         * a census window is not silent — staging after the narrowing would
-         * have missed it and produced a false "suspected bypass". */
+         * further below (which exists to decide whether THIS hook may
+         * answer, not whether a question counts as a sighting) AND before
+         * the ACL/pause/bypass gates immediately below (which exist to
+         * decide whether this hook may answer AT ALL, same reasoning). A
+         * client that only ever sends PTR/TXT/type-65 queries, or one under
+         * an admin pause/bypass/ACL rule, is not silent — staging after
+         * either kind of gate would have missed it and produced a false
+         * "suspected bypass". */
         census_stage(buf + 6, src_hbo, CENSUS_SEEN_QUERY, nullptr, 0);
+        /* (#87) The ACL guards the socket path but never this one, so a client
+         * excluded from DNS still got blocked verdicts and cached answers over
+         * Ethernet — the fast path only failed to answer on a cold miss, where
+         * it fell through to the ACL-protected socket. Provable permission is
+         * required to answer here; denied OR unknown defers to that socket,
+         * which drops the query if it really is denied. */
+        if (!acl_permits_nb(src_hbo)) break;
+        /* (#48/#74) A client under a timed pause, or on the standing bypass
+         * list, must get the real answer, which only the socket path can
+         * fetch. Deferring here (rather than answering "not blocked") keeps
+         * this hook's rule intact: it never forwards, and it never answers
+         * on a verdict the socket path would override. The socket path
+         * re-derives both from the same tables. */
+        if (pause_active_for(src_hbo) || bypass_active_for_nb(src_hbo)) break;
         size_t nlen = 0;
         int qend = dns_extract_qname(buf + dns, dns_len, 12, name, sizeof(name), &nlen);
         if (qend < 0) break;
