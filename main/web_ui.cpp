@@ -96,6 +96,16 @@ static void html_escape(char *dst, size_t cap, const char *src)
     dst[d] = '\0';
 }
 
+/* Wraps a non-null error message in <p class=err>...</p>; empty string if err
+ * is null. err is always a static or snprintf'd server-generated message
+ * (setup_page/login_page never echo request input through it), so this
+ * applies no escaping — same as the two call sites it replaces. */
+static void err_html(char *dst, size_t cap, const char *err)
+{
+    if (err) snprintf(dst, cap, "<p class=err>%s</p>", err);
+    else     dst[0] = '\0';
+}
+
 /* URL-decode a form-encoded value (%-hex and + as space). dst is NUL-terminated. */
 static void url_decode(char *dst, size_t cap, const char *src, size_t src_len)
 {
@@ -392,6 +402,7 @@ static esp_err_t setup_page(httpd_req_t *r, const char *err)
 {
     static EXT_RAM_BSS_ATTR char page[3072];
     char fp[96]; web_tls_fingerprint(fp, sizeof(fp));
+    char errp[128]; err_html(errp, sizeof(errp), err);
     int n = 0;
     page_appendf(page, sizeof(page), &n, AUTH_PAGE_HEAD);
     page_appendf(page, sizeof(page), &n,
@@ -402,7 +413,7 @@ static esp_err_t setup_page(httpd_req_t *r, const char *err)
         "self-signed certificate. Compare its fingerprint with this one, then you can trust it "
         "permanently. It also prints on the USB console at boot.</small></p>"
         "<div class=fp>%s</div><br>"
-        "%s%s%s"
+        "%s"
         "<form method=post action=/setup>"
         "<label>Admin username<input name=user maxlength=%d autocomplete=username required></label>"
         "<label>Password <small>(%d&ndash;%d characters)</small><input name=pass type=password "
@@ -414,7 +425,7 @@ static esp_err_t setup_page(httpd_req_t *r, const char *err)
         "brings this page back &mdash; it needs the cable, not the network.</small></p>"
         "</body></html>",
         fp[0] ? fp : "(unavailable)",
-        err ? "<p class=err>" : "", err ? err : "", err ? "</p>" : "",
+        errp,
         WEB_AUTH_USER_MAX, WEB_AUTH_PASS_MIN, WEB_AUTH_PASS_MAX,
         WEB_AUTH_PASS_MIN, WEB_AUTH_PASS_MAX, WEB_AUTH_PASS_MIN, WEB_AUTH_PASS_MAX);
     send_html(r, page);
@@ -456,17 +467,18 @@ static esp_err_t handle_setup_post(httpd_req_t *r)
 static esp_err_t login_page(httpd_req_t *r, const char *err)
 {
     static EXT_RAM_BSS_ATTR char page[2048];
+    char errp[128]; err_html(errp, sizeof(errp), err);
     int n = 0;
     page_appendf(page, sizeof(page), &n, AUTH_PAGE_HEAD);
     page_appendf(page, sizeof(page), &n,
         "<h2>DNS Sinkhole &mdash; sign in</h2>"
-        "%s%s%s"
+        "%s"
         "<form method=post action=/login>"
         "<label>Username<input name=user maxlength=%d autocomplete=username required autofocus></label>"
         "<label>Password<input name=pass type=password maxlength=%d autocomplete=current-password required></label>"
         "<button>Sign in</button></form>"
         "</body></html>",
-        err ? "<p class=err>" : "", err ? err : "", err ? "</p>" : "",
+        errp,
         WEB_AUTH_USER_MAX, WEB_AUTH_PASS_MAX);
     send_html(r, page);
     return ESP_OK;
@@ -883,15 +895,14 @@ static esp_err_t handle_status(httpd_req_t *r)
         static EXT_RAM_BSS_ATTR char wl[WHITELIST_MAX][64]; uint32_t cnt = WHITELIST_MAX;
         blocklist_whitelist_get(wl, &cnt);
         for (uint32_t i = 0; i < cnt && n < (int)sizeof(page) - 256; i++) {
-            char safe_text[384], safe_attr[384];
+            char safe_text[384];
             html_escape(safe_text, sizeof(safe_text), wl[i]);
-            html_escape(safe_attr, sizeof(safe_attr), wl[i]);
             page_appendf(page, sizeof(page), &n,
                 "<tr><td>%s</td><td>"
                 "<form method=post action=/whitelist/remove>"
                 "<input type=hidden name=domain value=\"%s\">"
                 "<button>Remove</button></form></td></tr>",
-                safe_text, safe_attr);
+                safe_text, safe_text);
         }
         page_appendf(page, sizeof(page), &n, "</table>");
     }
@@ -930,7 +941,6 @@ static esp_err_t handle_status(httpd_req_t *r)
             page_appendf(page, sizeof(page), &n, "<table><tr><th>Domain</th><th>IP</th><th>Action</th></tr>");
             for (uint32_t i = 0; i < rw_cnt && n < (int)sizeof(page) - 256; i++) {
                 char safe_d[128]; html_escape(safe_d, sizeof(safe_d), rw_domains[i]);
-                char safe_da[128]; html_escape(safe_da, sizeof(safe_da), rw_domains[i]);
                 uint32_t ip = rw_ips[i];
                 page_appendf(page, sizeof(page), &n,
                     "<tr><td>%s</td><td>%u.%u.%u.%u</td><td>"
@@ -940,7 +950,7 @@ static esp_err_t handle_status(httpd_req_t *r)
                     safe_d,
                     (unsigned)((ip>>24)&0xFF),(unsigned)((ip>>16)&0xFF),
                     (unsigned)((ip>>8)&0xFF),(unsigned)(ip&0xFF),
-                    safe_da);
+                    safe_d);
             }
             page_appendf(page, sizeof(page), &n, "</table>");
         }
@@ -1107,13 +1117,12 @@ static esp_err_t handle_status(httpd_req_t *r)
             page_appendf(page, sizeof(page), &n, "<table><tr><th>Allowed client IP</th><th>Action</th></tr>");
             for (uint32_t i = 0; i < acl_n && n < (int)sizeof(page) - 256; i++) {
                 char safe_ip[48]; html_escape(safe_ip, sizeof(safe_ip), acl_ips[i]);
-                char safe_ipv[48]; html_escape(safe_ipv, sizeof(safe_ipv), acl_ips[i]);
                 page_appendf(page, sizeof(page), &n,
                     "<tr><td>%s</td><td>"
                     "<form method=post action=/acl/remove>"
                     "<input type=hidden name=ip value=\"%s\">"
                     "<button>Remove</button></form></td></tr>",
-                    safe_ip, safe_ipv);
+                    safe_ip, safe_ip);
             }
             page_appendf(page, sizeof(page), &n, "</table>"
                 "<form method=post action=/acl/clear style='margin-top:.5em'>"
@@ -1137,13 +1146,12 @@ static esp_err_t handle_status(httpd_req_t *r)
             page_appendf(page, sizeof(page), &n, "<table><tr><th>Bypassed client IP</th><th>Action</th></tr>");
             for (uint32_t i = 0; i < byp_n && n < (int)sizeof(page) - 256; i++) {
                 char safe_ip[48]; html_escape(safe_ip, sizeof(safe_ip), byp_ips[i]);
-                char safe_ipv[48]; html_escape(safe_ipv, sizeof(safe_ipv), byp_ips[i]);
                 page_appendf(page, sizeof(page), &n,
                     "<tr><td>%s</td><td>"
                     "<form method=post action=/bypass/remove>"
                     "<input type=hidden name=ip value=\"%s\">"
                     "<button>Remove</button></form></td></tr>",
-                    safe_ip, safe_ipv);
+                    safe_ip, safe_ip);
             }
             page_appendf(page, sizeof(page), &n, "</table>"
                 "<form method=post action=/bypass/clear style='margin-top:.5em'>"
