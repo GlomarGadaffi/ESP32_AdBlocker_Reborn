@@ -6,9 +6,9 @@
 [![Web Flasher](https://img.shields.io/badge/Web%20Flasher-Browser%20Install-brightgreen.svg)](https://glomargadaffi.github.io/ESP32_AdBlocker_Reborn/flasher/)
 [![Release](https://img.shields.io/github/v/release/GlomarGadaffi/ESP32_AdBlocker_Reborn)](https://github.com/GlomarGadaffi/ESP32_AdBlocker_Reborn/releases)
 
-A high-performance, native ESP-IDF DNS sinkhole (a dedicated hardware "Pi-hole" alternative) for **ESP32-S3 + W5500 SPI Ethernet** boards. It blocks ads, tracking, and malware at the network layer for your entire home or office while consuming negligible power (~1W).
+Pi-hole made the case that DNS-level ad and tracking blocking deserves an always-on dedicated box instead of a bolt-on to your router. This project takes that idea and swaps the hardware underneath it: it's a high-performance, native ESP-IDF DNS sinkhole (a dedicated hardware "Pi-hole" alternative) for **ESP32-S3 + W5500 SPI Ethernet** boards — a roughly $15-30 microcontroller taking on a job usually handed to a $50+ single-board computer. It blocks ads, tracking, and malware at the network layer for your entire home or office while consuming negligible power (~1W).
 
-Unlike typical microcontroller blockers, this is a ground-up rewrite engineered for speed and scale: it holds **800,000+ wildcard domains** in PSRAM, answers blocked and cached queries in **~1.8 ms at ~2,200 qps** via an L2 Ethernet fast path, and warm-boots a full list from an SD card cache in **~21 seconds** instead of re-downloading it for minutes.
+Running on smaller, cheaper hardware doesn't mean running slower. Unlike typical microcontroller blockers, this is a ground-up rewrite engineered for speed and scale: it holds **800,000+ wildcard domains** in PSRAM, answers blocked and cached queries in **~1.8 ms at ~2,200 qps** via an L2 Ethernet fast path, and warm-boots a full list from an SD card cache in **~21 seconds** instead of re-downloading it for minutes. The **How It Works** section below covers the mechanics.
 
 ---
 
@@ -101,6 +101,9 @@ By default any client on the LAN may use the sinkhole. To restrict it, go to the
 * ⚠️ **Sharp edge:** because there is no CIDR support, a list containing a single host silences DNS for *every other device on your network*. Add each client you care about — including the router, if it forwards DNS on behalf of clients — before you rely on it.
 * Since 1.3.0 the ACL is enforced on the **Ethernet fast path** too. Previously an excluded client still received blocked verdicts and cached answers over Ethernet, and the ACL only appeared to work when the cache was cold.
 
+### Per-Client Bypass List (Access tab)
+Separate from the ACL, the **Access** tab also has a bypass list: any client IP added there always resolves unfiltered, the same way a device you've paused resolves — its queries are forwarded and the answers are never written to the shared cache, so nothing it resolves leaks to anyone else. The L2 Ethernet fast path recognizes a bypassed client too and defers to the normal socket path instead of serving it a blocked or cached verdict, so the exemption holds across transports. Unlike a timed pause, a bypass entry is **NVS-persistent and has no expiry** — it stays until you remove it. `bypass_count` in `/metrics` reports how many entries are set.
+
 ### Encrypted Upstream (DNS-over-TLS)
 To encrypt your upstream DNS queries and keep your ISP from tracking your browsing:
 1. Go to the **Upstream DNS** tab.
@@ -129,11 +132,22 @@ If you forget your admin password, lose network access, or enter invalid IP sett
 3. Available recovery commands:
    * `admin-reset` — Clears the web UI admin account so you can run the setup wizard again.
    * `cert-reset` — Erases the TLS identity and generates a new certificate on reboot.
+   * `cert` — Prints the SHA-256 fingerprint of the certificate currently in use, to compare against the browser's certificate warning.
    * `wifi "<SSID>" <password>` — Sets new Wi-Fi credentials and reconnects.
-   * `status` — Prints board uptime, link status, and IP addresses.
+   * `setup-psk` — Prints the WPA2 passphrase for the temporary `ESP32AdBlock-Setup` network (Wi-Fi-capable builds only).
+   * `status` — Prints uptime, the connected Wi-Fi SSID, the web admin username (or that the device is still in setup mode), and whether the temporary setup AP is active.
    * `heap` — Displays internal and external PSRAM utilization.
    * `pause <minutes> [<ip>|all]` — Suspends blocking for one client, or for every client with `all`, up to 24 hours. With no arguments it lists what is currently paused and how long is left.
    * `resume [<ip>|all]` — Ends a pause early; with no arguments it clears every pause.
+
+---
+
+### Metrics & Monitoring
+For scripting, external monitoring, or just watching the counters move:
+* **`GET /metrics`** returns a single JSON object with query counts, cache stats, latency histograms, and health fields (see [`docs/http-api.md`](docs/http-api.md) for the full list).
+* **`GET /metrics/view`** renders that same data as a human-readable status page — the same numbers, grouped for the eye instead of a machine, with no separate implementation to drift out of sync.
+
+Both require being logged in first, like every other route on the device.
 
 ---
 
@@ -161,6 +175,8 @@ Two boards use the **ESP32-S3** with 16 MB flash, 8 MB Octal PSRAM, and a W5500 
 | **Generic ESP32-S3 (Wi-Fi only)** | `esp32adblock.local` | none — Wi-Fi STA instead | none | Any plain ESP32-S3 dev board **with PSRAM** (ESP32-S3-DevKitC-1 N8R8 / N16R8 and similar). No Ethernet hardware and no SD card required. See the note below on what you give up |
 
 > **Note on the Wi-Fi-only build:** it runs the same DNS engine, blocklist, cache, whitelist, rewrites, ACL, DoT, web UI and OTA as the Ethernet boards. Two things differ. There is no **Layer 2 fast path**, because that hook is an `esp_eth` feature with no Wi-Fi equivalent, so blocked and cached answers take the normal socket path at roughly 1.8 ms instead of 0.4 ms. And with no SD card the blocklist is downloaded on every cold boot, which means the first few minutes after power-up forward unfiltered. Blocklist capacity adapts to the PSRAM actually fitted, so a 2 MB quad-PSRAM module holds proportionally fewer domains instead of failing to start.
+>
+> **This target isn't in a tagged release's browser-flasher manifest yet** — it shows up in the [Web Flasher](https://glomargadaffi.github.io/ESP32_AdBlocker_Reborn/flasher/)'s board picker, but selecting it just disables the Flash button ("the latest release has no build for" it) until a release ships its images. For now, build and flash it from source — see [Building from Source](#building-from-source) below.
 
 > **Note on MicroSD Cards:** A MicroSD card is optional but strongly recommended. Without a card, the device re-downloads the blocklist over HTTPS on every boot — minutes, and up to 459 s on a four-feed configuration — instead of restoring it from an SD snapshot in ~21 seconds. It forwards unfiltered until the list is live.
 
@@ -168,8 +184,10 @@ Two boards use the **ESP32-S3** with 16 MB flash, 8 MB Octal PSRAM, and a W5500 
 
 ## 🔬 How It Works: Technical Architecture
 
+None of the speed above is an accident. It comes down to three deliberate design decisions, none of them exotic — they just get applied carefully, right down to the byte and the CPU cycle.
+
 ### 1. 40-Bit Bucket-Split Hash Table
-Storing 800,000 domain strings directly would require over 25 MB of RAM—far exceeding the ESP32-S3's 8 MB PSRAM. Storing standard 32-bit hashes causes frequent collisions (~1 in 1,500 domains falsely blocked).
+The first problem is simple arithmetic. Storing 800,000 domain strings directly would require over 25 MB of RAM—far exceeding the ESP32-S3's 8 MB PSRAM. Storing standard 32-bit hashes causes frequent collisions (~1 in 1,500 domains falsely blocked).
 
 **The Solution:** A 40-bit hash is partitioned using hash quotienting:
 $$\text{40-bit hash} = \underbrace{\text{Top 16 bits}}_{\text{Bucket Index } (q)} \ + \ \underbrace{\text{Bottom 24 bits}}_{\text{Stored Remainder } (r)}$$
@@ -181,8 +199,10 @@ $$\text{40-bit hash} = \underbrace{\text{Top 16 bits}}_{\text{Bucket Index } (q)
 * **Known cost:** building the live image has to write the buffer that is serving, so there is a **~50 ms fail-open window on each blocklist reload** (every 4 hours) during which queries are forwarded unfiltered. See [`docs/blocklist-format.md`](docs/blocklist-format.md) for why, and the alternatives.
 
 ### 2. Layer 2 (L2) Ethernet Fast Path
-In standard firmware, incoming DNS UDP packets must traverse:
+This is the piece that does the real work. In standard firmware, incoming DNS UDP packets must traverse:
 $$\text{Hardware} \longrightarrow \text{Driver ISR} \longrightarrow \text{lwIP Stack} \longrightarrow \text{Socket Layer} \longrightarrow \text{FreeRTOS Context Switch} \longrightarrow \text{DNS Task}$$
+
+Reborn skips essentially all of that.
 
 **The Reborn Fast Path:**
 * The W5500 driver registers an input hook (`esp_eth_update_input_path_info`).
@@ -212,6 +232,7 @@ Both `acl_permits_nb()` and `rewrite_lookup_nb()` are **tri-state and zero-wait*
 The net effect: the fast path is still what delivers the ~2,200 qps below, but it is now provably consistent with the socket path rather than a cheaper approximation of it.
 
 ### 3. PSRAM Forward Cache & Optimistic Stale Serving (RFC 8767)
+The third piece is everything that happens once a query has to go upstream: answers worth remembering, and answers worth serving even a little stale rather than making the client wait.
 * **4-Way Set-Associative Cache:** 512 sets (2,048 entries) in PSRAM. Query type is folded into the hash key so `A` and `AAAA` records for the same domain never evict each other.
 * **Serve-Stale:** If an allowed domain's TTL has expired, the cached answer is replayed immediately to the client while a refresh query is dispatched in the background. LAN clients never wait for upstream round trips on frequently visited sites.
 * **Single-Flight Coalescing & Hedging:** Duplicate concurrent requests for the same un-cached domain share a single upstream socket. If an upstream query exceeds the observed p95 response time, a hedged duplicate query is sent.
@@ -221,7 +242,7 @@ The net effect: the fast path is still what delivers the ~2,200 qps below, but i
 
 ## 📊 Measured Performance
 
-Tested LAN client to board over wired Ethernet:
+Numbers, not adjectives. Tested LAN client to board over wired Ethernet:
 
 | Query Type | Typical Latency (p50, c=1) | Minimum Latency | Saturated Throughput |
 | :--- | :--- | :--- | :--- |
@@ -282,27 +303,35 @@ Set the Wi-Fi credentials afterwards over the USB console (`wifi "<SSID>" <passw
 │   ├── query_log.c       # PSRAM query history ring buffer & analytics
 │   ├── rewrite.c         # Local DNS rewrite rules & static hosts
 │   ├── localzone.c       # Split-horizon local domain forwarding
-│   └── acl.c             # Client IP access control list
+│   ├── acl.c             # Client IP access control list
+│   ├── bypass.c          # Per-client always-unfiltered bypass list
+│   ├── pause.c           # Timed pause/resume table shared by the web UI and USB console
+│   ├── census.c          # Passive LAN census (ARP/DHCP/DNS sightings, suspected-bypass flag)
+│   └── crashlog.c        # RTC-backed crash flight recorder (GET /lastwords)
 ├── docs/
 │   ├── blocklist-format.md          # In-depth mathematical analysis of bucket-split storage
 │   ├── http-api.md                  # Complete REST API route and field reference
 │   ├── simd-acceleration-notes.md  # ESP32-S3 Xtensa PIE / SIMD performance study
-│   └── flasher/                     # Web Serial browser flasher implementation
+│   ├── flasher/                     # Web Serial browser flasher implementation
+│   └── firmware/                    # Same-origin release binaries + manifest the flasher fetches
 ├── tests/
-│   └── bl_table_test.c   # Host tests for the storage core (radix landing buffer,
-│                         # near-capacity merge, bucket occupancy, measured FP rate)
+│   ├── bl_table_test.c          # Host tests for the storage core (radix landing buffer,
+│   │                             # near-capacity merge, bucket occupancy, measured FP rate)
+│   └── l2_finish_reply_test.c   # Byte-equivalence check for the L2 fast-path reply builder
 └── tools/
     ├── dnsload/          # DNS load generator: N queries in flight, true percentiles
-    └── make-release.ps1  # Collects both boards' build artifacts into release/
+    └── make-release.ps1  # Collects each board's build artifacts into release/
                           # and writes the manifest.json the web flasher consumes
 ```
 
-Build and run the storage tests on the host — no ESP-IDF required, just a C
-compiler (on Windows, run these from WSL or MSYS2):
+Build and run the host tests — no ESP-IDF required, just a C compiler (on
+Windows, run these from WSL or MSYS2):
 
 ```bash
 gcc -O2 -I main -o bl_table_test tests/bl_table_test.c main/bl_table.c
 ./bl_table_test
+gcc -O2 -o l2_finish_reply_test tests/l2_finish_reply_test.c
+./l2_finish_reply_test
 ```
 
 ---

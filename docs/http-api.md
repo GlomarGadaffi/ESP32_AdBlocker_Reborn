@@ -46,7 +46,7 @@ metrics fields from `dns_server_metrics_json()` in `dns_server.cpp`.
 | GET | `/login` | Sign-in form. |
 | POST | `/login` | Verify `user`/`pass`; sets the `sid` cookie. 5 failures → 60 s lockout. |
 | POST | `/logout` | Destroy the current session and clear the cookie. |
-| GET | `/` | Status page (Dashboard + tabs). Auto-refreshes every 10 s. |
+| GET | `/` | Status page (Dashboard + tabs). Polls `GET /metrics` every 10 s and patches the stat chips, the pause-countdown table, and the clock line in place — no full-page reload, so in-progress typing in the Check-domain / Whitelist boxes survives a tick (#105, #108, PR #134). |
 | GET | `/metrics` | JSON counters and latency histograms — see below. |
 | GET | `/metrics/view` | Rendered dashboard over `/metrics` (#126). Static page; the grouping lives in its JS and it polls `/metrics` every 10 s, pausing while the tab is hidden. Fields the grouping does not claim are still shown, under "Other (ungrouped)". |
 | GET | `/lastwords` | JSON crash flight recorder (#71) — see below. |
@@ -99,6 +99,7 @@ A single JSON object. Field names are exactly as emitted.
 | `upstream` | string | Dotted-quad of the resolver actually being forwarded to. |
 | `clock` | string | `synced`, `floored`, or `unset`. |
 | `clock_src` | string | How the clock got its boot value: `rtc`, `nvs`, `build`, or `unset`. Latched at boot. |
+| `clock_epoch` | int | Unix epoch seconds off the system clock, unconditionally — populated even before NTP sync completes. Not a validity signal by itself; pair with `clock` for that (PR #134). |
 | `uptime_s` | int | Seconds since boot (`esp_timer`). |
 | `queries_total` | int | Queries seen by the socket path. |
 | `blocked` | int | Sinkholed on the socket path. |
@@ -131,6 +132,7 @@ A single JSON object. Field names are exactly as emitted.
 | `blocklist_loading` | bool | A reload is in progress. |
 | `blocklist_paused` | bool | Global pause (the persistent on/off switch) is on. |
 | `pause_active` | int | Timed pause entries currently in force, across all scopes. Expired entries are not counted. |
+| `pause_list` | array | One object per currently active timed pause: `{"ip":"a.b.c.d","remaining_s":N}`, or `{"ip":"all","remaining_s":N}` for the "pause every device" scope. Powers the Dashboard's pause-countdown table (PR #134); see `pause_active` for the count. |
 | `bypass_count` | int | Entries on the standing per-client bypass list (#74 Part 2). |
 | `blocklist_dropped` | int | Entries lost to `BLOCKLIST_CAPACITY` on the last reload. |
 | `blocklist_feed_failures` | int | Extra feeds that hard-failed on the last publishing reload. Non-zero means the live list is missing whole sources, and the SD snapshot is vetoed. |
@@ -150,7 +152,8 @@ A single JSON object. Field names are exactly as emitted.
 each `{"p50":N,"p99":N,"max":N,"count":N}` in microseconds.
 
 The whole response is built into a fixed 2048 B buffer and clamped to it;
-worst case today is roughly 1.3 KB.
+worst case today is roughly 1,750 B (`pause_list` can add up to `PAUSE_MAX`
+(8) entries at ~50 B each — see the `F15` comment in `dns_server.cpp`).
 
 ## `GET /lastwords`
 

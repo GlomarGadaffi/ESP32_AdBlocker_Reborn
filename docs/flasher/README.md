@@ -32,9 +32,10 @@ own machine.
    runs against the stub, on one connection — the page never reconnects between
    detecting and flashing.
 
-2. **Detect the board.** Both supported boards are ESP32-S3 with 16 MB flash, so
-   nothing about the chip distinguishes them. The firmware instead stamps the
-   board into its own version string: `CMakeLists.txt` sets
+2. **Detect the board.** The two Ethernet boards are both ESP32-S3 with 16 MB
+   flash, so nothing about the chip distinguishes them (the Wi-Fi-only target
+   is a separate case — see *Release contract* below). The firmware instead
+   stamps the board into its own version string: `CMakeLists.txt` sets
    `PROJECT_VER` to `"<semver>+<board>"`, which lands in `esp_app_desc_t.version`.
 
    The page reads that descriptor back off the flash with `loader.readFlash()`.
@@ -155,9 +156,21 @@ without re-hardcoding `0xf000`/`0x20000` in the page — exactly the offsets the
 script just finished parsing out of `flash_args`. Older manifests without `role`
 still work; the page falls back to matching on offset.
 
-Board ids (`t-eth-elite`, `waveshare-s3-eth`) are load-bearing in three places
-that must stay in sync: `ADBLOCK_BOARD_TAG` in `CMakeLists.txt`, the `$Boards`
-table in `tools/make-release.ps1`, and the `BOARDS` table in `index.html`.
+Board ids (`t-eth-elite`, `waveshare-s3-eth`, `generic-s3-wifi`) are
+load-bearing in three places that must stay in sync: `ADBLOCK_BOARD_TAG` in
+`CMakeLists.txt`, the `$Boards` table in `tools/make-release.ps1`, and the
+`BOARDS` table in `index.html`. All three already agree on all three ids.
+
+**The picker always shows all three boards; a release doesn't have to.**
+`index.html` renders every entry in its own `BOARDS` table regardless of what
+the fetched manifest contains, so `generic-s3-wifi` appears as an option even
+in a release built before that board existed. Selecting a board with no entry
+in `manifest.json` just disables the Flash button — `updateFlashButton()` sets
+the status text to "The latest release has no build for `<board name>`"
+instead of failing partway through a write. As of the `1.3.0` manifest (see
+the example below), only `t-eth-elite` and `waveshare-s3-eth` have shipped
+images; `generic-s3-wifi` support landed on `main` after that tag and must
+currently be built from source until a release includes its binaries.
 
 ## Local development
 
