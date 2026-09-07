@@ -647,6 +647,7 @@ static esp_err_t handle_status(httpd_req_t *r)
         "var sl=document.getElementById('stop-load-form');"
         "if(sl)sl.hidden=!m.blocklist_loading;"
         "renderPause(m.pause_list||[]);"
+        "renderClock(m.clock,m.clock_src,m.clock_epoch);"
         "DASH_FAILS=0;"
         "}else{DASH_FAILS++;}"
         "markStale();DASH_BUSY=false;schedRefresh();"
@@ -660,13 +661,17 @@ static esp_err_t handle_status(httpd_req_t *r)
         "var e=document.getElementById('dash-stale');if(!e)return;"
         "e.hidden=DASH_FAILS<3;"
         "}"
-        /* Mirrors the server-rendered pause table exactly (main/web_ui.cpp's
-         * own handle_status) so the two never need to agree on markup by
-         * hand — same client-side-rendering approach #126 established for
-         * the rest of /metrics/view, applied to this one section instead of
-         * the whole page. The submit listener above is delegated on
-         * `document`, so it CSRF-tags these forms even though they're
-         * created here, after page load. */
+        /* The ONLY renderer for the pause table — handle_status's C code
+         * calls this via an inline <script> at first paint (passing the same
+         * pause_list data JSON-encoded) instead of hand-building the HTML
+         * itself. A prior version had two copies (server-side C for first
+         * paint, this one for refreshes); review caught that as the exact
+         * class of drift bug #103/#107 exist because of elsewhere in this
+         * file, despite a comment here once claiming otherwise. Now there is
+         * one, so first paint and every refresh are provably the same
+         * markup. The submit listener above is delegated on `document`, so
+         * it CSRF-tags these forms even though they're created via
+         * innerHTML, same as any other form. */
         "function renderPause(list){"
         "var c=document.getElementById('pause-active');if(!c)return;"
         "if(!list.length){c.innerHTML='';return;}"
@@ -683,6 +688,27 @@ static esp_err_t handle_status(httpd_req_t *r)
         "h+='</table><form method=post action=/pause/resume style=\"margin-top:.4em\">'+"
         "'<input type=hidden name=ip value=every><button>Resume all now</button></form>';"
         "c.innerHTML=h;"
+        "}"
+        /* Same single-renderer fix as renderPause(), for the same review
+         * finding: the Clock line used to freeze at whatever it showed on
+         * first paint (a real gap during the exact NTP-sync moment a viewer
+         * might be watching for), since /metrics already carried clock and
+         * clock_src but nothing patched this line from them. clock_epoch is
+         * raw time(NULL) (see dns_server.cpp's comment on that field) — it
+         * reflects the floor date while unsynced, matching what this line
+         * has always shown, not a new value. */
+        "function renderClock(clock,src,epoch){"
+        "var c=document.getElementById('clock-status');if(!c)return;"
+        "var d=new Date(epoch*1000);"
+        "if(clock=='synced'){"
+        "c.innerHTML='Clock: <b>'+d.toISOString().slice(0,19).replace('T',' ')+"
+        "' UTC</b> (NTP synced)';"
+        "}else{"
+        "c.innerHTML='Clock: <span class=warn>syncing via NTP\\u2026</span> '+"
+        "'running on the <b>'+src+'</b> clock ('+d.toISOString().slice(0,10)+') '+"
+        "'\\u2014 good enough for TLS certificate dates, not for timestamps, '+"
+        "'so the log shows uptime until synced.';"
+        "}"
         "}"
         "document.addEventListener('visibilitychange',function(){"
         "if(!document.hidden){var a=document.querySelector('.tab.active');"
@@ -803,67 +829,46 @@ static esp_err_t handle_status(httpd_req_t *r)
             (unsigned)PAUSE_MAX_MINUTES, (unsigned)PAUSE_MAX_MINUTES,
             (unsigned)((me>>24)&0xFF),(unsigned)((me>>16)&0xFF),
             (unsigned)((me>>8)&0xFF),(unsigned)(me&0xFF));
-        /* (#105/#108 follow-up) Stable container: refreshDash() replaces
-         * this div's innerHTML from /metrics's pause_list every 10s, the
-         * same client-side-rendering approach #126 already established for
-         * /metrics/view — rather than a second server-side renderer to keep
-         * in step. The submit listener in the head script is delegated on
-         * `document`, so it CSRF-tags these forms' actions even when they're
-         * created by innerHTML after page load, same as any other form. */
-        page_appendf(page, sizeof(page), &n, "<div id=pause-active>");
-        if (pn > 0) {
-            page_appendf(page, sizeof(page), &n,
-                "<table><tr><th>Paused for</th><th>Time left</th><th></th></tr>");
-            for (uint32_t i = 0; i < pn; i++) {
-                char who[24], ipv[24];
-                if (pv[i].ip == PAUSE_IP_ALL) {
-                    snprintf(who, sizeof(who), "<b>All devices</b>");
-                    snprintf(ipv, sizeof(ipv), "all");
-                } else {
-                    snprintf(who, sizeof(who), "%u.%u.%u.%u",
-                        (unsigned)((pv[i].ip>>24)&0xFF),(unsigned)((pv[i].ip>>16)&0xFF),
-                        (unsigned)((pv[i].ip>>8)&0xFF),(unsigned)(pv[i].ip&0xFF));
-                    snprintf(ipv, sizeof(ipv), "%s", who);
-                }
-                page_appendf(page, sizeof(page), &n,
-                    "<tr><td>%s%s</td><td>%um %02us</td>"
-                    "<td><form method=post action=/pause/resume style='margin:0'>"
-                    "<input type=hidden name=ip value='%s'><button>Resume now</button></form></td></tr>",
-                    who, pv[i].ip == me ? " (this device)" : "",
-                    (unsigned)(pv[i].remaining_s / 60), (unsigned)(pv[i].remaining_s % 60), ipv);
+        /* (#105/#108 follow-up, and the review finding that the first cut of
+         * this got wrong) A previous version hand-built this table's HTML
+         * here in C AND in renderPause() (JS) — two renderers for the same
+         * pause_list data, the exact class of drift bug #103/#107 exist
+         * because of elsewhere in this file. There is now exactly ONE
+         * renderer: renderPause() (head script). The initial paint just
+         * calls it with the same data JSON-encoded, so first load and every
+         * 10s refresh always go through the same code. The submit listener
+         * in the head script is delegated on `document`, so it CSRF-tags
+         * these forms' actions even though renderPause() creates them via
+         * innerHTML, same as any other form. */
+        page_appendf(page, sizeof(page), &n, "<div id=pause-active></div><script>renderPause([");
+        for (uint32_t i = 0; i < pn; i++) {
+            char ipv[16];
+            if (pv[i].ip == PAUSE_IP_ALL) {
+                snprintf(ipv, sizeof(ipv), "all");
+            } else {
+                snprintf(ipv, sizeof(ipv), "%u.%u.%u.%u",
+                    (unsigned)((pv[i].ip>>24)&0xFF),(unsigned)((pv[i].ip>>16)&0xFF),
+                    (unsigned)((pv[i].ip>>8)&0xFF),(unsigned)(pv[i].ip&0xFF));
             }
             page_appendf(page, sizeof(page), &n,
-                "</table><form method=post action=/pause/resume style='margin-top:.4em'>"
-                "<input type=hidden name=ip value=every><button>Resume all now</button></form>");
+                "%s{ip:'%s',remaining_s:%" PRIu32 "}", i ? "," : "", ipv, pv[i].remaining_s);
         }
-        page_appendf(page, sizeof(page), &n, "</div>");
+        page_appendf(page, sizeof(page), &n, "]);</script>");
     }
 
-    /* Clock status (NTP) */
+    /* Clock status (NTP). (#105/#108 follow-up) Single renderer, same fix as
+     * the pause table above: renderClock() (head script) builds this from
+     * timesync_state()/timesync_source()/time(NULL) at first paint via this
+     * inline call, and refreshDash() calls the same function with the same
+     * fields from /metrics every 10s — one function, not two copies that
+     * used to drift (the #75 "say which floor source" reasoning that
+     * motivated the original wording lives in renderClock()'s own comment
+     * now, not duplicated here). */
     {
-        uint32_t ep = timesync_epoch();
-        if (ep) {
-            time_t t = (time_t)ep;
-            struct tm tmv; gmtime_r(&t, &tmv);
-            char tbuf[32]; strftime(tbuf, sizeof(tbuf), "%Y-%m-%d %H:%M:%S", &tmv);
-            page_appendf(page, sizeof(page), &n,
-                "<p><small>Clock: <b>%s UTC</b> (NTP synced)</small></p>", tbuf);
-        } else {
-            /* #75: not synced no longer means the clock reads 1970 — a floor
-             * from NVS or the build stamp is in place, which is what lets TLS
-             * certificate dates be checked at all this early. Say which,
-             * because "syncing…" alone gave no way to tell a floored box from
-             * one whose TLS is about to fail every handshake. */
-            time_t fl = time(NULL);
-            struct tm tmv; gmtime_r(&fl, &tmv);
-            char fbuf[16]; strftime(fbuf, sizeof(fbuf), "%Y-%m-%d", &tmv);
-            page_appendf(page, sizeof(page), &n,
-                "<p><small>Clock: <span class=warn>syncing via NTP…</span> "
-                "running on the <b>%s</b> clock (%s) — good enough for TLS "
-                "certificate dates, not for timestamps, so the log shows "
-                "uptime until synced.</small></p>",
-                timesync_source(), fbuf);
-        }
+        page_appendf(page, sizeof(page), &n,
+            "<p><small id=clock-status></small></p>"
+            "<script>renderClock('%s','%s',%lld);</script>",
+            timesync_state(), timesync_source(), (long long)time(NULL));
     }
     page_appendf(page, sizeof(page), &n, "</div><div class='tab' id=tab-blocklist>");
 
