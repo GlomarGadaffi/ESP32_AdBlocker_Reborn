@@ -2,11 +2,13 @@
 #include <string.h>
 #include <ctype.h>
 
-/* IRAM_ATTR (#78): called unconditionally from l2_qname() on every packet
- * the L2 fast path parses — confirmed by nm that without this tag it stayed
- * in flash even after l2_input_cb/l2_qname moved to IRAM, defeating the
- * "never touch flash from the L2 hook" invariant #78 is about. Not in the
- * issue's original function list, but required to actually deliver it. */
+/* IRAM_ATTR (#78): called unconditionally from dns_extract_qname() (this
+ * file, below — l2_qname was its pre-#109 name when it lived in dns_sink.cpp)
+ * on every packet the L2 fast path parses — confirmed by nm that without
+ * this tag it stayed in flash even after that caller moved to IRAM,
+ * defeating the "never touch flash from the L2 hook" invariant #78 is about.
+ * Not in the issue's original function list, but required to actually
+ * deliver it. */
 size_t IRAM_ATTR domain_normalize(char *buf, size_t buf_size, const char *src, size_t src_len)
 {
     if (!src || !buf || buf_size < 2) return 0;

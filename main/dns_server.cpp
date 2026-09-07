@@ -1073,12 +1073,11 @@ static int build_rewrite_a(const uint8_t *query, int qend, uint32_t rw_ip,
 }
 
 
-/* ── QNAME extraction from DNS query (label walking) ────────────── */
-/* Returns offset past QNAME+QTYPE+QCLASS, or -1 on error.          */
-/* Writes normalized domain name to name_out (up to name_cap bytes). */
-/* (#109) extract_qname used to be its own copy here; it's now
- * dns_extract_qname() in domain.c/.h, shared with the L2 fast path
- * (dns_sink.cpp) — see that header for why. */
+/* (#109) QNAME extraction from DNS query (label walking) used to be its own
+ * copy here (extract_qname); it's now dns_extract_qname() in domain.c/.h,
+ * shared with the L2 fast path (dns_sink.cpp) — see that header for the full
+ * contract (returns offset past QNAME+QTYPE+QCLASS, or -1 on error; writes
+ * the normalized name to name_out) and for why. */
 
 /* A TCP-origin query forwarded upstream over plain UDP with no EDNS gets
  * classic-truncated by the upstream resolver at 512 B (RFC 1035) exactly as
@@ -1110,8 +1109,8 @@ static int append_bare_edns_opt(uint8_t *dst, const uint8_t *q, int mlen, int ca
 }
 
 /* Decompress a name that may use RFC 1035 §4.1.4 message compression —
- * unlike extract_qname (which REJECTS compression in the question section
- * by design), answer-section owner/RDATA names commonly use it. *off is
+ * unlike dns_extract_qname (which REJECTS compression in the question
+ * section by design), answer-section owner/RDATA names commonly use it. *off is
  * advanced exactly like skip_name() would (stopping at the first
  * terminator or the first compression pointer at the ORIGINAL position,
  * +1 or +2 respectively) regardless of how many pointers are followed
