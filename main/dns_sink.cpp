@@ -1269,39 +1269,55 @@ extern "C" bool dns_sink_l2log_drain(char *, size_t, uint16_t *, uint32_t *, boo
 extern "C" uint32_t dns_sink_l2log_dropped(void) { return 0; }
 #endif /* CONFIG_ADBLOCK_NET_ETH — L2 query-log staging ring */
 
-/* Parse question qname → normalized name; return qend offset within DNS msg.
- * IRAM_ATTR (#78): called from l2_input_cb, which must never fault to flash. */
-#if CONFIG_ADBLOCK_NET_ETH
-static int IRAM_ATTR l2_qname(const uint8_t *dns, int dns_len, char *out, size_t cap, size_t *outlen)
-{
-    /* (#114) Was `static`: mutable parser state shared across calls on the
-     * Ethernet RX worker task is a reentrancy hazard even though callers are
-     * currently serialized. Stack-allocated — 256 bytes is cheap next to the
-     * IRAM_ATTR budget this function already accepts. */
-    char raw[256];
-    int off = 12; size_t rl = 0;
-    while (off < dns_len && dns[off] != 0) {
-        uint8_t l = dns[off];
-        if ((l & 0xC0) == 0xC0) return -1;              /* no compression in question */
-        if (l & 0xC0) return -1;                        /* #42: reserved label type */
-        if (off + 1 + l > dns_len || rl + l + 1 >= sizeof(raw)) return -1;
-        if (rl) raw[rl++] = '.';
-        memcpy(raw + rl, dns + off + 1, l); rl += l; off += 1 + l;
-    }
-    if (off >= dns_len) return -1;
-    off++;                                               /* null label */
-    if (off + 4 > dns_len) return -1;                    /* qtype + qclass */
-    size_t nl = domain_normalize(out, cap, raw, rl);
-    if (!nl) return -1;
-    *outlen = nl;
-    return off + 4;
-}
-
-/* IRAM_ATTR (#78): makes the "never touch flash from the L2 hook" invariant
+/* (#109) The question-qname parser that used to live here (l2_qname) is now
+ * dns_extract_qname() in domain.c/.h, shared with dns_server.cpp's socket
+ * path — the two copies' bounds checks had already drifted (functionally
+ * equivalent, but only by accident) since #42/L5 needed a human to notice
+ * and mirror a fix by hand. It stays IRAM_ATTR there for this call site.
+ *
+ * IRAM_ATTR (#78): makes the "never touch flash from the L2 hook" invariant
  * explicit rather than relying on CONFIG_LWIP_IRAM_OPTIMIZATION to have
  * caught it incidentally — that setting only covers lwIP's own component
  * sources, not this callback, which esp_eth invokes via a stored function
  * pointer (so it can't be inlined into anything already in IRAM). */
+#if CONFIG_ADBLOCK_NET_ETH
+
+/* (#109) Shared tail for both l2_input_cb reply paths (cache hit, blocked).
+ * Both build their DNS payload directly into tx[dns..], at which point what
+ * remains is identical: turn the copied request's Ethernet/IP/UDP headers
+ * into a reply addressed back to the sender, patch the two length fields for
+ * this payload's size, and redo the IP checksum (zeroed UDP checksum is
+ * legal for IPv4 either way).
+ *
+ * Deliberately does NOT touch the DNS txid: the blocked path's payload was
+ * memcpy'd from the original query (buf), so its txid is already correct;
+ * the cached path's payload came from the forward cache and needs its own
+ * one-line patch (tx[dns]=buf[dns]; tx[dns+1]=buf[dns+1];) BEFORE calling
+ * this — folding that in here would mean every future caller either gets an
+ * unwanted patch or has to know to undo it. Keeping it caller-side makes the
+ * one real hazard in this consolidation (patch the wrong reply's txid, or
+ * silently drop the patch) impossible to get wrong by construction. */
+static void IRAM_ATTR l2_finish_reply(uint8_t *tx, int ihl, int udp, int payload_len)
+{
+    uint8_t t6[6];
+    memcpy(t6, tx, 6); memcpy(tx, tx + 6, 6); memcpy(tx + 6, t6, 6);              /* swap MAC */
+    uint8_t t4[4];
+    memcpy(t4, tx+14+12, 4); memcpy(tx+14+12, tx+14+16, 4); memcpy(tx+14+16, t4, 4); /* swap IP */
+    uint8_t t2[2];
+    memcpy(t2, tx+udp, 2); memcpy(tx+udp, tx+udp+2, 2); memcpy(tx+udp+2, t2, 2);     /* swap ports */
+    int iptot = ihl + 8 + payload_len;
+    tx[14+2] = (iptot >> 8); tx[14+3] = (iptot & 0xFF);
+    int udplen = 8 + payload_len;
+    tx[udp+4] = (udplen >> 8); tx[udp+5] = (udplen & 0xFF);
+    tx[udp+6] = 0; tx[udp+7] = 0;                     /* zero UDP checksum (legal IPv4) */
+    tx[14+10] = 0; tx[14+11] = 0;                     /* IP checksum */
+    uint32_t sum = 0;
+    for (int i = 0; i < ihl; i += 2) sum += (tx[14+i] << 8) | tx[14+i+1];
+    while (sum >> 16) sum = (sum & 0xFFFF) + (sum >> 16);
+    uint16_t csum = ~sum;
+    tx[14+10] = (csum >> 8); tx[14+11] = (csum & 0xFF);
+}
+
 static esp_err_t IRAM_ATTR l2_input_cb(esp_eth_handle_t h, uint8_t *buf, uint32_t len,
                              void *priv, void *info)
 {
@@ -1366,7 +1382,7 @@ static esp_err_t IRAM_ATTR l2_input_cb(esp_eth_handle_t h, uint8_t *buf, uint32_
         if (buf[dns + 2] & 0x80) break;                  /* must be a query (QR=0) */
         if (((buf[dns + 4] << 8) | buf[dns + 5]) != 1) break;    /* qdcount==1 */
         size_t nlen = 0;
-        int qend = l2_qname(buf + dns, dns_len, name, sizeof(name), &nlen);
+        int qend = dns_extract_qname(buf + dns, dns_len, 12, name, sizeof(name), &nlen);
         if (qend < 0) break;
         uint16_t qtype = (buf[dns + qend - 4] << 8) | buf[dns + qend - 3];
         if (qtype != 1 && qtype != 28) break;            /* A / AAAA only */
@@ -1394,20 +1410,8 @@ static esp_err_t IRAM_ATTR l2_input_cb(esp_eth_handle_t h, uint8_t *buf, uint32_
                                         tx + dns, (int)sizeof(tx) - dns);
             if (clen <= 0) break;                        /* miss/expired/race → lwIP */
             memcpy(tx, buf, dns);                         /* eth+ip+udp headers */
-            uint8_t s6[6]; memcpy(s6,tx,6); memcpy(tx,tx+6,6); memcpy(tx+6,s6,6);            /* swap MAC */
-            uint8_t s4[4]; memcpy(s4,tx+14+12,4); memcpy(tx+14+12,tx+14+16,4); memcpy(tx+14+16,s4,4); /* swap IP */
-            uint8_t s2[2]; memcpy(s2,tx+udp,2); memcpy(tx+udp,tx+udp+2,2); memcpy(tx+udp+2,s2,2);     /* swap ports */
             tx[dns] = buf[dns]; tx[dns+1] = buf[dns+1];   /* patch txid to this query */
-            int iptot_c = ihl + 8 + clen;
-            tx[14+2]=(iptot_c>>8); tx[14+3]=(iptot_c&0xFF);
-            int udplen_c = 8 + clen;
-            tx[udp+4]=(udplen_c>>8); tx[udp+5]=(udplen_c&0xFF);
-            tx[udp+6]=0; tx[udp+7]=0;                     /* zero UDP checksum (legal IPv4) */
-            tx[14+10]=0; tx[14+11]=0;                     /* IP checksum */
-            uint32_t csum=0;
-            for (int i=0;i<ihl;i+=2) csum += (tx[14+i]<<8)|tx[14+i+1];
-            while (csum>>16) csum=(csum&0xFFFF)+(csum>>16);
-            uint16_t cks=~csum; tx[14+10]=(cks>>8); tx[14+11]=(cks&0xFF);
+            l2_finish_reply(tx, ihl, udp, clen);
             if (esp_eth_transmit(h, tx, dns + clen) != ESP_OK) s_l2_tx_fail++;
             s_l2_cached++;
             l2_log_stage(name, nlen, qtype, src_hbo, false);
@@ -1421,12 +1425,6 @@ static esp_err_t IRAM_ATTR l2_input_cb(esp_eth_handle_t h, uint8_t *buf, uint32_
         int frame = dns + dns_resp;
         if (frame > (int)sizeof(tx)) break;
         memcpy(tx, buf, dns + qend);                     /* eth+ip+udp+dns(hdr+question) */
-        uint8_t t6[6];
-        memcpy(t6, tx, 6); memcpy(tx, tx + 6, 6); memcpy(tx + 6, t6, 6);          /* swap MAC */
-        uint8_t t4[4];
-        memcpy(t4, tx+14+12, 4); memcpy(tx+14+12, tx+14+16, 4); memcpy(tx+14+16, t4, 4); /* swap IP */
-        uint8_t t2[2];
-        memcpy(t2, tx+udp, 2); memcpy(tx+udp, tx+udp+2, 2); memcpy(tx+udp+2, t2, 2);     /* swap ports */
         { uint16_t qf = (buf[dns+2] << 8) | buf[dns+3];
           uint16_t rf = dns_resp_flags(qf, 0);
           tx[dns+2] = (rf >> 8); tx[dns+3] = (rf & 0xFF); }
@@ -1434,20 +1432,15 @@ static esp_err_t IRAM_ATTR l2_input_cb(esp_eth_handle_t h, uint8_t *buf, uint32_
         tx[dns+8] = 0; tx[dns+9] = 0; tx[dns+10] = 0; tx[dns+11] = 0;  /* ns/ar=0 */
         uint8_t *a = tx + dns + qend;
         a[0]=0xC0; a[1]=0x0C; a[2]=(qtype>>8); a[3]=(qtype&0xFF);
-        a[4]=0; a[5]=1; a[6]=0; a[7]=0; a[8]=0; a[9]=10;             /* class IN, ttl 10 */
+        /* (#109) TTL shared with the socket path's BLOCKED_TTL_S (dns_server.h)
+         * rather than a second hardcoded literal — the two verdict paths must
+         * agree on how long a client caches a block, not just whether. */
+        a[4]=0; a[5]=1;                                              /* class IN */
+        a[6]=(BLOCKED_TTL_S>>24)&0xFF; a[7]=(BLOCKED_TTL_S>>16)&0xFF;
+        a[8]=(BLOCKED_TTL_S>>8)&0xFF;  a[9]=BLOCKED_TTL_S&0xFF;      /* ttl */
         a[10]=(rdlen>>8); a[11]=(rdlen&0xFF);
         memset(a+12, 0, rdlen);                          /* 0.0.0.0 / :: */
-        int iptot_b = ihl + 8 + dns_resp;
-        tx[14+2]=(iptot_b>>8); tx[14+3]=(iptot_b&0xFF);
-        int udplen_b = 8 + dns_resp;
-        tx[udp+4]=(udplen_b>>8); tx[udp+5]=(udplen_b&0xFF);
-        tx[udp+6]=0; tx[udp+7]=0;                        /* zero UDP checksum (legal IPv4) */
-        tx[14+10]=0; tx[14+11]=0;                        /* IP checksum */
-        uint32_t sum=0;
-        for (int i=0;i<ihl;i+=2) sum += (tx[14+i]<<8)|tx[14+i+1];
-        while (sum>>16) sum=(sum&0xFFFF)+(sum>>16);
-        uint16_t csum=~sum;
-        tx[14+10]=(csum>>8); tx[14+11]=(csum&0xFF);
+        l2_finish_reply(tx, ihl, udp, dns_resp);
 
         if (esp_eth_transmit(h, tx, frame) != ESP_OK) s_l2_tx_fail++;
         s_l2_blocked++;

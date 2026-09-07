@@ -129,7 +129,8 @@ struct DnsAnswerHeader {
 
 static constexpr uint16_t DNS_FLAGS_RESPONSE   = 0x8400; /* QR=1 AA=1 */
 static constexpr uint16_t DNS_FLAGS_NXDOMAIN   = 0x8403; /* QR=1 AA=1 RCODE=3 */
-static constexpr uint32_t BLOCKED_TTL_S        = 10;
+/* BLOCKED_TTL_S moved to dns_server.h (#109) — the L2 hook's blocked-reply
+ * path needs it too, and used to hardcode its own literal 10. */
 static constexpr int      UPSTREAM_PORT        = 53;
 static constexpr uint32_t UPSTREAM_TIMEOUT_MS  = 3000;
 static constexpr int      UPSTREAM_TABLE_SIZE  = 64;
@@ -1072,38 +1073,11 @@ static int build_rewrite_a(const uint8_t *query, int qend, uint32_t rw_ip,
 }
 
 
-/* ── QNAME extraction from DNS query (label walking) ────────────── */
-/* Returns offset past QNAME+QTYPE+QCLASS, or -1 on error.          */
-/* Writes normalized domain name to name_out (up to name_cap bytes). */
-static int extract_qname(const uint8_t *pkt, int pkt_len,
-                          int offset, char *name_out, size_t name_cap,
-                          size_t *name_len_out)
-{
-    char raw[256]; size_t raw_len = 0;
-    /* label walk per RFC 1035 §4.1.2 */
-    while (offset < pkt_len && pkt[offset] != 0) {
-        uint8_t label_len = pkt[offset];
-        /* A compression pointer in a question QNAME is malformed per RFC 1035
-         * (questions don't use compression). Reject it, matching the L2 fast
-         * path's stricter parser (L5). */
-        if ((label_len & 0xC0) == 0xC0) return -1;
-        if (label_len & 0xC0) return -1;           /* #42: 0x40-0xBF are reserved */
-        if (offset + 1 + label_len >= pkt_len) return -1;
-        if (raw_len + label_len + 1 >= sizeof(raw)) return -1;
-        if (raw_len > 0) raw[raw_len++] = '.';
-        memcpy(raw + raw_len, pkt + offset + 1, label_len);
-        raw_len += label_len;
-        offset  += 1 + label_len;
-    }
-    if (offset >= pkt_len) return -1;
-    offset++;  /* skip null byte */
-    if (offset + 4 > pkt_len) return -1;  /* QTYPE + QCLASS */
-
-    size_t nlen = domain_normalize(name_out, name_cap, raw, raw_len);
-    if (nlen == 0) return -1;
-    *name_len_out = nlen;
-    return offset + 4;  /* past QTYPE+QCLASS */
-}
+/* (#109) QNAME extraction from DNS query (label walking) used to be its own
+ * copy here (extract_qname); it's now dns_extract_qname() in domain.c/.h,
+ * shared with the L2 fast path (dns_sink.cpp) — see that header for the full
+ * contract (returns offset past QNAME+QTYPE+QCLASS, or -1 on error; writes
+ * the normalized name to name_out) and for why. */
 
 /* A TCP-origin query forwarded upstream over plain UDP with no EDNS gets
  * classic-truncated by the upstream resolver at 512 B (RFC 1035) exactly as
@@ -1135,8 +1109,8 @@ static int append_bare_edns_opt(uint8_t *dst, const uint8_t *q, int mlen, int ca
 }
 
 /* Decompress a name that may use RFC 1035 §4.1.4 message compression —
- * unlike extract_qname (which REJECTS compression in the question section
- * by design), answer-section owner/RDATA names commonly use it. *off is
+ * unlike dns_extract_qname (which REJECTS compression in the question
+ * section by design), answer-section owner/RDATA names commonly use it. *off is
  * advanced exactly like skip_name() would (stopping at the first
  * terminator or the first compression pointer at the ORIGINAL position,
  * +1 or +2 respectively) regardless of how many pointers are followed
@@ -1398,7 +1372,7 @@ void DnsSinkServer::run_loop()
             int rqend;
             {
                 char rname[256]; size_t rnlen = 0;
-                rqend = extract_qname(pkt, plen, sizeof(DnsHeader),
+                rqend = dns_extract_qname(pkt, plen, sizeof(DnsHeader),
                                       rname, sizeof(rname), &rnlen);
                 if (rqend < 0) return;
                 uint16_t rqtype = ntohs(*reinterpret_cast<uint16_t *>(pkt + rqend - 4));
@@ -1777,7 +1751,7 @@ void DnsSinkServer::run_loop()
 
                 /* parse QNAME */
                 char name[256]; size_t nlen = 0;
-                int qend = extract_qname(rx, rlen, sizeof(DnsHeader), name, sizeof(name), &nlen);
+                int qend = dns_extract_qname(rx, rlen, sizeof(DnsHeader), name, sizeof(name), &nlen);
                 if (qend < 0) continue;
 
                 uint16_t qtype  = ntohs(*reinterpret_cast<uint16_t *>(rx + qend - 4));
@@ -2089,7 +2063,7 @@ void DnsSinkServer::run_loop()
                     char name[256]; size_t nlen = 0;
                     int qend = -1;
                     if (!(ntohs(qh->flags) & 0x8000) && ntohs(qh->qdcount) != 0)
-                        qend = extract_qname(q, mlen, sizeof(DnsHeader),
+                        qend = dns_extract_qname(q, mlen, sizeof(DnsHeader),
                                              name, sizeof(name), &nlen);
                     if (qend < 0) {
                         tcp_conn_close();
