@@ -22,6 +22,7 @@
 #include <cerrno>
 #include <cinttypes>
 #include <atomic>
+#include <ctime>
 #include <sys/select.h>
 
 static const char *TAG = "dns_server";
@@ -2333,8 +2334,15 @@ int dns_server_metrics_json(char *out, size_t cap)
         /* #75: how the system clock got its value, and where it stands now.
          * clock_src is LATCHED at boot - the floor decision is only visible
          * for the 1-3 s before SNTP lands, which is too short to catch by
-         * polling, and it gates every TLS handshake on the box. */
-        "\"clock\":\"%s\",\"clock_src\":\"%s\","
+         * polling, and it gates every TLS handshake on the box.
+         * (#105/#108 follow-up) clock_epoch is deliberately raw time(NULL),
+         * NOT timesync_epoch() — the latter is 0-while-floored on purpose
+         * (a floor timestamp is "a plausible-looking lie", per timesync.h),
+         * which is exactly right for query-log dating but wrong here: the
+         * Dashboard's clock line has always shown the floor date too (when
+         * unsynced), so this field just lets the JS renderer reproduce that
+         * existing display, not a new disclosure. */
+        "\"clock\":\"%s\",\"clock_src\":\"%s\",\"clock_epoch\":%lld,"
         "\"uptime_s\":%lld,"
         "\"queries_total\":%" PRIu32 ",\"blocked\":%" PRIu32 ",\"forwarded\":%" PRIu32 ","
         "\"tcp_queries\":%" PRIu32 ","
@@ -2360,7 +2368,7 @@ int dns_server_metrics_json(char *out, size_t cap)
         "\"flash_status\":\"%s\","
         "\"heap_free\":%u,\"heap_largest\":%u,\"psram_free\":%u,\"dns_task_stack_hwm\":%u,",
         upstream_s,
-        timesync_state(), timesync_source(),
+        timesync_state(), timesync_source(), (long long)time(NULL),
         (long long)(esp_timer_get_time() / 1000000),
         s_cnt_total, s_cnt_blocked, s_cnt_forwarded,
         s_cnt_tcp,
@@ -2403,7 +2411,31 @@ int dns_server_metrics_json(char *out, size_t cap)
             hist_pctl(cats[i].h, 0.50), hist_pctl(cats[i].h, 0.99),
             cats[i].h->max_us, cats[i].h->count);
     }
-    if ((size_t)n < cap) n += snprintf(out + n, cap - (size_t)n, "}}");
+    if ((size_t)n < cap) n += snprintf(out + n, cap - (size_t)n, "}");
+
+    /* (#105/#108 follow-up) The Dashboard's "Time left" pause table used to
+     * only refresh on the full-page reload that #105/#108 removed; now
+     * refreshDash() rebuilds it from here every 10s, the same client-side
+     * pattern #126 already established for the rest of /metrics/view. */
+    if ((size_t)n < cap) n += snprintf(out + n, cap - (size_t)n, ",\"pause_list\":[");
+    {
+        pause_view_t pv[PAUSE_MAX];
+        uint32_t pn = pause_list(pv, PAUSE_MAX);
+        for (uint32_t i = 0; i < pn && (size_t)n < cap; i++) {
+            char ip_s[16];
+            if (pv[i].ip == PAUSE_IP_ALL) {
+                snprintf(ip_s, sizeof(ip_s), "all");
+            } else {
+                snprintf(ip_s, sizeof(ip_s), "%u.%u.%u.%u",
+                    (unsigned)((pv[i].ip>>24)&0xFF),(unsigned)((pv[i].ip>>16)&0xFF),
+                    (unsigned)((pv[i].ip>>8)&0xFF),(unsigned)(pv[i].ip&0xFF));
+            }
+            n += snprintf(out + n, cap - (size_t)n,
+                "%s{\"ip\":\"%s\",\"remaining_s\":%" PRIu32 "}",
+                i ? "," : "", ip_s, pv[i].remaining_s);
+        }
+    }
+    if ((size_t)n < cap) n += snprintf(out + n, cap - (size_t)n, "]}");
     /* F15: n accumulates snprintf's WOULD-BE length, not bytes actually
      * written. Every append above is guarded (`if ((size_t)n < cap) ...`) so
      * none of them overflow `out`, but that guard only stops FURTHER growth —
@@ -2411,8 +2443,12 @@ int dns_server_metrics_json(char *out, size_t cap)
      * it there (or past it, from the very first unguarded snprintf() above).
      * handle_metrics() then does httpd_resp_send(r, json, n) against a fixed
      * 2048 B buffer, so an unclamped n ships whatever .bss sits after json[]
-     * to an unauthenticated client as unterminated JSON. Unreachable today
-     * (worst case ~1,323 B) but one line of insurance against future growth. */
+     * to an unauthenticated client as unterminated JSON. Unreachable today —
+     * worst case is now ~1,750 B (was ~1,323 B before #105/#108's
+     * pause_list/clock_epoch additions: PAUSE_MAX=8 entries at ~50 B each is
+     * the largest single addition) — against a 2048 B cap, less headroom
+     * than the old estimate implied. Re-check this number the next time
+     * something is added here rather than trusting it stays stale-safe. */
     if (n > (int)cap - 1) n = (int)cap - 1;
     return n;
 }
