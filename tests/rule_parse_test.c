@@ -214,11 +214,20 @@ static void test_feed_policy(void)
     CHECK(r.kind == RULE_ALLOW && (r.flags & RULE_IMPORTANT),
           "FEED policy must not touch an exception rule");
 
-    /* a plain block with no $important is untouched */
+    /* a plain sub-inclusive block with no $important is untouched */
     bool got3 = parse_one("||example.com^", &r);
     CHECK(got3 && r.kind == RULE_BLOCK && !(r.flags & RULE_IMPORTANT), "sanity: parsed as plain BLOCK");
     rule_apply_feed_policy(&r);
-    CHECK(r.kind == RULE_BLOCK, "FEED policy must not touch a plain block");
+    CHECK(r.kind == RULE_BLOCK && !(r.flags & RULE_EXACT), "FEED policy must not touch a plain sub block");
+
+    /* the feed block-table entry has no spare bit for RULE_EXACT either:
+     * a feed "|domain^" (single-pipe, exact) is widened to sub-inclusive
+     * rather than dropped — the safe over-block direction. */
+    bool got4 = parse_one("|example.com^", &r);
+    CHECK(got4 && r.kind == RULE_BLOCK && (r.flags & RULE_EXACT), "sanity: parsed as exact BLOCK");
+    rule_apply_feed_policy(&r);
+    CHECK(r.kind == RULE_BLOCK && !(r.flags & RULE_EXACT),
+          "FEED policy must clear RULE_EXACT on a block (widen to sub-inclusive)");
 }
 
 int main(void)
