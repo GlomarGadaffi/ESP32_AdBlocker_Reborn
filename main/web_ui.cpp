@@ -317,17 +317,97 @@ static void page_appendf(char *buf, size_t cap, int *pos, const char *fmt, ...)
     else                    *pos += w;
 }
 
-/* F11: last-resort visible marker for a section skipped because the page
- * buffer's running low, instead of letting page_appendf's silent clamp (H1)
- * truncate mid-markup — that presents as dead tabs with no indication why
- * (#60). Reserves TRUNC_CLOSE_RESERVE so printing the marker itself can never
- * be the thing that eats the room the final closing markup needs. */
-static constexpr int TRUNC_CLOSE_RESERVE = 128;
-static void page_mark_truncated(char *page, size_t cap, int *n)
-{
-    if (*n < (int)cap - TRUNC_CLOSE_RESERVE)
-        page_appendf(page, cap, n, "<p class=warn>[page truncated — too much config to render]</p>");
-}
+/* ── Page buffer with truncation tracking (#110 item 4) ─────────────
+ * Replaces ad-hoc hand-measured reserve gates with an explicit buffer manager.
+ * Reserves TRUNC_RESERVE bytes at the tail so that if markup ever exceeds
+ * capacity, a visible truncation banner and closing tags (</div></body></html>)
+ * are guaranteed to fit, preventing broken layouts or silently dropped tabs. */
+struct PageBuf {
+    char *buf;
+    size_t cap;
+    size_t pos;
+    bool truncated;
+
+    static constexpr size_t TRUNC_RESERVE = 256;
+
+    PageBuf(char *b, size_t c) : buf(b), cap(c), pos(0), truncated(false) {
+        if (buf && cap > 0) buf[0] = '\0';
+    }
+
+    PageBuf(const PageBuf &) = delete;
+    PageBuf &operator=(const PageBuf &) = delete;
+
+    bool has_room(size_t needed = 0) const {
+        return !truncated && (cap > pos + TRUNC_RESERVE + needed);
+    }
+
+    void mark_truncated() {
+        truncated = true;
+    }
+
+    void appendf(const char *fmt, ...) __attribute__((format(printf, 2, 3))) {
+        if (truncated) return;
+        if (pos >= cap) {
+            truncated = true;
+            return;
+        }
+        size_t avail = (cap > pos + TRUNC_RESERVE) ? (cap - pos - TRUNC_RESERVE) : 0;
+        if (avail <= 1) {
+            truncated = true;
+            return;
+        }
+        va_list ap;
+        va_start(ap, fmt);
+        int w = vsnprintf(buf + pos, avail, fmt, ap);
+        va_end(ap);
+        if (w < 0) return;
+        if ((size_t)w >= avail) {
+            truncated = true;
+            pos += avail - 1;
+            buf[pos] = '\0';
+        } else {
+            pos += (size_t)w;
+        }
+    }
+
+    void append(const char *str) {
+        if (truncated || !str) return;
+        size_t len = strlen(str);
+        if (pos >= cap) {
+            truncated = true;
+            return;
+        }
+        size_t avail = (cap > pos + TRUNC_RESERVE) ? (cap - pos - TRUNC_RESERVE) : 0;
+        if (len >= avail) {
+            truncated = true;
+            if (avail > 1) {
+                memcpy(buf + pos, str, avail - 1);
+                pos += avail - 1;
+                buf[pos] = '\0';
+            }
+        } else {
+            memcpy(buf + pos, str, len);
+            pos += len;
+            buf[pos] = '\0';
+        }
+    }
+
+    esp_err_t send(httpd_req_t *r) {
+        if (truncated) {
+            ESP_LOGW(TAG, "status page hit %u B cap — markup truncated, emitted truncation marker",
+                     (unsigned)cap);
+            size_t rem = (cap > pos) ? (cap - pos) : 0;
+            if (rem > 1) {
+                snprintf(buf + pos, rem,
+                         "<p class=warn>[page truncated &mdash; too much config to render]</p>"
+                         "</div></body></html>");
+                pos = strlen(buf);
+            }
+        }
+        httpd_resp_set_type(r, "text/html; charset=utf-8");
+        return httpd_resp_send(r, buf, HTTPD_RESP_USE_STRLEN);
+    }
+};
 
 static void send_html(httpd_req_t *r, const char *body)
 {
@@ -559,13 +639,13 @@ static esp_err_t handle_status(httpd_req_t *r)
     uint32_t bl_dropped   = blocklist_dropped_count();
     uint32_t bl_feed_fail = blocklist_feed_failures();
 
-    /* static: avoids stack overflow in httpd task. Sized with headroom for a
-     * fully-populated device (whitelist + ACL + rewrites + extra sources all
-     * at once) — page_appendf clamps silently on overflow (H1), which with the
-     * tabbed layout would truncate mid-markup and leave unbalanced <div>s, so
-     * the failure would present as dead tabs rather than an error (#60). */
-    static EXT_RAM_BSS_ATTR char page[16384];
-    int  n = 0;
+    /* static: avoids stack overflow in httpd task. Sized at 64 KB in PSRAM
+     * (#110 item 4) with headroom for a fully-populated device (whitelist +
+     * ACL + rewrites + all extra sources) so later tabs like Upstream DNS/DoT
+     * are never dropped. PageBuf guarantees balanced closing markup and emits a
+     * visible marker if truncation ever occurs. */
+    static EXT_RAM_BSS_ATTR char page[65536];
+    PageBuf pb(page, sizeof(page));
     char csrf[33] = "";
     web_auth_session_csrf(s_req_sid, csrf, sizeof(csrf));
     /* Hoisted here (was computed down in the pause section) so the head
@@ -577,7 +657,7 @@ static esp_err_t handle_status(httpd_req_t *r)
     snprintf(my_ip_s, sizeof(my_ip_s), "%u.%u.%u.%u",
              (unsigned)((me>>24)&0xFF),(unsigned)((me>>16)&0xFF),
              (unsigned)((me>>8)&0xFF),(unsigned)(me&0xFF));
-    page_appendf(page, sizeof(page), &n,
+    pb.appendf(
         "<!DOCTYPE html><html><head><meta charset=utf-8>"
         "<title>DNS Sinkhole</title>"
         /* No <meta refresh>: it dropped the URL fragment, so every reload
@@ -775,7 +855,7 @@ static esp_err_t handle_status(httpd_req_t *r)
      * wins over both — it's transient and self-clears. */
     const char *status_cls = loading ? "warn" : (paused ? "warn" : (degraded ? "warn" : "ok"));
     const char *status_txt = loading ? "Reloading" : (paused ? "Paused" : (degraded ? "Degraded" : "Active"));
-    page_appendf(page, sizeof(page), &n,
+    pb.appendf(
         "<div class=stats>"
         "<div class=stat><div class=val id=st-domains>%" PRIu32 "</div><div class=lbl>Domains</div></div>"
         "<div class=stat><div class=val id=st-queries>%" PRIu32 "</div><div class=lbl>Queries</div></div>"
@@ -790,14 +870,14 @@ static esp_err_t handle_status(httpd_req_t *r)
         status_cls, status_txt);
 
     if (dns_sink_setup_ap_active()) {
-        page_appendf(page, sizeof(page), &n,
+        pb.appendf(
             "<p style='background:#fff3cd;border:1px solid #ffe08a;border-radius:6px;"
             "padding:.6em 1em'><b>Setup AP active</b> — no Ethernet or Wi-Fi link yet. "
             "Join \"ESP32AdBlock-Setup\" (WPA2 passphrase printed on the USB console) and browse "
             "<b>https://192.168.4.1</b> to enter real Wi-Fi credentials in the Network tab; "
             "this AP shuts off automatically once a link comes up.</p>");
     }
-    page_appendf(page, sizeof(page), &n,
+    pb.appendf(
         "<h3>Actions</h3>"
         "<form method=post action=/reload><button>Reload blocklist</button></form><br>"
         /* (#105/#108 follow-up) Always rendered, `hidden` toggled by
@@ -808,7 +888,7 @@ static esp_err_t handle_status(httpd_req_t *r)
         "<form method=post action=/blocklist/stop id=stop-load-form%s>"
         "<button>Stop load</button></form><br>",
         loading ? "" : " hidden");
-    page_appendf(page, sizeof(page), &n,
+    pb.appendf(
         "<form method=post action=/pause>"
         "<input type=hidden name=on value=%d>"
         "<button>%s</button></form><br>"
@@ -842,7 +922,7 @@ static esp_err_t handle_status(httpd_req_t *r)
     {
         pause_view_t pv[PAUSE_MAX];
         uint32_t pn = pause_list(pv, PAUSE_MAX);
-        page_appendf(page, sizeof(page), &n,
+        pb.appendf(
             "<h3>Pause blocking for a while</h3>"
             "<form method=post action=/pause/timed>"
             "<input name=min type=number min=1 max=%u value=30 style='width:5em'> minutes "
@@ -868,7 +948,7 @@ static esp_err_t handle_status(httpd_req_t *r)
          * in the head script is delegated on `document`, so it CSRF-tags
          * these forms' actions even though renderPause() creates them via
          * innerHTML, same as any other form. */
-        page_appendf(page, sizeof(page), &n, "<div id=pause-active></div><script>renderPause([");
+        pb.appendf("<div id=pause-active></div><script>renderPause([");
         for (uint32_t i = 0; i < pn; i++) {
             char ipv[16];
             if (pv[i].ip == PAUSE_IP_ALL) {
@@ -878,10 +958,10 @@ static esp_err_t handle_status(httpd_req_t *r)
                     (unsigned)((pv[i].ip>>24)&0xFF),(unsigned)((pv[i].ip>>16)&0xFF),
                     (unsigned)((pv[i].ip>>8)&0xFF),(unsigned)(pv[i].ip&0xFF));
             }
-            page_appendf(page, sizeof(page), &n,
+            pb.appendf(
                 "%s{ip:'%s',remaining_s:%" PRIu32 "}", i ? "," : "", ipv, pv[i].remaining_s);
         }
-        page_appendf(page, sizeof(page), &n, "]);</script>");
+        pb.appendf("]);</script>");
     }
 
     /* Clock status (NTP). (#105/#108 follow-up) Single renderer, same fix as
@@ -893,31 +973,35 @@ static esp_err_t handle_status(httpd_req_t *r)
      * motivated the original wording lives in renderClock()'s own comment
      * now, not duplicated here). */
     {
-        page_appendf(page, sizeof(page), &n,
+        pb.appendf(
             "<p><small id=clock-status></small></p>"
             "<script>renderClock('%s','%s',%lld);</script>",
             timesync_state(), timesync_source(), (long long)time(NULL));
     }
-    page_appendf(page, sizeof(page), &n, "</div><div class='tab' id=tab-blocklist>");
+    pb.appendf("</div><div class='tab' id=tab-blocklist>");
 
     /* whitelist table */
     if (wl_n > 0) {
-        page_appendf(page, sizeof(page), &n,
+        pb.appendf(
             "<h3>Whitelist</h3><table>"
             "<tr><th>Domain</th><th>Action</th></tr>");
         static EXT_RAM_BSS_ATTR char wl[WHITELIST_MAX][64]; uint32_t cnt = WHITELIST_MAX;
         blocklist_whitelist_get(wl, &cnt);
-        for (uint32_t i = 0; i < cnt && n < (int)sizeof(page) - 256; i++) {
+        for (uint32_t i = 0; i < cnt; i++) {
+            if (!pb.has_room(256)) {
+                pb.mark_truncated();
+                break;
+            }
             char safe_text[384];
             html_escape(safe_text, sizeof(safe_text), wl[i]);
-            page_appendf(page, sizeof(page), &n,
+            pb.appendf(
                 "<tr><td>%s</td><td>"
                 "<form method=post action=/whitelist/remove>"
                 "<input type=hidden name=domain value=\"%s\">"
                 "<button>Remove</button></form></td></tr>",
                 safe_text, safe_text);
         }
-        page_appendf(page, sizeof(page), &n, "</table>");
+        pb.appendf("</table>");
     }
 
     /* Custom block rules (#14) */
@@ -926,7 +1010,7 @@ static esp_err_t handle_status(httpd_req_t *r)
         static EXT_RAM_BSS_ATTR char safe_cr[CUSTOM_RULES_CAP * 2 + 8];
         size_t clen = blocklist_custom_get(crules, sizeof(crules));
         html_escape(safe_cr, sizeof(safe_cr), crules);
-        page_appendf(page, sizeof(page), &n,
+        pb.appendf(
             "<h3>Custom Block Rules</h3>"
             "<form method=post action=/custom/rules>"
             "<textarea name=rules rows=5 cols=60 placeholder='One domain per line. Lines starting with # are comments."
@@ -939,7 +1023,7 @@ static esp_err_t handle_status(httpd_req_t *r)
     /* DNS rewrite table (#12) */
     {
         uint32_t rw_n = rewrite_count();
-        page_appendf(page, sizeof(page), &n,
+        pb.appendf(
             "<h3>Local hosts &amp; DNS rewrites</h3>"
             "<p><small>Static name → IP. A bare hostname (<code>printer</code>) or a "
             "domain (<code>nas.lan</code>); a domain also covers its subdomains. "
@@ -951,11 +1035,15 @@ static esp_err_t handle_status(httpd_req_t *r)
         if (rw_n > 0) {
             static EXT_RAM_BSS_ATTR char rw_domains[REWRITE_MAX][64]; static EXT_RAM_BSS_ATTR uint32_t rw_ips[REWRITE_MAX]; uint32_t rw_cnt = REWRITE_MAX;
             rewrite_list(rw_domains, rw_ips, &rw_cnt);
-            page_appendf(page, sizeof(page), &n, "<table><tr><th>Domain</th><th>IP</th><th>Action</th></tr>");
-            for (uint32_t i = 0; i < rw_cnt && n < (int)sizeof(page) - 256; i++) {
+            pb.appendf("<table><tr><th>Domain</th><th>IP</th><th>Action</th></tr>");
+            for (uint32_t i = 0; i < rw_cnt; i++) {
+                if (!pb.has_room(256)) {
+                    pb.mark_truncated();
+                    break;
+                }
                 char safe_d[128]; html_escape(safe_d, sizeof(safe_d), rw_domains[i]);
                 uint32_t ip = rw_ips[i];
-                page_appendf(page, sizeof(page), &n,
+                pb.appendf(
                     "<tr><td>%s</td><td>%u.%u.%u.%u</td><td>"
                     "<form method=post action=/rewrite/clear>"
                     "<input type=hidden name=domain value=\"%s\">"
@@ -965,23 +1053,27 @@ static esp_err_t handle_status(httpd_req_t *r)
                     (unsigned)((ip>>8)&0xFF),(unsigned)(ip&0xFF),
                     safe_d);
             }
-            page_appendf(page, sizeof(page), &n, "</table>");
+            pb.appendf("</table>");
         }
     }
 
     /* Blocklist sources section (#4, #9) */
-    page_appendf(page, sizeof(page), &n,
+    pb.appendf(
         "<h3>Blocklist Sources</h3>"
         "<table><tr><th>#</th><th>URL</th><th>Status</th><th>Action</th></tr>"
         "<tr><td>0 (primary)</td><td>%s</td><td class='ok'>enabled</td><td>built-in</td></tr>",
         BLOCKLIST_URL);
     int free_slot = -1;
-    for (int i = 0; i < BLOCKLIST_EXTRA_MAX && n < (int)sizeof(page) - 512; i++) {
+    for (int i = 0; i < BLOCKLIST_EXTRA_MAX; i++) {
+        if (!pb.has_room(512)) {
+            pb.mark_truncated();
+            break;
+        }
         char url[BLOCKLIST_URL_CAP]; blocklist_extra_url_get(i, url, sizeof(url));
         if (url[0]) {
             char safe_url[BLOCKLIST_URL_CAP * 2]; html_escape(safe_url, sizeof(safe_url), url);
             bool en = blocklist_extra_enabled_get(i);
-            page_appendf(page, sizeof(page), &n,
+            pb.appendf(
                 "<tr><td>%d</td><td>%s</td><td class='%s'>%s</td><td>"
                 "<form method=post action=/blocklist/url/toggle style='display:inline'>"
                 "<input type=hidden name=idx value=%d>"
@@ -993,7 +1085,7 @@ static esp_err_t handle_status(httpd_req_t *r)
                 i, en ? "Disable" : "Enable", i);
         } else {
             if (free_slot < 0) free_slot = i;
-            page_appendf(page, sizeof(page), &n,
+            pb.appendf(
                 "<tr><td>%d (empty)</td><td>"
                 "<form method=post action=/blocklist/url/set style='display:inline'>"
                 "<input type=hidden name=idx value=%d>"
@@ -1002,20 +1094,10 @@ static esp_err_t handle_status(httpd_req_t *r)
                 i + 1, i);
         }
     }
-    page_appendf(page, sizeof(page), &n, "</table>");
+    pb.appendf("</table>");
 
-    /* F11: this one gate has to cover everything from here to the closing
-     * markup — presets below, the overflow banner, the feed-failure line, the
-     * capacity note, and the whole Access/Network/Upstream tabs — measured
-     * 4.9-6.9 KB post-preset on a fully populated device. The old 2048 B
-     * reserve badly under-counted that and was reachable at ~8% of max config:
-     * page_appendf clamps silently (H1) on overflow, which with this tabbed
-     * layout truncates mid-markup and presents as dead tabs (#60) rather than
-     * a visible error. The banner/note gates further down are a second,
-     * tighter layer of the same guard: best-effort, not a proof nothing past
-     * them can ever clamp, but they turn "silent" into "visible" wherever they
-     * do catch it. */
-    if (n < (int)sizeof(page) - 7168) {
+    /* Presets dropdown + overflow text (#110 item 4: PageBuf tracks capacity) */
+    {
         /* F12: everything below except tif.medium is the lossless domains/ ->
          * wildcard/ FORMAT change — identical coverage under our suffix-walk
          * matching, just a smaller encoding of the same list. tif.medium is
@@ -1039,20 +1121,20 @@ static esp_err_t handle_status(httpd_req_t *r)
             { NSFW_URL,         "OISD NSFW (adult)",                  true  },
         };
         if (free_slot >= 0) {
-            page_appendf(page, sizeof(page), &n,
+            pb.appendf(
                 "<form method=post action=/blocklist/url/set>"
                 "<input type=hidden name=idx value=%d>"
                 "<select name=url><option value=''>hagezi preset&hellip;</option>", free_slot);
             for (size_t i = 0; i < sizeof(presets)/sizeof(presets[0]); i++) {
                 if (presets[i].full_url)
-                    page_appendf(page, sizeof(page), &n,
+                    pb.appendf(
                         "<option value='%s'>%s</option>", presets[i].ref, presets[i].label);
                 else
-                    page_appendf(page, sizeof(page), &n,
+                    pb.appendf(
                         "<option value='%s%s'>%s</option>",
                         HAGEZI_BASE, presets[i].ref, presets[i].label);
             }
-            page_appendf(page, sizeof(page), &n, "</select> <button>Add preset</button></form>");
+            pb.appendf("</select> <button>Add preset</button></form>");
         } else {
             /* F14: this dropdown is the only place any hagezi (or nsfw) URL
              * appears in the UI, and it used to vanish entirely once all extra
@@ -1061,64 +1143,51 @@ static esp_err_t handle_status(httpd_req_t *r)
              * with nowhere left to paste a replacement. Give the copyable
              * base URL + file names so removing a feed (table above) and
              * adding a smaller one doesn't need the README or GitHub open. */
-            page_appendf(page, sizeof(page), &n,
+            pb.appendf(
                 "<p><small>All %d extra source slots are full — remove one above, "
                 "then paste a preset URL: base <code>%s</code> + one of ",
                 BLOCKLIST_EXTRA_MAX, HAGEZI_BASE);
             bool first = true;
             for (size_t i = 0; i < sizeof(presets)/sizeof(presets[0]); i++) {
                 if (presets[i].full_url) continue;
-                page_appendf(page, sizeof(page), &n, "%s<code>%s</code>",
+                pb.appendf("%s<code>%s</code>",
                     first ? "" : ", ", presets[i].ref);
                 first = false;
             }
-            page_appendf(page, sizeof(page), &n,
+            pb.appendf(
                 ". Adult filtering: <code>%s</code>.</small></p>", NSFW_URL);
         }
-    } else {
-        page_mark_truncated(page, sizeof(page), &n);
     }
 
-    /* F11: second layer — banner + the new feed-failure line, guarded on
-     * their own so a squeeze here degrades to a visible marker rather than a
-     * silent clamp even if the outer 7168 reserve above ever proves optimistic. */
-    if (n < (int)sizeof(page) - 7168) {
-        if (bl_dropped > 0)
-            page_appendf(page, sizeof(page), &n,
-                "<p class=warn><b>&#9888; Last reload overflowed the %uk-entry buffer: "
-                "%" PRIu32 " entries dropped — blocking is incomplete.</b> "
-                "Remove a source or pick smaller lists.</p>",
-                (unsigned)(BLOCKLIST_CAPACITY / 1000), bl_dropped);
-        /* blocklist_feed_failures(): a feed that hard-failed to download is a
-         * different failure than capacity overflow above — entries it never
-         * got to attempt, not entries it fetched and then discarded. */
-        if (bl_feed_fail > 0)
-            page_appendf(page, sizeof(page), &n,
-                "<p class=warn>&#9888; %" PRIu32 " source feed(s) failed to download on "
-                "the last reload — the live list is missing their entries.</p>",
-                bl_feed_fail);
-    } else {
-        page_mark_truncated(page, sizeof(page), &n);
-    }
+    if (bl_dropped > 0)
+        pb.appendf(
+            "<p class=warn><b>&#9888; Last reload overflowed the %uk-entry buffer: "
+            "%" PRIu32 " entries dropped — blocking is incomplete.</b> "
+            "Remove a source or pick smaller lists.</p>",
+            (unsigned)(BLOCKLIST_CAPACITY / 1000), bl_dropped);
+    /* blocklist_feed_failures(): a feed that hard-failed to download is a
+     * different failure than capacity overflow above — entries it never
+     * got to attempt, not entries it fetched and then discarded. */
+    if (bl_feed_fail > 0)
+        pb.appendf(
+            "<p class=warn>&#9888; %" PRIu32 " source feed(s) failed to download on "
+            "the last reload — the live list is missing their entries.</p>",
+            bl_feed_fail);
 
-    if (n < (int)sizeof(page) - 6144) {
-        page_appendf(page, sizeof(page), &n,
-            "<p><small>After adding/removing a source, click <b>Reload blocklist</b> above. "
-            "Any http(s) list in plain, hosts, adblock or *.wildcard format works. All sources "
-            "combined are capped at %uk entries after dedup vs primary; OISD uses ~270k of that. "
-            "For hagezi use the <code>wildcard/</code> files, never <code>domains/</code>.</small></p>",
-            (unsigned)(BLOCKLIST_CAPACITY / 1000));
-    } else {
-        page_mark_truncated(page, sizeof(page), &n);
-    }
+    pb.appendf(
+        "<p><small>After adding/removing a source, click <b>Reload blocklist</b> above. "
+        "Any http(s) list in plain, hosts, adblock or *.wildcard format works. All sources "
+        "combined are capped at %uk entries after dedup vs primary; OISD uses ~270k of that. "
+        "For hagezi use the <code>wildcard/</code> files, never <code>domains/</code>.</small></p>",
+        (unsigned)(BLOCKLIST_CAPACITY / 1000));
 
-    page_appendf(page, sizeof(page), &n, "</div><div class='tab' id=tab-access>");
+    pb.appendf("</div><div class='tab' id=tab-access>");
 
     /* Client ACL section (#10) */
     {
         char acl_ips[ACL_MAX][20]; uint32_t acl_n = ACL_MAX;
         acl_list(acl_ips, &acl_n);
-        page_appendf(page, sizeof(page), &n,
+        pb.appendf(
             "<h3>Client Access Control</h3>"
             "<p><small>Empty = allow all. If any IP is listed, only those clients may resolve "
             "anything — the Ethernet fast path enforces this list too (#87), and hands any query "
@@ -1127,17 +1196,21 @@ static esp_err_t handle_status(httpd_req_t *r)
             "<input name=ip placeholder='192.168.x.x' size=18>"
             "<button>Add allowed client</button></form>");
         if (acl_n > 0) {
-            page_appendf(page, sizeof(page), &n, "<table><tr><th>Allowed client IP</th><th>Action</th></tr>");
-            for (uint32_t i = 0; i < acl_n && n < (int)sizeof(page) - 256; i++) {
+            pb.appendf("<table><tr><th>Allowed client IP</th><th>Action</th></tr>");
+            for (uint32_t i = 0; i < acl_n; i++) {
+            if (!pb.has_room(256)) {
+                pb.mark_truncated();
+                break;
+            }
                 char safe_ip[48]; html_escape(safe_ip, sizeof(safe_ip), acl_ips[i]);
-                page_appendf(page, sizeof(page), &n,
+                pb.appendf(
                     "<tr><td>%s</td><td>"
                     "<form method=post action=/acl/remove>"
                     "<input type=hidden name=ip value=\"%s\">"
                     "<button>Remove</button></form></td></tr>",
                     safe_ip, safe_ip);
             }
-            page_appendf(page, sizeof(page), &n, "</table>"
+            pb.appendf("</table>"
                 "<form method=post action=/acl/clear style='margin-top:.5em'>"
                 "<button>Clear all (allow everyone)</button></form>");
         }
@@ -1147,7 +1220,7 @@ static esp_err_t handle_status(httpd_req_t *r)
     {
         char byp_ips[BYPASS_MAX][20]; uint32_t byp_n = BYPASS_MAX;
         bypass_list(byp_ips, &byp_n);
-        page_appendf(page, sizeof(page), &n,
+        pb.appendf(
             "<h3>Per-Client Bypass</h3>"
             "<p><small>Listed clients always resolve unfiltered — no blocklist, no "
             "custom rules, applied the same way the timed pause is (delivery-time, "
@@ -1156,17 +1229,21 @@ static esp_err_t handle_status(httpd_req_t *r)
             "<input name=ip placeholder='192.168.x.x' size=18>"
             "<button>Add bypassed client</button></form>");
         if (byp_n > 0) {
-            page_appendf(page, sizeof(page), &n, "<table><tr><th>Bypassed client IP</th><th>Action</th></tr>");
-            for (uint32_t i = 0; i < byp_n && n < (int)sizeof(page) - 256; i++) {
+            pb.appendf("<table><tr><th>Bypassed client IP</th><th>Action</th></tr>");
+            for (uint32_t i = 0; i < byp_n; i++) {
+            if (!pb.has_room(256)) {
+                pb.mark_truncated();
+                break;
+            }
                 char safe_ip[48]; html_escape(safe_ip, sizeof(safe_ip), byp_ips[i]);
-                page_appendf(page, sizeof(page), &n,
+                pb.appendf(
                     "<tr><td>%s</td><td>"
                     "<form method=post action=/bypass/remove>"
                     "<input type=hidden name=ip value=\"%s\">"
                     "<button>Remove</button></form></td></tr>",
                     safe_ip, safe_ip);
             }
-            page_appendf(page, sizeof(page), &n, "</table>"
+            pb.appendf("</table>"
                 "<form method=post action=/bypass/clear style='margin-top:.5em'>"
                 "<button>Clear all</button></form>");
         }
@@ -1177,7 +1254,7 @@ static esp_err_t handle_status(httpd_req_t *r)
         char user[WEB_AUTH_USER_MAX + 1]; web_auth_get_user(user, sizeof(user));
         char safe_user[80]; html_escape(safe_user, sizeof(safe_user), user);
         char fp[96]; web_tls_fingerprint(fp, sizeof(fp));
-        page_appendf(page, sizeof(page), &n,
+        pb.appendf(
             "<h3>Admin account</h3>"
             "<p>Signed in as <b>%s</b>. Sessions expire after 30 min idle / 12 h.</p>"
             "<form method=post action=/auth/set>"
@@ -1192,13 +1269,13 @@ static esp_err_t handle_status(httpd_req_t *r)
             safe_user, safe_user, WEB_AUTH_USER_MAX, WEB_AUTH_PASS_MIN, fp);
     }
 
-    page_appendf(page, sizeof(page), &n, "</div><div class='tab' id=tab-network>");
+    pb.appendf("</div><div class='tab' id=tab-network>");
 
     /* Dual-WAN interface selection (#53) — only when both links exist (#49) */
     if (dns_sink_wifi_built() && dns_sink_eth_built()) {
         char iface[8]="", eth_ip[16]="", wifi_ip[16]="";
         dns_sink_net_status(iface, sizeof(iface), eth_ip, sizeof(eth_ip), wifi_ip, sizeof(wifi_ip));
-        page_appendf(page, sizeof(page), &n,
+        pb.appendf(
             "<h3>Network Interfaces</h3>"
             "<p>Ethernet: %s &nbsp; Wi-Fi: %s</p>"
             "<p><small>Both stay up together. This chooses which one egresses "
@@ -1234,7 +1311,7 @@ static esp_err_t handle_status(httpd_req_t *r)
             if (dhcp)
                 dns_sink_net_get_current(ifaces[i], ip, sizeof(ip), nm, sizeof(nm),
                                           gw, sizeof(gw), dns_ip, sizeof(dns_ip));
-            page_appendf(page, sizeof(page), &n,
+            pb.appendf(
                 "<h3>%s: DHCP / Static IP</h3>"
                 "<form method=post action=/net/%s/set>"
                 "<label><input type=radio name=mode value=dhcp%s> DHCP</label> "
@@ -1249,7 +1326,7 @@ static esp_err_t handle_status(httpd_req_t *r)
                 dhcp ? " checked" : "", dhcp ? "" : " checked",
                 ip, nm, gw, dns_ip);
         }
-        page_appendf(page, sizeof(page), &n,
+        pb.appendf(
             "<form method=post action=/reboot style='margin-top:.5em'>"
             "<button>Reboot now</button></form>");
     }
@@ -1257,7 +1334,7 @@ static esp_err_t handle_status(httpd_req_t *r)
     /* Firmware update (#1) — mirrors upstream's OTA Upload tab */
     {
         const esp_partition_t *running = esp_ota_get_running_partition();
-        page_appendf(page, sizeof(page), &n,
+        pb.appendf(
             "<h3>Firmware Update</h3>"
             "<p><small>Running from: <b>%s</b>. Pick a merged firmware .bin "
             "(built with idf.py build, or a release asset) and upload — no "
@@ -1284,7 +1361,7 @@ static esp_err_t handle_status(httpd_req_t *r)
     if (dns_sink_wifi_built()) {
         char ssid[33] = ""; dns_sink_wifi_get_ssid(ssid, sizeof(ssid));
         char safe_ssid[80]; html_escape(safe_ssid, sizeof(safe_ssid), ssid);
-        page_appendf(page, sizeof(page), &n,
+        pb.appendf(
             "<h3>Wi-Fi</h3>"
             "<p>Currently configured SSID: <b>%s</b></p>"
             "<button type=button onclick=\"wifiScan()\">Scan for networks</button>"
@@ -1327,7 +1404,7 @@ static esp_err_t handle_status(httpd_req_t *r)
             "</script>",
             safe_ssid);
     }
-    page_appendf(page, sizeof(page), &n, "</div><div class='tab' id=tab-upstream>");
+    pb.appendf("</div><div class='tab' id=tab-upstream>");
 
     /* DoT upstream settings (#5) */
     {
@@ -1339,7 +1416,7 @@ static esp_err_t handle_status(httpd_req_t *r)
         char safe_srv[sizeof(dot_srv) * 6], safe_sni[sizeof(dot_sni) * 6];
         html_escape(safe_srv, sizeof(safe_srv), dot_srv);
         html_escape(safe_sni, sizeof(safe_sni), dot_sni);
-        page_appendf(page, sizeof(page), &n,
+        pb.appendf(
             "<h3>Upstream DNS (DoT)</h3>"
             "<form method=post action=/dot/set>"
             "<label><input type=checkbox name=enabled value=1%s> Enable DNS-over-TLS</label><br>"
@@ -1352,7 +1429,7 @@ static esp_err_t handle_status(httpd_req_t *r)
         /* Split-horizon zones: names the router answers, never sent over DoT. */
         char zones[LOCALZONE_LIST_CAP]; localzone_get(zones, sizeof(zones));
         char safe_zones[LOCALZONE_LIST_CAP * 2]; html_escape(safe_zones, sizeof(safe_zones), zones);
-        page_appendf(page, sizeof(page), &n,
+        pb.appendf(
             "<h3>Local zones</h3>"
             "<p><small>Names in these zones &mdash; and any name with no dot at all &mdash; are "
             "resolved through your router in plain DNS even when DoT is on, because "
@@ -1364,14 +1441,10 @@ static esp_err_t handle_status(httpd_req_t *r)
             "<p><small>Default: <code>%s</code></small></p>",
             safe_zones, LOCALZONE_LIST_CAP - 1, localzone_default());
     }
-    page_appendf(page, sizeof(page), &n, "</div>");
+    pb.appendf("</div>");
 
-    page_appendf(page, sizeof(page), &n, "</body></html>");
-    if (n >= (int)sizeof(page) - 1)
-        ESP_LOGW(TAG, "status page hit the %u B cap — markup truncated, tabs "
-                      "may not render; raise page[]", (unsigned)sizeof(page));
-    send_html(r, page);
-    return ESP_OK;
+    pb.appendf("</body></html>");
+    return pb.send(r);
 }
 
 /* ── GET /metrics — JSON telemetry ───────────────────────────────── */
