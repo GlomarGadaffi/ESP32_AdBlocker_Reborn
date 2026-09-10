@@ -40,6 +40,24 @@ firmware's `esp_app_desc` version string comes from `version.txt`.
   now skip that check and are excluded from request coalescing, so no other
   client can ride or inherit an unfiltered answer. Found on hardware; every
   host-side check had passed.
+- **Five mutating web-UI handlers discarded a "refused" return and answered
+  303 anyway (#92).** `/whitelist/add`, `/rewrite/set`, `/acl/add`,
+  `/wifi/connect`, and `/blocklist/url/set` all ignored a `bool` meaning the
+  change was rejected — table full, unparsable IP, empty/oversize SSID, or a
+  bad slot index — and redirected to the dashboard as if it had succeeded,
+  with nothing actually changed and no indication why. Each now answers 400
+  with the specific reason instead.
+- **`POST /custom/rules` truncated a well-under-cap rule list because its
+  receive buffer was sized for the decoded text, not the percent-encoded wire
+  form (#91).** A ~250-line hosts-format submission comfortably under the
+  4000-character limit the page enforces could still exceed the old 4064-byte
+  buffer once newlines, `#`, and spaces became `%0D%0A`/`%23`/`+`-or-`%20` on
+  the wire — silently persisting a truncated, mid-line-cut rule list behind a
+  303 success. The receive buffer and its decode buffer are now sized for the
+  worst-case 3x encoding inflation and filled with a proper `content_len`
+  receive loop (matching `handle_ota_update`'s pattern) instead of a single
+  best-effort `recv()`; an over-cap decoded submission now answers 400 rather
+  than being silently cut.
 
 ## [1.3.0] — 2026-09-04
 

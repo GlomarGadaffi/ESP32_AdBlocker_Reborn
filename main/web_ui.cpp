@@ -426,8 +426,10 @@ static const char AUTH_PAGE_HEAD[] =
     "border:1px solid #ccc;padding:.6em;font-size:.85em}small{color:#555}</style></head><body>";
 
 /* Read a form body field into dst (URL-decoded). Body is the raw
- * application/x-www-form-urlencoded request. */
-static void form_field(const char *body, const char *key, char *dst, size_t cap)
+ * application/x-www-form-urlencoded request. Returns false if the key is
+ * absent, so a caller can tell "field missing" from "field submitted
+ * empty" — dst is set to "" either way. */
+static bool form_field(const char *body, const char *key, char *dst, size_t cap)
 {
     dst[0] = '\0';
     size_t kl = strlen(key);
@@ -438,10 +440,11 @@ static void form_field(const char *body, const char *key, char *dst, size_t cap)
             size_t l = 0;
             while (p[l] && p[l] != '&' && p[l] != '\r' && p[l] != '\n') l++;
             url_decode(dst, cap, p, l);
-            return;
+            return true;
         }
         p += kl;
     }
+    return false;
 }
 
 /* Read a form body field as a bounded integer. Leaves *out unchanged and
@@ -1892,7 +1895,12 @@ static esp_err_t handle_wl_add(httpd_req_t *r)
     char body[256] = {}; httpd_req_recv(r, body, sizeof(body) - 1);
     char decoded[256]; form_field(body, "domain", decoded, sizeof(decoded));
     char norm[256]; size_t nlen = domain_normalize(norm, sizeof(norm), decoded, strlen(decoded));
-    if (nlen > 0) blocklist_whitelist_add(norm);
+    if (nlen == 0) { httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST, "bad domain"); return ESP_FAIL; }
+    if (!blocklist_whitelist_add(norm)) {
+        httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST,
+            "Whitelist is full (max 64), or the domain is too long");
+        return ESP_FAIL;
+    }
     httpd_resp_set_status(r, "303 See Other");
     httpd_resp_set_hdr(r, "Location", "/");
     httpd_resp_send(r, nullptr, 0);
@@ -2111,7 +2119,10 @@ static esp_err_t handle_wifi_connect(httpd_req_t *r)
     char ssid[33] = "", pass[65] = "";
     form_field(body, "ssid", ssid, sizeof(ssid));
     form_field(body, "password", pass, sizeof(pass));
-    dns_sink_wifi_set_creds(ssid, pass);
+    if (!dns_sink_wifi_set_creds(ssid, pass)) {
+        httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST, "SSID must be 1-32 characters");
+        return ESP_FAIL;
+    }
     httpd_resp_set_status(r, "303 See Other"); httpd_resp_set_hdr(r, "Location", "/#network"); httpd_resp_send(r,nullptr,0); return ESP_OK;
 }
 
@@ -2120,7 +2131,11 @@ static esp_err_t handle_acl_add(httpd_req_t *r)
 {
     if (!csrf_ok(r)) { httpd_resp_send_err(r, HTTPD_403_FORBIDDEN, "CSRF"); return ESP_FAIL; }
     char body[64] = {}; httpd_req_recv(r, body, sizeof(body) - 1);
-    char ip[24]; form_field(body, "ip", ip, sizeof(ip)); acl_add(ip);
+    char ip[24]; form_field(body, "ip", ip, sizeof(ip));
+    if (!acl_add(ip)) {
+        httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST, "ACL is full (max 8), or the IP is unparsable");
+        return ESP_FAIL;
+    }
     httpd_resp_set_status(r, "303 See Other"); httpd_resp_set_hdr(r, "Location", "/"); httpd_resp_send(r,nullptr,0); return ESP_OK;
 }
 
@@ -2175,14 +2190,40 @@ static esp_err_t handle_custom_rules(httpd_req_t *r)
     if (!csrf_ok(r)) {
         httpd_resp_send_err(r, HTTPD_403_FORBIDDEN, "CSRF"); return ESP_FAIL;
     }
-    static EXT_RAM_BSS_ATTR char body[CUSTOM_RULES_CAP + 64];
-    int got = httpd_req_recv(r, body, sizeof(body) - 1);
-    if (got <= 0) { httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST, ""); return ESP_FAIL; }
-    body[got] = '\0';
-    /* url-decode into a temp buffer */
-    static EXT_RAM_BSS_ATTR char decoded[CUSTOM_RULES_CAP + 4];
-    form_field(body, "rules", decoded, sizeof(decoded));
-    blocklist_custom_set(decoded);
+    /* Sized for the wire form, not the decoded cap: the textarea arrives
+     * percent-encoded (every newline is 6 B for 2 decoded, '#'/space 3 B
+     * each), so CUSTOM_RULES_CAP decoded chars can cost up to 3x that on
+     * the wire. A single recv() isn't enough at this size either — loop to
+     * content_len like handle_ota_update does. (#91) */
+    static EXT_RAM_BSS_ATTR char body[CUSTOM_RULES_CAP * 3 + 64];
+    if (r->content_len <= 0) { httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST, ""); return ESP_FAIL; }
+    if (r->content_len > (int)sizeof(body) - 1) {
+        httpd_resp_send_err(r, HTTPD_413_CONTENT_TOO_LARGE, "");
+        return ESP_FAIL;
+    }
+    int total = 0;
+    while (total < r->content_len) {
+        int got = httpd_req_recv(r, body + total, r->content_len - total);
+        if (got <= 0) { httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST, ""); return ESP_FAIL; }
+        total += got;
+    }
+    body[total] = '\0';
+    /* url-decode into a temp buffer. Sized the same as body (not the smaller
+     * CUSTOM_RULES_CAP+4 decoded cap): decoding never grows a string, so
+     * matching body's wire-worst-case bound here is the only way to guarantee
+     * this can't itself truncate a submission that already fit in body. */
+    static EXT_RAM_BSS_ATTR char decoded[CUSTOM_RULES_CAP * 3 + 64];
+    if (!form_field(body, "rules", decoded, sizeof(decoded))) {
+        httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST, ""); return ESP_FAIL;
+    }
+    if (strlen(decoded) >= CUSTOM_RULES_CAP) {
+        httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST, "rules text exceeds the 4000-character cap");
+        return ESP_FAIL;
+    }
+    if (!blocklist_custom_set(decoded)) {
+        httpd_resp_send_err(r, HTTPD_500_INTERNAL_SERVER_ERROR, "");
+        return ESP_FAIL;
+    }
     httpd_resp_set_status(r, "303 See Other");
     httpd_resp_set_hdr(r, "Location", "/");
     httpd_resp_send(r, nullptr, 0);
@@ -2392,7 +2433,10 @@ static esp_err_t handle_rw_set(httpd_req_t *r)
     }
     uint32_t ipv4 = ((uint32_t)b0<<24)|((uint32_t)b1<<16)|((uint32_t)b2<<8)|(uint32_t)b3;
     if (ipv4 == 0) { httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST, "bad ip"); return ESP_FAIL; }
-    rewrite_set(norm, ipv4);
+    if (!rewrite_set(norm, ipv4)) {
+        httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST, "Rewrite table is full (max 48)");
+        return ESP_FAIL;
+    }
     httpd_resp_set_status(r, "303 See Other");
     httpd_resp_set_hdr(r, "Location", "/");
     httpd_resp_send(r, nullptr, 0);
@@ -2447,7 +2491,10 @@ static esp_err_t handle_bl_url_set(httpd_req_t *r)
             "empty url — use /blocklist/url/clear to remove a source");
         return ESP_FAIL;
     }
-    blocklist_extra_url_set(idx, decoded);
+    if (!blocklist_extra_url_set(idx, decoded)) {
+        httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST, "bad slot index or URL too long");
+        return ESP_FAIL;
+    }
     httpd_resp_set_status(r, "303 See Other");
     httpd_resp_set_hdr(r, "Location", "/");
     httpd_resp_send(r, nullptr, 0);
