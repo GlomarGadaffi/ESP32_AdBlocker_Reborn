@@ -1,4 +1,5 @@
 #include "timesync.h"
+#include "nvs_keys.h"     /* every NVS key this project owns, in one place (#111) */
 #include "esp_netif_sntp.h"
 #include "esp_sntp.h"
 #include "esp_log.h"
@@ -17,8 +18,8 @@
 
 static const char *TAG = "timesync";
 
-#define NVS_NS   "dns_sink"
-#define NVS_KEY  "clock_ep"          /* last-known-good epoch, seconds */
+#define NVS_NS   NVS_NS_MAIN
+#define NVS_KEY  NVSK_CLOCK_EPOCH    /* last-known-good epoch, seconds */
 
 /* Persist cadence while synced. 144 writes/day; an NVS page holds ~126 u32
  * entries, so this is roughly one page erase every 21h — nothing against

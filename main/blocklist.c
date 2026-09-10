@@ -1,4 +1,5 @@
 #include "blocklist.h"
+#include "nvs_keys.h"     /* every NVS key this project owns, in one place (#111) */
 #include "bl_table.h"
 #include "bl_rank.h"
 #include "domain.h"
@@ -316,7 +317,7 @@ bool blocklist_custom_set(const char *text)
 
     nvs_handle_t h;
     if (nvs_open(NVS_NS, NVS_READWRITE, &h) != ESP_OK) return false;
-    nvs_set_str(h, "custom_blk", text);
+    nvs_set_str(h, NVSK_CUSTOM_BLOCK, text);
     nvs_commit(h);
     nvs_close(h);
     xSemaphoreTake(s_wl_mutex, portMAX_DELAY);
@@ -336,7 +337,7 @@ size_t blocklist_custom_get(char *buf, size_t cap)
     nvs_handle_t h;
     if (nvs_open(NVS_NS, NVS_READONLY, &h) != ESP_OK) { buf[0]='\0'; return 0; }
     size_t len = cap;
-    if (nvs_get_str(h, "custom_blk", buf, &len) != ESP_OK) buf[0]='\0', len=0;
+    if (nvs_get_str(h, NVSK_CUSTOM_BLOCK, buf, &len) != ESP_OK) buf[0]='\0', len=0;
     nvs_close(h);
     return len > 0 ? len - 1 : 0;
 }
@@ -353,7 +354,7 @@ static void custom_load_nvs(void)
     nvs_handle_t h;
     if (nvs_open(NVS_NS, NVS_READONLY, &h) != ESP_OK) return;
     size_t len = sizeof(buf);
-    if (nvs_get_str(h, "custom_blk", buf, &len) == ESP_OK) {
+    if (nvs_get_str(h, NVSK_CUSTOM_BLOCK, buf, &len) == ESP_OK) {
         xSemaphoreTake(s_wl_mutex, portMAX_DELAY);
         custom_parse(buf);
         xSemaphoreGive(s_wl_mutex);
@@ -369,7 +370,7 @@ static void extra_urls_load_nvs(void)
     nvs_handle_t h;
     if (nvs_open(NVS_NS, NVS_READONLY, &h) != ESP_OK) return;
     for (int i = 0; i < BLOCKLIST_EXTRA_MAX; i++) {
-        char key[12]; snprintf(key, sizeof(key), "bl_url_%d", i);
+        char key[12]; snprintf(key, sizeof(key), NVSK_BL_URL_FMT, i);
         size_t len = BLOCKLIST_URL_CAP;
         if (nvs_get_str(h, key, s_extra_urls[i], &len) != ESP_OK)
             s_extra_urls[i][0] = '\0';
@@ -384,7 +385,7 @@ bool blocklist_extra_url_set(int idx, const char *url)
     snprintf(s_extra_urls[idx], BLOCKLIST_URL_CAP, "%s", url);
     nvs_handle_t h;
     if (nvs_open(NVS_NS, NVS_READWRITE, &h) != ESP_OK) return false;
-    char key[12]; snprintf(key, sizeof(key), "bl_url_%d", idx);
+    char key[12]; snprintf(key, sizeof(key), NVSK_BL_URL_FMT, idx);
     nvs_set_str(h, key, url);
     nvs_commit(h);
     nvs_close(h);
@@ -404,7 +405,7 @@ bool blocklist_extra_enabled_get(int idx)
     if (idx < 0 || idx >= BLOCKLIST_EXTRA_MAX) return false;
     nvs_handle_t h;
     if (nvs_open(NVS_NS, NVS_READONLY, &h) != ESP_OK) return true;
-    char key[10]; snprintf(key, sizeof(key), "bl_en_%d", idx);
+    char key[10]; snprintf(key, sizeof(key), NVSK_BL_EN_FMT, idx);
     uint8_t v = 1;
     esp_err_t err = nvs_get_u8(h, key, &v);
     nvs_close(h);
@@ -416,7 +417,7 @@ bool blocklist_extra_enabled_set(int idx, bool enabled)
     if (idx < 0 || idx >= BLOCKLIST_EXTRA_MAX) return false;
     nvs_handle_t h;
     if (nvs_open(NVS_NS, NVS_READWRITE, &h) != ESP_OK) return false;
-    char key[10]; snprintf(key, sizeof(key), "bl_en_%d", idx);
+    char key[10]; snprintf(key, sizeof(key), NVSK_BL_EN_FMT, idx);
     nvs_set_u8(h, key, enabled ? 1 : 0);
     nvs_commit(h);
     nvs_close(h);
@@ -577,7 +578,7 @@ static void wl_load_nvs(void)
     nvs_handle_t h;
     if (nvs_open(NVS_NS, NVS_READONLY, &h) != ESP_OK) return;
     for (uint32_t i = 0; i < WHITELIST_MAX && s_wl_count < WHITELIST_MAX; i++) {
-        char key[16]; snprintf(key, sizeof(key), "wl%" PRIu32, i);
+        char key[16]; snprintf(key, sizeof(key), NVSK_WHITELIST_FMT, i);
         size_t len = sizeof(s_whitelist[0]);
         if (nvs_get_str(h, key, s_whitelist[s_wl_count], &len) == ESP_OK)
             s_wl_count++;
@@ -596,11 +597,11 @@ static void wl_save_nvs(void)
      * them on every whitelist add/remove. Erase only the wl* key range instead,
      * so a shrinking list still drops its stale tail. */
     for (uint32_t i = 0; i < WHITELIST_MAX; i++) {
-        char key[16]; snprintf(key, sizeof(key), "wl%" PRIu32, i);
+        char key[16]; snprintf(key, sizeof(key), NVSK_WHITELIST_FMT, i);
         nvs_erase_key(h, key);
     }
     for (uint32_t i = 0; i < s_wl_count; i++) {
-        char key[16]; snprintf(key, sizeof(key), "wl%" PRIu32, i);
+        char key[16]; snprintf(key, sizeof(key), NVSK_WHITELIST_FMT, i);
         nvs_set_str(h, key, s_whitelist[i]);
     }
     nvs_commit(h);
@@ -613,7 +614,7 @@ static void paused_load_nvs(void)
     nvs_handle_t h;
     if (nvs_open(NVS_NS, NVS_READONLY, &h) != ESP_OK) return;
     uint8_t v = 0;
-    if (nvs_get_u8(h, "paused", &v) == ESP_OK)
+    if (nvs_get_u8(h, NVSK_PAUSED, &v) == ESP_OK)
         atomic_store_explicit(&s_paused, v != 0, memory_order_relaxed);
     nvs_close(h);
 }
@@ -1046,7 +1047,7 @@ void blocklist_set_paused(bool paused)
     blocklist_generation_bump();
     nvs_handle_t h;
     if (nvs_open(NVS_NS, NVS_READWRITE, &h) == ESP_OK) {
-        nvs_set_u8(h, "paused", paused ? 1 : 0);
+        nvs_set_u8(h, NVSK_PAUSED, paused ? 1 : 0);
         nvs_commit(h);
         nvs_close(h);
     }

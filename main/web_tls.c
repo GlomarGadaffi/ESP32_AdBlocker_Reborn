@@ -1,4 +1,5 @@
 #include "web_tls.h"
+#include "nvs_keys.h"     /* every NVS key this project owns, in one place (#111) */
 #include "esp_log.h"
 #include "esp_random.h"
 #include "esp_heap_caps.h"
@@ -18,10 +19,10 @@ static const char *TAG = "web_tls";
 /* Own namespace: the shared "dns_sink" namespace is the one blocklist.c warns
  * against erase_all()'ing; keeping TLS material apart also lets `cert-reset`
  * wipe exactly this and nothing else. */
-#define TLS_NVS_NS "web_tls"
-#define KEY_CRT    "crt_pem"
-#define KEY_KEY    "key_pem"
-#define KEY_FMT    "fmt"
+#define TLS_NVS_NS NVS_NS_WEB_TLS
+#define KEY_CRT    NVSK_TLS_CERT
+#define KEY_KEY    NVSK_TLS_KEY
+#define KEY_FMT    NVSK_TLS_FMT_VER
 /* Bump when the certificate's contents change in a way existing devices
  * must pick up (a stored cert from an older format is regenerated at boot).
  * 2: EKU serverAuth + IP SAN + ≤2-year validity (Apple trust rules). */

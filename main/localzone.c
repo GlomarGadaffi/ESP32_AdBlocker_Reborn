@@ -1,4 +1,5 @@
 #include "localzone.h"
+#include "nvs_keys.h"     /* every NVS key this project owns, in one place (#111) */
 #include "nvs.h"
 #include "esp_log.h"
 #include <string.h>
@@ -7,8 +8,8 @@
 #include <stdatomic.h>
 
 static const char *TAG = "localzone";
-#define NVS_NS  "dns_sink"
-#define NVS_KEY "local_zones"
+#define NVS_NS  NVS_NS_MAIN
+#define NVS_KEY NVSK_LOCAL_ZONES
 #define MAX_ZONES 16
 
 static const char DEFAULT_LIST[] = "lan,local,home,home.arpa,internal,localdomain,intranet";
