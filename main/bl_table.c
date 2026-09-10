@@ -1,4 +1,5 @@
 #include "bl_table.h"
+#include "domain.h"
 #include <string.h>
 #include <stdlib.h>
 
@@ -85,6 +86,7 @@ void bl_sort_records_inplace(uint8_t *a, uint32_t n)
     qsort(a, n, BL_REC_BYTES, cmp_rec);
 }
 
+/* Block-table dedup: collapses equal hashes and keeps the first record, since feed block entries carry no flags or data. */
 uint32_t bl_dedup_records(uint8_t *recs, uint32_t n)
 {
     if (n == 0) return 0;
@@ -98,8 +100,34 @@ uint32_t bl_dedup_records(uint8_t *recs, uint32_t n)
     return u;
 }
 
-bool bl_records_contain(const uint8_t *recs, uint32_t n, uint64_t h40)
+/* Exception-table dedup: collapses equal hashes and merges flags (important = OR, exact = AND) so result is feed-order independent. */
+uint32_t bl_dedup_exceptions(uint8_t *recs, uint8_t *flags, uint32_t n)
 {
+    if (n == 0) return 0;
+    uint32_t u = 1;
+    for (uint32_t i = 1; i < n; i++) {
+        const uint8_t *cur_rec = recs + (size_t)i * BL_REC_BYTES;
+        uint8_t *last_rec = recs + (size_t)(u - 1) * BL_REC_BYTES;
+        if (memcmp(cur_rec, last_rec, BL_REC_BYTES) == 0) {
+            uint8_t cur_f = flags[i];
+            uint8_t *last_f = &flags[u - 1];
+            bool imp = ((*last_f & RULE_IMPORTANT) || (cur_f & RULE_IMPORTANT));
+            bool ex  = ((*last_f & RULE_EXACT) && (cur_f & RULE_EXACT));
+            *last_f = (uint8_t)((imp ? RULE_IMPORTANT : 0) | (ex ? RULE_EXACT : 0));
+        } else {
+            if (u != i) {
+                memcpy(recs + (size_t)u * BL_REC_BYTES, cur_rec, BL_REC_BYTES);
+                flags[u] = flags[i];
+            }
+            u++;
+        }
+    }
+    return u;
+}
+
+int32_t IRAM_ATTR bl_records_find(const uint8_t *recs, uint32_t n, uint64_t h40)
+{
+    if (n == 0 || !recs) return -1;
     uint8_t key[BL_REC_BYTES];
     bl_rec_put(key, h40);
     uint32_t lo = 0, hi = n;
@@ -108,9 +136,14 @@ bool bl_records_contain(const uint8_t *recs, uint32_t n, uint64_t h40)
         int c = memcmp(recs + (size_t)mid * BL_REC_BYTES, key, BL_REC_BYTES);
         if      (c < 0) lo = mid + 1;
         else if (c > 0) hi = mid;
-        else            return true;
+        else            return (int32_t)mid;
     }
-    return false;
+    return -1;
+}
+
+bool IRAM_ATTR bl_records_contain(const uint8_t *recs, uint32_t n, uint64_t h40)
+{
+    return bl_records_find(recs, n, h40) >= 0;
 }
 
 /* Sort + dedup, with the tail-scratch geometry that keeps the live image

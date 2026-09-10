@@ -9,6 +9,7 @@
  * false-positive rate measured against theory.
  */
 #include "bl_table.h"
+#include "domain.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -369,6 +370,70 @@ static void test_edges(void)
     CHECK(z == 0, "dedup of empty must be 0");
 }
 
+
+static void test_exceptions(void)
+{
+    printf("exception dedup & binary search\n");
+
+    /* 1. bl_records_find on a sorted array */
+    uint64_t hashes[] = { 100, 250, 500, 1000, 5000 };
+    uint8_t recs[5 * BL_REC_BYTES];
+    for (int i = 0; i < 5; i++) {
+        bl_rec_put(recs + i * BL_REC_BYTES, hashes[i]);
+    }
+    for (int i = 0; i < 5; i++) {
+        int32_t found = bl_records_find(recs, 5, hashes[i]);
+        CHECK(found == i, "bl_records_find failed for hash %" PRIu64 " (expected %d, got %d)", hashes[i], i, (int)found);
+    }
+    CHECK(bl_records_find(recs, 5, 50) == -1, "bl_records_find found missing element before lo");
+    CHECK(bl_records_find(recs, 5, 300) == -1, "bl_records_find found missing element in middle");
+    CHECK(bl_records_find(recs, 5, 9999) == -1, "bl_records_find found missing element after hi");
+
+    /* 2. bl_dedup_exceptions flag merging: important = OR, exact = AND */
+    uint8_t test_recs[6 * BL_REC_BYTES];
+    uint8_t test_flags[6];
+
+    // domain 1: hash 100, flags 0 and RULE_IMPORTANT
+    bl_rec_put(test_recs + 0 * BL_REC_BYTES, 100); test_flags[0] = 0;
+    bl_rec_put(test_recs + 1 * BL_REC_BYTES, 100); test_flags[1] = RULE_IMPORTANT;
+
+    // domain 2: hash 200, flags RULE_EXACT and 0
+    bl_rec_put(test_recs + 2 * BL_REC_BYTES, 200); test_flags[2] = RULE_EXACT;
+    bl_rec_put(test_recs + 3 * BL_REC_BYTES, 200); test_flags[3] = 0;
+
+    // domain 3: hash 300, flags RULE_EXACT and RULE_EXACT | RULE_IMPORTANT
+    bl_rec_put(test_recs + 4 * BL_REC_BYTES, 300); test_flags[4] = RULE_EXACT;
+    bl_rec_put(test_recs + 5 * BL_REC_BYTES, 300); test_flags[5] = RULE_EXACT | RULE_IMPORTANT;
+
+    uint32_t u = bl_dedup_exceptions(test_recs, test_flags, 6);
+    CHECK(u == 3, "expected 3 unique exception entries, got %" PRIu32, u);
+
+    CHECK(bl_rec_get(test_recs + 0 * BL_REC_BYTES) == 100, "entry 0 hash mismatch");
+    CHECK(test_flags[0] == RULE_IMPORTANT, "entry 0 flag mismatch: expected IMPORTANT, got 0x%02x", test_flags[0]);
+
+    CHECK(bl_rec_get(test_recs + 1 * BL_REC_BYTES) == 200, "entry 1 hash mismatch");
+    CHECK(test_flags[1] == 0, "entry 1 flag mismatch: expected 0 (exact cleared by AND), got 0x%02x", test_flags[1]);
+
+    CHECK(bl_rec_get(test_recs + 2 * BL_REC_BYTES) == 300, "entry 2 hash mismatch");
+    CHECK(test_flags[2] == (RULE_EXACT | RULE_IMPORTANT), "entry 2 flag mismatch: expected EXACT|IMPORTANT, got 0x%02x", test_flags[2]);
+
+    /* 3. Order-independence test:
+     * feed A then feed B vs feed B then feed A must produce identical surviving entry */
+    uint8_t ab_recs[2 * BL_REC_BYTES], ab_flags[2];
+    bl_rec_put(ab_recs + 0 * BL_REC_BYTES, 999); ab_flags[0] = 0;
+    bl_rec_put(ab_recs + 1 * BL_REC_BYTES, 999); ab_flags[1] = RULE_IMPORTANT;
+    uint32_t ab_u = bl_dedup_exceptions(ab_recs, ab_flags, 2);
+
+    uint8_t ba_recs[2 * BL_REC_BYTES], ba_flags[2];
+    bl_rec_put(ba_recs + 0 * BL_REC_BYTES, 999); ba_flags[0] = RULE_IMPORTANT;
+    bl_rec_put(ba_recs + 1 * BL_REC_BYTES, 999); ba_flags[1] = 0;
+    uint32_t ba_u = bl_dedup_exceptions(ba_recs, ba_flags, 2);
+
+    CHECK(ab_u == 1 && ba_u == 1, "order independence count wrong");
+    CHECK(ab_flags[0] == ba_flags[0], "order independence failed: ab=0x%02x, ba=0x%02x", ab_flags[0], ba_flags[0]);
+    CHECK(ab_flags[0] == RULE_IMPORTANT, "order independence flag value wrong");
+}
+
 int main(void)
 {
     printf("bl_table host tests\n\n");
@@ -380,6 +445,7 @@ int main(void)
     test_large();
     test_image_valid();
     test_edges();
+    test_exceptions();
     printf("\n%s (%d failure%s)\n", g_fail ? "FAILED" : "PASSED", g_fail, g_fail == 1 ? "" : "s");
     return g_fail != 0;
 }

@@ -27,13 +27,12 @@
  * firmware, would be served as a garbage blocklist rather than rejected. Old
  * firmware now rejects a new file and new firmware rejects an old one, both
  * falling back to a download. */
-#define SD_MAGIC    0xB10C2840u
+/* Bumped from 0xB10C2840 for feed-level exceptions (#117 stage e-ii). */
+#define SD_MAGIC    0xB10C2841u
 
-/* The file is the live image verbatim: this header, then idx[65537], then the
- * 3-byte entries. That is exactly the byte layout a flash partition would hold,
- * so Wave 2 writes the same image with no further format change. The format
- * parameters are stored rather than assumed, so a future bucket/entry width is
- * detected and rejected precisely instead of needing another magic bump. */
+/* The file is the live image verbatim followed by the feed exception table:
+ * this header, then idx[65537], then the 3-byte entries, then exc_count * 5B
+ * exception records, then exc_count * 1B exception flags. */
 typedef struct {
     uint32_t magic;
     uint32_t count;
@@ -45,6 +44,8 @@ typedef struct {
      * truncated list comes back from a warm boot looking healthy (dropped=0, no
      * banner) and serves silently incomplete until the next successful reload. */
     uint32_t dropped;
+    uint32_t exc_count;     /* #117: feed exceptions stored after block image */
+    uint32_t exc_dropped;   /* #117: exceptions dropped when BL_EXCEPT_CAPACITY exceeded */
 } bl_sd_header_t;
 
 /* ── Flash-resident persistence (#70) ────────────────────────────────
@@ -56,13 +57,15 @@ typedef struct {
  * always erases-then-writes the OLDER (or invalid) slot, so a power cut
  * mid-write leaves the other slot's last-known-good image intact for the
  * next boot to fall back to. */
-#define BL_FLASH_MAGIC 0xB10CF1A5u
+#define BL_FLASH_MAGIC 0xB10CF1A6u  /* bumped for feed exceptions (#117 stage e-ii) */
 typedef struct {
     uint32_t magic;
     uint32_t seq;           /* monotonic; the higher VALID seq wins at load */
     uint32_t count;
     uint8_t  hash_bits, bucket_bits, entry_bytes, pad;
     uint32_t dropped;
+    uint32_t exc_count;     /* #117: feed exceptions stored after block image */
+    uint32_t exc_dropped;   /* #117: exceptions dropped when BL_EXCEPT_CAPACITY exceeded */
 } bl_flash_header_t;
 
 static const char *TAG = "blocklist";
@@ -101,11 +104,41 @@ static uint8_t *s_stage = NULL;
 static uint8_t *s_image = NULL;
 
 /* Atomic pointer read by dns_task (Core 1) and the L2 hook, written by
- * download_task (Core 0). NULL means every query fails open and forwards
- * upstream — set during the publish window while s_image is rewritten. */
-static _Atomic(const uint8_t *) s_live = NULL;
+ * download_task (Core 0). Points to an immutable snapshot descriptor bundling
+ * the block image and exception table (#117 stage e-ii). NULL means every query
+ * fails open during the publish window — treated as BL_DEFER_SNAPSHOT by the
+ * non-blocking L2 hook and unproven by the socket path. */
+static _Atomic(const bl_snapshot_t *) s_live = NULL;
 static _Atomic uint32_t    s_count   = 0;
 static _Atomic bool        s_loading = false;
+
+/* Ping-pong snapshot descriptors and exception buffers (#117 stage e-ii).
+ * Readers walk the currently published descriptor atomically without locks.
+ * Reloads/downloads build into the inactive slot and publish by a single
+ * atomic store to s_live. */
+static bl_snapshot_t s_snap_buf[2];
+static uint8_t s_snap_idx = 0;
+static uint8_t *s_exc_recs[2] = { NULL, NULL };
+static uint8_t *s_exc_flags[2] = { NULL, NULL };
+
+typedef struct __attribute__((packed)) {
+    uint8_t rec[BL_REC_BYTES];
+    uint8_t flag;
+} bl_exc_pair_t;
+static bl_exc_pair_t *s_exc_scratch = NULL;
+
+static _Atomic uint32_t s_exc_loaded = 0;
+static _Atomic uint32_t s_exc_dropped = 0;
+
+uint32_t blocklist_exceptions_loaded(void)  { return atomic_load(&s_exc_loaded); }
+uint32_t blocklist_exceptions_dropped(void) { return atomic_load(&s_exc_dropped); }
+
+static int cmp_exc_pair(const void *a, const void *b)
+{
+    return memcmp(((const bl_exc_pair_t *)a)->rec,
+                  ((const bl_exc_pair_t *)b)->rec,
+                  BL_REC_BYTES);
+}
 /* Bumped every time a reload swaps in a new live list (#85). The forward
  * cache stamps each entry with the generation live when it was stored;
  * a lookup against a stale generation is treated as a miss instead of
@@ -146,8 +179,9 @@ uint32_t blocklist_capacity(void) { return s_cap; }
  * exceeds what its partitions.csv provisioned for. */
 static uint32_t capacity_for_flash(size_t slot_bytes)
 {
-    if (slot_bytes <= sizeof(bl_flash_header_t) + BL_IDX_BYTES) return 0;
-    size_t avail = slot_bytes - sizeof(bl_flash_header_t) - BL_IDX_BYTES;
+    size_t reserved = sizeof(bl_flash_header_t) + BL_IDX_BYTES + (size_t)BL_EXCEPT_CAPACITY * (BL_REC_BYTES + 1);
+    if (slot_bytes <= reserved) return 0;
+    size_t avail = slot_bytes - reserved;
     return (uint32_t)(avail / BL_ENT_BYTES);
 }
 static _Atomic bool        s_stop_requested = false;  /* #1: mirrors upstream's xStop */
@@ -184,7 +218,6 @@ static _Atomic uint32_t    s_rejected_cosmetic         = 0;
 static _Atomic uint32_t    s_rejected_cidr             = 0;
 static _Atomic uint32_t    s_rejected_too_wide         = 0;
 static _Atomic uint32_t    s_rejected_important_block  = 0;
-static _Atomic uint32_t    s_exceptions_skipped        = 0;
 
 /* Mutex guarding the whitelist AND custom-rules arrays. Created first thing in
  * blocklist_init(), before any NVS loader runs, so every writer/reader below can
@@ -420,6 +453,10 @@ typedef struct {
     uint8_t  *buf;            /* staging records, BL_REC_BYTES each */
     uint32_t  cap;
     uint32_t  n;
+    uint8_t  *exc_recs;       /* staging exception records: BL_REC_BYTES each */
+    uint8_t  *exc_flags;      /* staging exception flags: 1 byte each */
+    uint32_t  exc_cap;        /* BL_EXCEPT_CAPACITY */
+    uint32_t  exc_n;          /* exceptions collected so far */
     uint32_t  rejected;       /* total, every reason */
     uint32_t  rejected_regex;
     uint32_t  rejected_wildcard;
@@ -428,7 +465,7 @@ typedef struct {
     uint32_t  rejected_cidr;
     uint32_t  rejected_too_wide;
     uint32_t  rejected_important_block;  /* #117: $important on a feed BLOCK rule */
-    uint32_t  exceptions_skipped;        /* #117: @@ rules seen, no table yet (e-ii) */
+    uint32_t  exceptions_dropped;        /* #117: dropped if exc_n exceeds BL_EXCEPT_CAPACITY */
     uint32_t  dropped;        /* lost to capacity (surfaced after load) */
     uint32_t  sorted_prefix;  /* buf[0..sorted_prefix) is sorted+deduped - every
                                * feed folded in so far, not just the primary;
@@ -475,9 +512,38 @@ static bool on_domain_line(const char *line, size_t len, void *ctx)
             continue;
         }
         if (r.kind == RULE_ALLOW) {
-            /* No feed exception table yet (#117 stage e-ii) — counted so the
-             * gap is visible rather than the line silently vanishing. */
-            lc->exceptions_skipped++;
+            char norm[256];
+            size_t nlen = domain_normalize(norm, sizeof(norm), r.tok, r.len);
+            if (nlen == 0 || domain_is_bare_tld(norm, nlen)) continue;
+
+            uint64_t h = bl_hash40(norm, nlen);
+            uint8_t key[BL_REC_BYTES];
+            bl_rec_put(key, h);
+
+            /* Extra-feed entry: check if already present in this reload's staging.
+             * Dedup merges flags: important = OR, exact = AND (#117). */
+            bool found = false;
+            for (uint32_t i = 0; i < lc->exc_n; i++) {
+                if (memcmp(lc->exc_recs + (size_t)i * BL_REC_BYTES, key, BL_REC_BYTES) == 0) {
+                    bool imp = (lc->exc_flags[i] & RULE_IMPORTANT) || (r.flags & RULE_IMPORTANT);
+                    bool ex  = (lc->exc_flags[i] & RULE_EXACT) && (r.flags & RULE_EXACT);
+                    lc->exc_flags[i] = (uint8_t)((imp ? RULE_IMPORTANT : 0) | (ex ? RULE_EXACT : 0));
+                    found = true;
+                    break;
+                }
+            }
+            if (found) continue;
+
+            if (lc->exc_n >= lc->exc_cap) {
+                lc->exceptions_dropped++;
+                ESP_LOGE(TAG, "Feed exception capacity exceeded (%" PRIu32 "/%" PRIu32 ") for %.*s",
+                         lc->exc_n + lc->exceptions_dropped, lc->exc_cap, (int)nlen, norm);
+                continue;
+            }
+
+            bl_rec_put(lc->exc_recs + (size_t)lc->exc_n * BL_REC_BYTES, h);
+            lc->exc_flags[lc->exc_n] = r.flags;
+            lc->exc_n++;
             continue;
         }
 
@@ -573,12 +639,24 @@ bool blocklist_init(void)
         (size_t)s_cap * BL_REC_BYTES, MALLOC_CAP_SPIRAM);
     s_image = (uint8_t *)heap_caps_malloc(
         BL_IMAGE_BYTES(s_cap), MALLOC_CAP_SPIRAM);
-    if (!s_stage || !s_image) {
+    s_exc_recs[0] = (uint8_t *)heap_caps_malloc(
+        (size_t)BL_EXCEPT_CAPACITY * BL_REC_BYTES, MALLOC_CAP_SPIRAM);
+    s_exc_recs[1] = (uint8_t *)heap_caps_malloc(
+        (size_t)BL_EXCEPT_CAPACITY * BL_REC_BYTES, MALLOC_CAP_SPIRAM);
+    s_exc_flags[0] = (uint8_t *)heap_caps_malloc(
+        BL_EXCEPT_CAPACITY, MALLOC_CAP_SPIRAM);
+    s_exc_flags[1] = (uint8_t *)heap_caps_malloc(
+        BL_EXCEPT_CAPACITY, MALLOC_CAP_SPIRAM);
+    s_exc_scratch = (bl_exc_pair_t *)heap_caps_malloc(
+        BL_EXCEPT_CAPACITY * sizeof(bl_exc_pair_t), MALLOC_CAP_SPIRAM);
+    if (!s_stage || !s_image || !s_exc_recs[0] || !s_exc_recs[1] ||
+        !s_exc_flags[0] || !s_exc_flags[1] || !s_exc_scratch) {
         ESP_LOGE(TAG, "PSRAM alloc failed: stage %" PRIu32 " B, image %" PRIu32 " B",
                  (uint32_t)((size_t)s_cap * BL_REC_BYTES),
                  (uint32_t)BL_IMAGE_BYTES(s_cap));
         return false;
     }
+    memset(s_snap_buf, 0, sizeof(s_snap_buf));
     /* An image with a zeroed index reads as empty from every bucket, so a
      * lookup landing here before the first list is published returns "not
      * blocked" rather than walking uninitialised offsets. s_live still gates
@@ -660,9 +738,30 @@ uint32_t blocklist_load(void)
     atomic_store(&s_loading, true);
     atomic_store_explicit(&s_stop_requested, false, memory_order_relaxed);
 
+    uint8_t next_idx = s_snap_idx ^ 1;
     /* Build in the staging buffer. s_image keeps serving the whole fetch and
      * the whole sort — nothing here touches it until the publish below. */
-    load_ctx_t lc = { .buf = s_stage, .cap = s_cap, .n = 0, .rejected = 0 };
+    load_ctx_t lc = {
+        .buf = s_stage,
+        .cap = s_cap,
+        .n = 0,
+        .exc_recs = s_exc_recs[next_idx],
+        .exc_flags = s_exc_flags[next_idx],
+        .exc_cap = BL_EXCEPT_CAPACITY,
+        .exc_n = 0,
+        .rejected = 0,
+        .rejected_regex = 0,
+        .rejected_wildcard = 0,
+        .rejected_modifier = 0,
+        .rejected_cosmetic = 0,
+        .rejected_cidr = 0,
+        .rejected_too_wide = 0,
+        .rejected_important_block = 0,
+        .exceptions_dropped = 0,
+        .dropped = 0,
+        .sorted_prefix = 0,
+        .deduped = 0,
+    };
 
     /* Accumulated locally and published only where s_dropped is: until then the
      * OLD list is still the live one, and the count that describes it must not
@@ -796,7 +895,6 @@ uint32_t blocklist_load(void)
     atomic_store(&s_rejected_cidr, lc.rejected_cidr);
     atomic_store(&s_rejected_too_wide, lc.rejected_too_wide);
     atomic_store(&s_rejected_important_block, lc.rejected_important_block);
-    atomic_store(&s_exceptions_skipped, lc.exceptions_skipped);
     if (feed_failures > 0)
         ESP_LOGE(TAG, "%" PRIu32 " extra feed(s) failed — the live list is missing whole sources",
                  feed_failures);
@@ -805,29 +903,35 @@ uint32_t blocklist_load(void)
                  "list is incomplete. Remove a source or switch to smaller lists "
                  "(hagezi wildcard/ variants, not domains/).",
                  lc.dropped, (unsigned)s_cap);
-    /* Publish.
-     *
-     * The sort happened entirely in s_stage, so the old list served the whole
-     * fetch AND the whole sort. What cannot be avoided is the conversion: the
-     * 5-byte records have to become 3-byte entries plus a bucket index, and the
-     * only buffer that can hold that result is s_image, which is live.
-     *
-     * So publishing goes degraded for one conversion pass (~50ms at full
-     * capacity), once per reload, i.e. every 4 hours. Queries fail OPEN during
-     * it — forwarded upstream and answered normally, just unfiltered.
-     *
-     * Be straight about this: it is a NEW cost. The 4-byte predecessor could
-     * pointer-swap two equal ping-pong buffers with no window at all on its
-     * common path, and only went degraded in one near-capacity corner. The
-     * window is the price of the bucket index — which is also what buys 3-byte
-     * entries, 40-bit hashes and ~4 probes. docs/blocklist-format.md has the
-     * alternatives and why a zero-copy swap does not fit in PSRAM.
-     *
-     * The null + yield ahead of the conversion is the same RCU quiescence the
-     * old degraded sort used (#45): a Core 1 reader that latched the pointer
-     * microseconds ago must finish its bucket search before we overwrite what
-     * it is reading. That search is a handful of probes inside one bucket;
-     * 2ms is a thousandfold margin. */
+    if (lc.exceptions_dropped > 0)
+        ESP_LOGE(TAG, "EXCEPTION CAPACITY EXCEEDED: %" PRIu32 " exceptions dropped (cap %u) — "
+                 "affected names fail closed. Vetoing snapshot.",
+                 lc.exceptions_dropped, (unsigned)lc.exc_cap);
+
+    uint32_t exc_unique = 0;
+    uint8_t feed_max_rank = 0;
+    if (lc.exc_n > 0) {
+        for (uint32_t i = 0; i < lc.exc_n; i++) {
+            memcpy(s_exc_scratch[i].rec, s_exc_recs[next_idx] + (size_t)i * BL_REC_BYTES, BL_REC_BYTES);
+            s_exc_scratch[i].flag = s_exc_flags[next_idx][i];
+        }
+        qsort(s_exc_scratch, lc.exc_n, sizeof(bl_exc_pair_t), cmp_exc_pair);
+        for (uint32_t i = 0; i < lc.exc_n; i++) {
+            memcpy(s_exc_recs[next_idx] + (size_t)i * BL_REC_BYTES, s_exc_scratch[i].rec, BL_REC_BYTES);
+            s_exc_flags[next_idx][i] = s_exc_scratch[i].flag;
+        }
+        exc_unique = bl_dedup_exceptions(s_exc_recs[next_idx], s_exc_flags[next_idx], lc.exc_n);
+        feed_max_rank = 1;
+        for (uint32_t i = 0; i < exc_unique; i++) {
+            if (s_exc_flags[next_idx][i] & RULE_IMPORTANT) {
+                feed_max_rank = 3;
+                break;
+            }
+        }
+        ESP_LOGI(TAG, "Feed exceptions: %" PRIu32 " loaded (deduped from %" PRIu32 "), max rank %u",
+                 exc_unique, lc.exc_n, (unsigned)feed_max_rank);
+    }
+
     uint32_t unique;
     if (lc.sorted_prefix == lc.n) {
         /* Every feed was folded in as it completed: already sorted and deduped. */
@@ -841,28 +945,41 @@ uint32_t blocklist_load(void)
         ESP_LOGI(TAG, "%" PRIu32 " dupes removed", lc.n - unique);
     }
 
+    s_snap_buf[next_idx] = (bl_snapshot_t){
+        .block_img = s_image,
+        .block_count = unique,
+        .exc_recs = s_exc_recs[next_idx],
+        .exc_flags = s_exc_flags[next_idx],
+        .exc_count = exc_unique,
+        .feed_max_rank = feed_max_rank,
+    };
+
     atomic_store_explicit(&s_live, NULL, memory_order_release);
     vTaskDelay(pdMS_TO_TICKS(2));
     bl_build_image(s_stage, unique, s_image);
     atomic_store_explicit(&s_count, unique, memory_order_relaxed);
-    atomic_store_explicit(&s_live, s_image, memory_order_release);
+    atomic_store(&s_exc_loaded, exc_unique);
+    atomic_store(&s_exc_dropped, lc.exceptions_dropped);
+    atomic_store_explicit(&s_live, &s_snap_buf[next_idx], memory_order_release);
+    s_snap_idx = next_idx;
     blocklist_generation_bump();  /* (#85) */
 
-    ESP_LOGI(TAG, "Blocklist live: %" PRIu32 " domains", unique);
+    ESP_LOGI(TAG, "Blocklist live: %" PRIu32 " domains, %" PRIu32 " exceptions", unique, exc_unique);
     atomic_store(&s_loading, false);
     reload_diff_vs_sd(s_stage, unique);   /* before the snapshot is overwritten */
 
-    /* A snapshot from a reload with a dead feed would come back at the next warm
-     * boot as the list, with no record that a source was missing. Keep the last
-     * good one — a slightly stale complete list beats a fresh incomplete one.
-     * (Capacity drops DO get saved: those are recorded in the header and
-     * restored by blocklist_load_sd, so they stay visible.) */
-    if (feed_failures == 0) {
+    /* A snapshot from a reload with a dead feed or overflowed exceptions would
+     * come back at the next warm boot as the list. Keep the last good one. (#117) */
+    if (feed_failures == 0 && lc.exceptions_dropped == 0) {
         blocklist_save_flash();   /* (#70) — every board; belt-and-suspenders with SD below */
         blocklist_save_sd();
     } else {
-        ESP_LOGW(TAG, "SD snapshot SKIPPED: %" PRIu32 " feed(s) failed this reload — keeping "
-                 "the previous good snapshot", feed_failures);
+        if (feed_failures > 0)
+            ESP_LOGW(TAG, "SD snapshot SKIPPED: %" PRIu32 " feed(s) failed this reload — keeping "
+                     "the previous good snapshot", feed_failures);
+        if (lc.exceptions_dropped > 0)
+            ESP_LOGE(TAG, "SD snapshot VETOED: %" PRIu32 " exception(s) dropped to capacity — keeping "
+                     "the previous good snapshot", lc.exceptions_dropped);
     }
     return unique;
 }
@@ -992,21 +1109,13 @@ static bool IRAM_ATTR wl_contains_locked(const char *domain, size_t len)
 
 /* ── Rank-ordered verdict (#117) ──────────────────────────────────────
  * The shared resolver every verdict path now goes through: bl_rank.c's
- * pure suffix walk, fed the feed block table + whitelist + custom rules
- * as rank_source_t probes. No feed exception table yet (#117 stage e-ii)
- * — a feed's @@ lines parse and are counted (on_domain_line's
- * exceptions_skipped) but have nowhere to be stored, so they cannot yet
- * change a verdict; only custom @@ rules and the whitelist can. */
+ * pure suffix walk, fed the feed block table + feed exception table +
+ * whitelist + custom rules as rank_source_t probes (#117 stage e-ii). */
 
-/* Probe: feed block table. ctx is the published image pointer, read once
- * by the caller before the walk starts (not re-read per probe call — a
- * mid-walk reload is caught by the snapshot-changed check in
- * blocklist_verdict_nb, not by this probe). Always rank 0: a FEED
- * $important block is downgraded to REJECT before it ever reaches this
- * table (rule_apply_feed_policy, called from on_domain_line), and a feed
- * can only ever produce a block in this stage. */
-static bool IRAM_ATTR feed_probe(void *ctx, const char *suffix, size_t len,
-                                  uint8_t depth, uint8_t *rank_out)
+/* Probe: feed block table. Always rank 0: a FEED block entry has no spare
+ * bit for $important (see issue #117 "PSRAM budget"). */
+static bool IRAM_ATTR feed_block_probe(void *ctx, const char *suffix, size_t len,
+                                       uint8_t depth, uint8_t *rank_out)
 {
     (void)depth;
     const uint8_t *img = (const uint8_t *)ctx;
@@ -1016,16 +1125,29 @@ static bool IRAM_ATTR feed_probe(void *ctx, const char *suffix, size_t len,
     return true;
 }
 
+/* Probe: feed exception table (#117 stage e-ii). Binary-searched in PSRAM;
+ * returns rank 1 (ALLOW) or rank 3 (ALLOW + $important). Exact-only entries
+ * (RULE_EXACT) participate only at depth 0. */
+static bool IRAM_ATTR feed_exc_probe(void *ctx, const char *suffix, size_t len,
+                                     uint8_t depth, uint8_t *rank_out)
+{
+    const bl_snapshot_t *snap = (const bl_snapshot_t *)ctx;
+    if (!snap || snap->exc_count == 0) return false;
+    int32_t idx = bl_records_find(snap->exc_recs, snap->exc_count, bl_hash40(suffix, len));
+    if (idx < 0) return false;
+    uint8_t flags = snap->exc_flags[idx];
+    if (!rank_rule_applies(flags, depth)) return false;
+    *rank_out = rule_rank(RULE_ALLOW, flags);
+    return true;
+}
+
 /* Probe: NVS whitelist. Caller holds s_wl_mutex for the whole walk — this
- * does not take it. Always rank 1 (ALLOW), sub-inclusive (flags=0, never
- * RULE_EXACT): a whitelist entry unblocks its whole subtree, matching
- * today's wl_contains_locked-inside-the-suffix-walk behaviour exactly —
- * see the "BEHAVIOUR CHANGE: the whitelist becomes rank-dominant" note in
- * #117 for why a feed block under a whitelisted parent now loses. */
+ * does not take it. Always rank 1 (ALLOW), sub-inclusive. */
 static bool IRAM_ATTR wl_probe_locked(void *ctx, const char *suffix, size_t len,
                                        uint8_t depth, uint8_t *rank_out)
 {
     (void)ctx; (void)depth;
+    if (!s_wl_count) return false;
     if (!wl_contains_locked(suffix, len)) return false;
     *rank_out = 1;
     return true;
@@ -1039,6 +1161,7 @@ static bool IRAM_ATTR custom_probe_locked(void *ctx, const char *suffix, size_t 
                                            uint8_t depth, uint8_t *rank_out)
 {
     (void)ctx;
+    if (!s_custom_count) return false;
     bool found = false;
     uint8_t best = 0;
     for (uint32_t i = 0; i < s_custom_count; i++) {
@@ -1055,34 +1178,38 @@ static bool IRAM_ATTR custom_probe_locked(void *ctx, const char *suffix, size_t 
     return true;
 }
 
-/* Socket path: bounded ~2ms take on the small tables (whitelist + custom
- * rules share one lock, one take for the whole walk — strictly LESS
- * contention than the old is_blocked_impl()'s per-suffix-level wl_check
- * take). A busy take fails open: NO_MATCH with .unproven set,
- * so the caller forwards the query without caching the answer — the same
- * #99-class fail-open contract the old per-caller whitelist checks used
- * to have, now expressed once instead of independently per caller. */
+/* Socket path: bounded ~2ms take on the small tables. A busy take or NULL
+ * snapshot fails open: NO_MATCH with .unproven set, so the caller forwards
+ * the query without caching the answer (#117). */
 bl_verdict_t blocklist_verdict(const char *name, size_t len)
 {
     bl_verdict_t v = { .state = BL_NO_MATCH, .rank = 0, .unproven = 0, .src = 0xFF, .depth = 0 };
+    if (!name || len == 0) return v;
     if (atomic_load_explicit(&s_paused, memory_order_relaxed)) return v;
 
-    const uint8_t *img = atomic_load_explicit(&s_live, memory_order_acquire);
+    const bl_snapshot_t *snap = atomic_load_explicit(&s_live, memory_order_acquire);
+    if (!snap) {
+        /* NULL during the ~2ms republish quiescence: query fails open and forwards
+         * upstream, but record unproven = 1 rather than claiming a proven NO_MATCH (#117). */
+        v.unproven = 1;
+        return v;
+    }
 
     if (xSemaphoreTake(s_wl_mutex, pdMS_TO_TICKS(2)) != pdTRUE) {
         v.unproven = 1;
         return v;   /* fail open: forward, don't cache — caller's job */
     }
 
-    rank_source_t srcs[3];
-    size_t n = 0;
-    srcs[n++] = (rank_source_t){ .probe = feed_probe, .ctx = (void *)img, .max_rank = 0 };
-    srcs[n++] = (rank_source_t){ .probe = wl_probe_locked, .ctx = NULL,
-                                  .max_rank = s_wl_count ? 1 : 0 };
-    srcs[n++] = (rank_source_t){ .probe = custom_probe_locked, .ctx = NULL,
-                                  .max_rank = atomic_load_explicit(&s_custom_max_rank, memory_order_relaxed) };
+    rank_source_t srcs[4];
+    srcs[0] = (rank_source_t){ .probe = feed_block_probe, .ctx = (void *)snap->block_img, .max_rank = 0 };
+    srcs[1] = (rank_source_t){ .probe = feed_exc_probe,   .ctx = (void *)snap,
+                               .max_rank = snap->feed_max_rank };
+    srcs[2] = (rank_source_t){ .probe = wl_probe_locked,  .ctx = NULL,
+                               .max_rank = s_wl_count ? 1 : 0 };
+    srcs[3] = (rank_source_t){ .probe = custom_probe_locked, .ctx = NULL,
+                               .max_rank = atomic_load_explicit(&s_custom_max_rank, memory_order_relaxed) };
 
-    v = bl_rank_resolve(name, len, srcs, n);
+    v = bl_rank_resolve(name, len, srcs, 4);
     xSemaphoreGive(s_wl_mutex);
     return v;
 }
@@ -1090,63 +1217,48 @@ bl_verdict_t blocklist_verdict(const char *name, size_t len)
 /* L2 hook: never blocks. Returns 1 with *out filled (a proven verdict —
  * the hook may act on it); BL_DEFER_LOCK_BUSY or BL_DEFER_SNAPSHOT means
  * the hook must defer (hand the frame to lwIP) because this could not be
- * proven without stalling — distinguished so the caller can count each
- * reason separately (dns_sink.cpp's l2_defer_lock_busy / l2_defer_snapshot).
- * Both values are negative, so a caller that only cares "must I defer" can
- * still just test `< 0`.
- *
- * Issue #117 §5's literal defer condition only defers "if the zero-wait
- * take fails AND an allow-capable table is non-empty" — which would mean
- * reading s_wl_count, or an ALLOW-rule count for the custom table, WITHOUT
- * the lock, since the take already failed. That is exactly the wrong
- * moment to trust an unlocked read: the one busy window is precisely when
- * a writer might be flipping
- * one of those counts 0 -> 1, and a stale "0" read right then would walk
- * feed-only and block a name someone just unblocked — one wrong verdict
- * per first-allow-rule, reproducible with a single client. Deferring
- * unconditionally on ANY failed take closes that race. s_wl_mutex guards
- * ONLY the whitelist and custom-rules arrays, so "the take is busy" is
- * already synonymous with "an admin write to one of them is in flight" —
- * the cost is one fast-path miss per query during that window, which is
- * not a steady state. */
+ * proven without stalling. */
 int IRAM_ATTR blocklist_verdict_nb(const char *name, size_t len, bl_verdict_t *out)
 {
     *out = (bl_verdict_t){ .state = BL_NO_MATCH, .rank = 0, .unproven = 0, .src = 0xFF, .depth = 0 };
+    if (!name || len == 0) return 1;
     if (atomic_load_explicit(&s_paused, memory_order_relaxed)) return 1;
 
-    const uint8_t *img = atomic_load_explicit(&s_live, memory_order_acquire);
+    const bl_snapshot_t *snap = atomic_load_explicit(&s_live, memory_order_acquire);
+    if (!snap) return BL_DEFER_SNAPSHOT;  /* Close NULL-window gap (#117) */
 
-    if (xSemaphoreTake(s_wl_mutex, 0) != pdTRUE) return BL_DEFER_LOCK_BUSY;   /* see comment above: never guess */
+    if (xSemaphoreTake(s_wl_mutex, 0) != pdTRUE) return BL_DEFER_LOCK_BUSY;
 
-    rank_source_t srcs[3];
-    size_t n = 0;
-    srcs[n++] = (rank_source_t){ .probe = feed_probe, .ctx = (void *)img, .max_rank = 0 };
-    srcs[n++] = (rank_source_t){ .probe = wl_probe_locked, .ctx = NULL,
-                                  .max_rank = s_wl_count ? 1 : 0 };
-    srcs[n++] = (rank_source_t){ .probe = custom_probe_locked, .ctx = NULL,
-                                  .max_rank = atomic_load_explicit(&s_custom_max_rank, memory_order_relaxed) };
+    rank_source_t srcs[4];
+    srcs[0] = (rank_source_t){ .probe = feed_block_probe, .ctx = (void *)snap->block_img, .max_rank = 0 };
+    srcs[1] = (rank_source_t){ .probe = feed_exc_probe,   .ctx = (void *)snap,
+                               .max_rank = snap->feed_max_rank };
+    srcs[2] = (rank_source_t){ .probe = wl_probe_locked,  .ctx = NULL,
+                               .max_rank = s_wl_count ? 1 : 0 };
+    srcs[3] = (rank_source_t){ .probe = custom_probe_locked, .ctx = NULL,
+                               .max_rank = atomic_load_explicit(&s_custom_max_rank, memory_order_relaxed) };
 
-    *out = bl_rank_resolve(name, len, srcs, n);
+    *out = bl_rank_resolve(name, len, srcs, 4);
     xSemaphoreGive(s_wl_mutex);
 
     /* Defer condition 3 (#117 §5): a reload published underneath this
-     * walk. The image pointer read above could be stale by the time the
+     * walk. The snapshot pointer read above could be stale by the time the
      * walk finished — re-read and compare rather than trust it. */
-    if (atomic_load_explicit(&s_live, memory_order_acquire) != img) return BL_DEFER_SNAPSHOT;
+    if (atomic_load_explicit(&s_live, memory_order_acquire) != snap) return BL_DEFER_SNAPSHOT;
     return 1;
 }
 
 /* Human-readable label for a bl_verdict_t.src (#103, #117) — POST /check
  * and the query log, reporting only, never precedence law. Indices match
  * the srcs[] construction order in blocklist_verdict{,_nb}() above
- * (feed, whitelist, custom) — the two must be kept in sync; there's
- * nothing else tying them together. */
+ * (feed block, feed exception, whitelist, custom). */
 const char *blocklist_verdict_src_name(uint8_t src)
 {
     switch (src) {
         case 0:  return "feed";
-        case 1:  return "whitelist";
-        case 2:  return "custom";
+        case 1:  return "feed_exception";
+        case 2:  return "whitelist";
+        case 3:  return "custom";
         default: return "none";
     }
 }
@@ -1220,6 +1332,11 @@ bool blocklist_load_sd(void)
         s_sd_status = "bad-count";
         fclose(f); return false;
     }
+    if (hdr.exc_count > BL_EXCEPT_CAPACITY) {
+        ESP_LOGW(TAG, "SD blocklist: bad exc_count %" PRIu32, hdr.exc_count);
+        s_sd_status = "bad-count";
+        fclose(f); return false;
+    }
 
     /* Read via a DRAM bounce buffer — same pattern as blocklist_save_sd, avoids
      * handing the SDSPI/FATFS path a single huge PSRAM-destined read. The file
@@ -1234,44 +1351,64 @@ bool blocklist_load_sd(void)
         memcpy(s_image + done, chunk, r);
         done += r;
     }
-    fclose(f);
     if (done != total) {
         ESP_LOGW(TAG, "SD blocklist: short read %" PRIu32 "/%" PRIu32,
                  (uint32_t)done, (uint32_t)total);
         s_sd_status = "short-read";
+        fclose(f);
         return false;
     }
-    /* The bounds bl_image_contains uses come out of this file, so a partial
-     * write or bit rot that leaves the header intact could hand the L2 RX hook
-     * a bucket range of 0..0xFFFFFFFF and send it gigabytes past PSRAM on every
-     * query — a crash loop that survives reboots, because the bad file does.
-     * The old 32-bit format could not fail this way: its search bounds came
-     * from a validated count, so corrupt data only ever meant a wrong verdict.
-     * One 65k-comparison pass at boot buys that immunity back. */
+
     if (!bl_image_valid(s_image, hdr.count)) {
         ESP_LOGW(TAG, "SD blocklist: index failed validation (corrupt snapshot) — "
                  "refusing and falling back to a download");
         s_sd_status = "invalid-index";
+        fclose(f);
         return false;
     }
 
-    /* Restore the truncation state with the data, before the release-store that
-     * makes the image visible: a reader that sees this list must also see how
-     * incomplete it is. Without this a truncated snapshot came back from a warm
-     * boot reading dropped=0 and served silently short until the next reload.
-     * s_feed_failures stays 0 by construction — blocklist_load refuses to write
-     * a snapshot from a reload where any feed hard-failed. */
+    if (hdr.exc_count > 0) {
+        size_t recs_bytes = (size_t)hdr.exc_count * BL_REC_BYTES;
+        if (fread(s_exc_recs[0], 1, recs_bytes, f) != recs_bytes ||
+            fread(s_exc_flags[0], 1, hdr.exc_count, f) != hdr.exc_count) {
+            ESP_LOGW(TAG, "SD blocklist: short read on exceptions");
+            s_sd_status = "short-read";
+            fclose(f);
+            return false;
+        }
+    }
+    fclose(f);
+
+    uint8_t feed_max_rank = 0;
+    if (hdr.exc_count > 0) {
+        feed_max_rank = 1;
+        for (uint32_t i = 0; i < hdr.exc_count; i++) {
+            if (s_exc_flags[0][i] & RULE_IMPORTANT) {
+                feed_max_rank = 3;
+                break;
+            }
+        }
+    }
+
+    s_snap_buf[0] = (bl_snapshot_t){
+        .block_img = s_image,
+        .block_count = hdr.count,
+        .exc_recs = s_exc_recs[0],
+        .exc_flags = s_exc_flags[0],
+        .exc_count = hdr.exc_count,
+        .feed_max_rank = feed_max_rank,
+    };
+    s_snap_idx = 0;
+
     atomic_store_explicit(&s_count, hdr.count, memory_order_relaxed);
     atomic_store(&s_dropped, hdr.dropped);
-    atomic_store_explicit(&s_live, s_image, memory_order_release);
-    /* (#70) Was missing here — harmless only because nothing raced it in
-     * practice (this ran at boot, before the forward cache had any entries to
-     * go stale). blocklist_load_flash() below now runs at the same point in
-     * boot on every board, so both publish paths bump it, not just the
-     * network-reload one. */
+    atomic_store(&s_exc_loaded, hdr.exc_count);
+    atomic_store(&s_exc_dropped, hdr.exc_dropped);
+    atomic_store_explicit(&s_live, &s_snap_buf[0], memory_order_release);
     blocklist_generation_bump();
     s_sd_status = "loaded";
-    ESP_LOGI(TAG, "SD blocklist loaded: %" PRIu32 " domains (instant)", hdr.count);
+    ESP_LOGI(TAG, "SD blocklist loaded: %" PRIu32 " domains, %" PRIu32 " exceptions (instant)",
+             hdr.count, hdr.exc_count);
     if (hdr.dropped > 0)
         ESP_LOGW(TAG, "Snapshot was TRUNCATED when written: %" PRIu32 " entries had been "
                  "dropped — this warm-boot list is INCOMPLETE until the next reload",
@@ -1281,11 +1418,12 @@ bool blocklist_load_sd(void)
 
 void blocklist_save_sd(void)
 {
-    uint32_t n = atomic_load(&s_count);
-    const uint8_t *img = atomic_load_explicit(&s_live, memory_order_acquire);
-    if (!img || n == 0) return;
+    const bl_snapshot_t *snap = atomic_load_explicit(&s_live, memory_order_acquire);
+    if (!snap || snap->block_count == 0) return;
+    uint32_t n = snap->block_count;
 
-    ESP_LOGI(TAG, "SD save: opening %s for %" PRIu32 " domains", SD_BL_PATH, n);
+    ESP_LOGI(TAG, "SD save: opening %s for %" PRIu32 " domains, %" PRIu32 " exceptions",
+             SD_BL_PATH, n, snap->exc_count);
     FILE *f = fopen(SD_BL_PATH, "wb");
     if (!f) {
         ESP_LOGW(TAG, "SD blocklist: can't open for write (errno=%d) — no card mounted?", errno);
@@ -1293,26 +1431,33 @@ void blocklist_save_sd(void)
         return;
     }
 
-    /* Carry the drop count into the file: the image alone cannot say whether it
-     * is the whole list, and the next warm boot serves this file before any
-     * download runs (see blocklist_load_sd). */
     uint32_t dropped = atomic_load(&s_dropped);
+    uint32_t exc_dropped = atomic_load(&s_exc_dropped);
     bl_sd_header_t hdr = { .magic = SD_MAGIC, .count = n,
                            .hash_bits = BL_HASH_BITS, .bucket_bits = BL_BUCKET_BITS,
-                           .entry_bytes = BL_ENT_BYTES, .pad = 0, .dropped = dropped };
+                           .entry_bytes = BL_ENT_BYTES, .pad = 0, .dropped = dropped,
+                           .exc_count = snap->exc_count, .exc_dropped = exc_dropped };
     fwrite(&hdr, sizeof(hdr), 1, f);
 
-    /* Write in chunks from a small bounce buffer — avoids handing the
-     * SDSPI/FATFS path a single huge PSRAM-sourced write. */
-    static EXT_RAM_BSS_ATTR uint8_t chunk[4096];   /* SD path only — cold */
+    /* Write in chunks from a small bounce buffer */
+    static EXT_RAM_BSS_ATTR uint8_t chunk[4096];
     size_t total = BL_IMAGE_BYTES(n), written = 0;
     while (written < total) {
         size_t batch = total - written;
         if (batch > sizeof(chunk)) batch = sizeof(chunk);
-        memcpy(chunk, img + written, batch);
+        memcpy(chunk, snap->block_img + written, batch);
         size_t w = fwrite(chunk, 1, batch, f);
         if (w != batch) { ESP_LOGW(TAG, "SD write stalled at %u", (unsigned)(written + w)); break; }
         written += batch;
+    }
+
+    if (written == total && snap->exc_count > 0) {
+        size_t recs_bytes = (size_t)snap->exc_count * BL_REC_BYTES;
+        size_t w1 = fwrite(snap->exc_recs, 1, recs_bytes, f);
+        size_t w2 = fwrite(snap->exc_flags, 1, snap->exc_count, f);
+        if (w1 != recs_bytes || w2 != snap->exc_count) {
+            ESP_LOGW(TAG, "SD write stalled on exceptions");
+        }
     }
     fflush(f);
     fclose(f);
@@ -1344,7 +1489,8 @@ static bool flash_partitions_find(const esp_partition_t **out_a, const esp_parti
 static bool flash_header_valid(const bl_flash_header_t *hdr)
 {
     return hdr->hash_bits == BL_HASH_BITS && hdr->bucket_bits == BL_BUCKET_BITS &&
-           hdr->entry_bytes == BL_ENT_BYTES && hdr->count > 0 && hdr->count <= s_cap;
+           hdr->entry_bytes == BL_ENT_BYTES && hdr->count > 0 && hdr->count <= s_cap &&
+           hdr->exc_count <= BL_EXCEPT_CAPACITY;
 }
 
 /* Attempt to load and publish from one header-validated slot. Returns false
@@ -1353,10 +1499,6 @@ static bool flash_header_valid(const bl_flash_header_t *hdr)
  * this is the actual power-loss guarantee, not just "trust the newer seq". */
 static bool flash_try_load_slot(const esp_partition_t *pick, const bl_flash_header_t *hdr)
 {
-    /* Internal DRAM, not EXT_RAM_BSS: this is a READ, so the PSRAM-source
-     * write penalty (see blocklist_save_flash) doesn't apply, but there's no
-     * reason to risk it either — this runs once at boot, the extra copy is
-     * free at that cost. */
     static uint8_t chunk[4096];
     size_t total = BL_IMAGE_BYTES(hdr->count), done = 0;
     while (done < total) {
@@ -1374,25 +1516,54 @@ static bool flash_try_load_slot(const esp_partition_t *pick, const bl_flash_head
         return false;
     }
 
-    /* Same immunity as the SD path: the index bounds come straight out of
-     * flash, so a torn write that leaves the header intact must still be
-     * caught before dns_task or the L2 hook ever probes it. A slot that was
-     * mid-write when power died is exactly this case — its header can say
-     * seq=N, count=700000 while the body is still partly the erased 0xFF
-     * pattern, which fails the monotonic idx[] check below. */
     if (!bl_image_valid(s_image, hdr->count)) {
         ESP_LOGW(TAG, "flash blocklist: index failed validation on %s — refusing", pick->label);
         s_flash_status = "invalid-index";
         return false;
     }
 
+    if (hdr->exc_count > 0) {
+        size_t recs_bytes = (size_t)hdr->exc_count * BL_REC_BYTES;
+        size_t offset_recs = sizeof(bl_flash_header_t) + total;
+        size_t offset_flags = offset_recs + recs_bytes;
+        if (esp_partition_read(pick, offset_recs, s_exc_recs[0], recs_bytes) != ESP_OK ||
+            esp_partition_read(pick, offset_flags, s_exc_flags[0], hdr->exc_count) != ESP_OK) {
+            ESP_LOGW(TAG, "flash blocklist: failed reading exceptions from %s", pick->label);
+            s_flash_status = "short-read";
+            return false;
+        }
+    }
+
+    uint8_t feed_max_rank = 0;
+    if (hdr->exc_count > 0) {
+        feed_max_rank = 1;
+        for (uint32_t i = 0; i < hdr->exc_count; i++) {
+            if (s_exc_flags[0][i] & RULE_IMPORTANT) {
+                feed_max_rank = 3;
+                break;
+            }
+        }
+    }
+
+    s_snap_buf[0] = (bl_snapshot_t){
+        .block_img = s_image,
+        .block_count = hdr->count,
+        .exc_recs = s_exc_recs[0],
+        .exc_flags = s_exc_flags[0],
+        .exc_count = hdr->exc_count,
+        .feed_max_rank = feed_max_rank,
+    };
+    s_snap_idx = 0;
+
     atomic_store_explicit(&s_count, hdr->count, memory_order_relaxed);
     atomic_store(&s_dropped, hdr->dropped);
-    atomic_store_explicit(&s_live, s_image, memory_order_release);
+    atomic_store(&s_exc_loaded, hdr->exc_count);
+    atomic_store(&s_exc_dropped, hdr->exc_dropped);
+    atomic_store_explicit(&s_live, &s_snap_buf[0], memory_order_release);
     blocklist_generation_bump();   /* (#85) */
     s_flash_status = "loaded";
-    ESP_LOGI(TAG, "Flash blocklist loaded from %s: %" PRIu32 " domains (seq %" PRIu32 ", instant)",
-             pick->label, hdr->count, hdr->seq);
+    ESP_LOGI(TAG, "Flash blocklist loaded from %s: %" PRIu32 " domains, %" PRIu32 " exceptions (seq %" PRIu32 ", instant)",
+             pick->label, hdr->count, hdr->exc_count, hdr->seq);
     if (hdr->dropped > 0)
         ESP_LOGW(TAG, "Snapshot was TRUNCATED when written: %" PRIu32 " entries had been "
                  "dropped — this warm-boot list is INCOMPLETE until the next reload",
@@ -1440,9 +1611,9 @@ bool blocklist_load_flash(void)
  * blocklist_save_sd() — no public entry point, nothing external triggers this. */
 static void blocklist_save_flash(void)
 {
-    uint32_t n = atomic_load(&s_count);
-    const uint8_t *img = atomic_load_explicit(&s_live, memory_order_acquire);
-    if (!img || n == 0) return;
+    const bl_snapshot_t *snap = atomic_load_explicit(&s_live, memory_order_acquire);
+    if (!snap || snap->block_count == 0) return;
+    uint32_t n = snap->block_count;
 
     const esp_partition_t *pa, *pb;
     if (!flash_partitions_find(&pa, &pb)) { s_flash_status = "absent"; return; }
@@ -1471,9 +1642,11 @@ static void blocklist_save_flash(void)
     const esp_partition_t *target = (a_ok && (!b_ok || ha.seq >= hb.seq)) ? pb : pa;
 
     uint32_t dropped = atomic_load(&s_dropped);
+    uint32_t exc_dropped = atomic_load(&s_exc_dropped);
     bl_flash_header_t hdr = { .magic = BL_FLASH_MAGIC, .seq = next_seq, .count = n,
                               .hash_bits = BL_HASH_BITS, .bucket_bits = BL_BUCKET_BITS,
-                              .entry_bytes = BL_ENT_BYTES, .pad = 0, .dropped = dropped };
+                              .entry_bytes = BL_ENT_BYTES, .pad = 0, .dropped = dropped,
+                              .exc_count = snap->exc_count, .exc_dropped = exc_dropped };
 
     /* Erase-then-write is inherently non-atomic on NOR flash — that's exactly
      * why the OTHER slot, never touched by this call, is the fallback a power
@@ -1501,7 +1674,7 @@ static void blocklist_save_flash(void)
     while (written < total) {
         size_t batch = total - written;
         if (batch > sizeof(chunk)) batch = sizeof(chunk);
-        memcpy(chunk, img + written, batch);
+        memcpy(chunk, snap->block_img + written, batch);
         if (esp_partition_write(target, sizeof(hdr) + written, chunk, batch) != ESP_OK) {
             ok = false;
             break;
@@ -1509,10 +1682,20 @@ static void blocklist_save_flash(void)
         written += batch;
     }
 
+    if (ok && snap->exc_count > 0) {
+        size_t recs_bytes = (size_t)snap->exc_count * BL_REC_BYTES;
+        size_t offset_recs = sizeof(bl_flash_header_t) + total;
+        size_t offset_flags = offset_recs + recs_bytes;
+        if (esp_partition_write(target, offset_recs, snap->exc_recs, recs_bytes) != ESP_OK ||
+            esp_partition_write(target, offset_flags, snap->exc_flags, snap->exc_count) != ESP_OK) {
+            ok = false;
+        }
+    }
+
     if (ok) {
         s_flash_status = "saved";
-        ESP_LOGI(TAG, "Flash blocklist saved to %s: %" PRIu32 " domains (seq %" PRIu32 ")",
-                 target->label, n, next_seq);
+        ESP_LOGI(TAG, "Flash blocklist saved to %s: %" PRIu32 " domains, %" PRIu32 " exceptions (seq %" PRIu32 ")",
+                 target->label, n, snap->exc_count, next_seq);
     } else {
         ESP_LOGW(TAG, "flash blocklist: short write to %s at %u/%u — that slot is now "
                  "suspect, the other slot remains the good copy", target->label,
@@ -1533,7 +1716,6 @@ uint32_t blocklist_rejected_cosmetic(void)         { return atomic_load(&s_rejec
 uint32_t blocklist_rejected_cidr(void)             { return atomic_load(&s_rejected_cidr); }
 uint32_t blocklist_rejected_too_wide(void)         { return atomic_load(&s_rejected_too_wide); }
 uint32_t blocklist_rejected_important_block(void)  { return atomic_load(&s_rejected_important_block); }
-uint32_t blocklist_exceptions_skipped(void)        { return atomic_load(&s_exceptions_skipped); }
 
 void blocklist_stop_load(void)
 {

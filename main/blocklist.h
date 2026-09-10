@@ -6,7 +6,8 @@ extern "C" {
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
-#include "bl_rank.h"   /* bl_verdict_t and friends, for blocklist_verdict{,_nb}() below */
+#include "bl_rank.h"
+#include "bl_table.h"   /* bl_verdict_t and friends, for blocklist_verdict{,_nb}() below */
 
 /* OISD big list URL (domainswild2 format) */
 #define BLOCKLIST_URL  "https://big.oisd.nl/domainswild2"
@@ -69,6 +70,21 @@ bool blocklist_init(void);
  * Returns number of domains loaded, or 0 on failure.
  */
 uint32_t blocklist_load(void);
+
+/*
+ * Live blocklist snapshot descriptor (#117 stage e-ii).
+ * Bundles the block image and exception table into one immutable descriptor
+ * swapped by a single atomic store, guaranteeing that the block image and
+ * exception table published to readers always come from the exact same reload.
+ */
+typedef struct {
+    const uint8_t *block_img;      /* [ idx | 3-byte entries ] */
+    uint32_t       block_count;
+    const uint8_t *exc_recs;       /* sorted 5-byte records (BL_REC_BYTES each) */
+    const uint8_t *exc_flags;      /* parallel flag bytes (RULE_IMPORTANT, RULE_EXACT) */
+    uint32_t       exc_count;
+    uint8_t        feed_max_rank;  /* 0 if no exceptions loaded, else max rank (1 or 3) */
+} bl_snapshot_t;
 
 /*
  * The shared rank-ordered verdict (#117): feed block table, NVS whitelist,
@@ -251,11 +267,11 @@ uint32_t blocklist_rejected_too_wide(void);
 /* $important on a feed BLOCK rule — accepted from custom rules, rejected
  * here because the feed block-table entry has no spare bit for the flag. */
 uint32_t blocklist_rejected_important_block(void);
-/* @@ exception lines seen in a feed on the last reload. Parsed and counted,
- * but not yet stored anywhere (#117 stage e-ii adds the feed exception
- * table) — non-zero here means those lines currently have no effect at
- * all, which is worth surfacing rather than leaving silently invisible. */
-uint32_t blocklist_exceptions_skipped(void);
+/* Feed exceptions loaded and active in the live snapshot (#117 stage e-ii). */
+uint32_t blocklist_exceptions_loaded(void);
+/* Feed exceptions dropped when capacity (BL_EXCEPT_CAPACITY = 2048) was exceeded.
+ * Exceeding capacity vetoes publishing to fail closed. */
+uint32_t blocklist_exceptions_dropped(void);
 
 #ifdef __cplusplus
 }
