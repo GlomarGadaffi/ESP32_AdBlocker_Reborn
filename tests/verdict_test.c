@@ -22,6 +22,7 @@
  *     resolver doesn't have.
  */
 #include "bl_rank.h"
+#include "blocklist.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -44,6 +45,7 @@ typedef struct {
 static bool synth_probe(void *vctx, const char *suffix, size_t len, uint8_t depth, uint8_t *rank_out)
 {
     synth_ctx_t *ctx = (synth_ctx_t *)vctx;
+    if (!ctx) return false;
     ctx->probe_calls++;
     bool found = false;
     uint8_t best = 0;
@@ -321,6 +323,136 @@ static void test_walk_cost(void)
     }
 }
 
+
+/* ── 5. feed exceptions and descriptor tests (#117 stage e-ii) ──────── */
+
+/* Harness replicating blocklist_verdict and blocklist_verdict_nb's contract */
+static bl_verdict_t mock_blocklist_verdict(const bl_snapshot_t *snap, const char *name, size_t len,
+                                           synth_ctx_t *feed_block, synth_ctx_t *feed_exc,
+                                           synth_ctx_t *wl, synth_ctx_t *custom)
+{
+    bl_verdict_t v = { .state = BL_NO_MATCH, .rank = 0, .unproven = 0, .src = 0xFF, .depth = 0 };
+    if (!name || len == 0) return v;
+    if (!snap) {
+        v.unproven = 1;  /* fail open: forward, don't cache (#117) */
+        return v;
+    }
+    rank_source_t srcs[4];
+    srcs[0] = mk_src(feed_block, 0);
+    srcs[1] = mk_src(feed_exc, snap->feed_max_rank);
+    srcs[2] = mk_src(wl, wl ? (wl->count ? 1 : 0) : 0);
+    srcs[3] = mk_src(custom, custom ? 3 : 0);
+    return bl_rank_resolve(name, len, srcs, 4);
+}
+
+static int mock_blocklist_verdict_nb(const bl_snapshot_t *snap, const char *name, size_t len, bl_verdict_t *out,
+                                     synth_ctx_t *feed_block, synth_ctx_t *feed_exc,
+                                     synth_ctx_t *wl, synth_ctx_t *custom)
+{
+    *out = (bl_verdict_t){ .state = BL_NO_MATCH, .rank = 0, .unproven = 0, .src = 0xFF, .depth = 0 };
+    if (!name || len == 0) return 1;
+    if (!snap) return BL_DEFER_SNAPSHOT;  /* Close NULL-window gap (#117) */
+
+    rank_source_t srcs[4];
+    srcs[0] = mk_src(feed_block, 0);
+    srcs[1] = mk_src(feed_exc, snap->feed_max_rank);
+    srcs[2] = mk_src(wl, wl ? (wl->count ? 1 : 0) : 0);
+    srcs[3] = mk_src(custom, custom ? 3 : 0);
+    *out = bl_rank_resolve(name, len, srcs, 4);
+    return 1;
+}
+
+static void test_feed_exceptions_and_descriptor(void)
+{
+    printf("feed exceptions and descriptor (stage e-ii)\n");
+
+    /* Case A: Name BLOCKed by feed and ALLOWed by feed exception.
+     * Must resolve to ALLOW on BOTH blocklist_verdict and blocklist_verdict_nb paths,
+     * with src == 1 ("feed_exception") and l2_defer flat (returns 1). */
+    {
+        synth_entry_t feed_block_e[] = { { "example.com", 0, 0 } };
+        synth_entry_t feed_exc_e[]   = { { "a.example.com", 1, 0 } };
+        synth_ctx_t feed_block = { feed_block_e, 1, 0 };
+        synth_ctx_t feed_exc   = { feed_exc_e, 1, 0 };
+        bl_snapshot_t snap = {
+            .block_img = (const uint8_t *)"dummy",
+            .block_count = 1,
+            .exc_recs = (const uint8_t *)"dummy",
+            .exc_flags = (const uint8_t *)"dummy",
+            .exc_count = 1,
+            .feed_max_rank = 1,
+        };
+
+        // Query x.a.example.com -> sub-inclusive ALLOW
+        bl_verdict_t v_sock = mock_blocklist_verdict(&snap, "x.a.example.com", strlen("x.a.example.com"),
+                                                     &feed_block, &feed_exc, NULL, NULL);
+        CHECK(v_sock.state == BL_ALLOW, "socket verdict expected BL_ALLOW, got %d", v_sock.state);
+        CHECK(v_sock.src == 1, "socket verdict src expected 1 (feed_exception), got %d", v_sock.src);
+        CHECK(v_sock.unproven == 0, "socket verdict unproven expected 0, got %d", v_sock.unproven);
+
+        bl_verdict_t v_nb;
+        int rc_nb = mock_blocklist_verdict_nb(&snap, "x.a.example.com", strlen("x.a.example.com"), &v_nb,
+                                              &feed_block, &feed_exc, NULL, NULL);
+        CHECK(rc_nb == 1, "nb verdict expected 1 (proven, not deferred), got %d", rc_nb);
+        CHECK(v_nb.state == BL_ALLOW, "nb verdict expected BL_ALLOW, got %d", v_nb.state);
+        CHECK(v_nb.src == 1, "nb verdict src expected 1 (feed_exception), got %d", v_nb.src);
+
+        // Query b.example.com -> BLOCK
+        bl_verdict_t v_block = mock_blocklist_verdict(&snap, "b.example.com", strlen("b.example.com"),
+                                                      &feed_block, &feed_exc, NULL, NULL);
+        CHECK(v_block.state == BL_BLOCK, "expected BL_BLOCK, got %d", v_block.state);
+        CHECK(v_block.src == 0, "expected src 0 (feed), got %d", v_block.src);
+    }
+
+    /* Case B: NULL descriptor (publish window quiescence gap fix).
+     * Socket path must set unproven = 1 (fail open).
+     * NB / L2 path must return BL_DEFER_SNAPSHOT (not proven NO_MATCH). */
+    {
+        bl_verdict_t v_sock = mock_blocklist_verdict(NULL, "example.com", strlen("example.com"),
+                                                     NULL, NULL, NULL, NULL);
+        CHECK(v_sock.state == BL_NO_MATCH, "NULL snap socket expected BL_NO_MATCH, got %d", v_sock.state);
+        CHECK(v_sock.unproven == 1, "NULL snap socket expected unproven == 1, got %d", v_sock.unproven);
+
+        bl_verdict_t v_nb;
+        int rc_nb = mock_blocklist_verdict_nb(NULL, "example.com", strlen("example.com"), &v_nb,
+                                              NULL, NULL, NULL, NULL);
+        CHECK(rc_nb == BL_DEFER_SNAPSHOT, "NULL snap nb expected BL_DEFER_SNAPSHOT (%d), got %d",
+              BL_DEFER_SNAPSHOT, rc_nb);
+    }
+
+    /* Case C: Feed exception $important (rank 3) beats custom $important block (rank 2). */
+    {
+        synth_entry_t feed_exc_e[] = { { "example.com", 3, 0 } };  // ALLOW + $important
+        synth_entry_t custom_e[]   = { { "example.com", 2, 0 } };  // BLOCK + $important
+        synth_ctx_t feed_exc = { feed_exc_e, 1, 0 };
+        synth_ctx_t custom   = { custom_e, 1, 0 };
+        bl_snapshot_t snap = { .exc_count = 1, .feed_max_rank = 3 };
+
+        bl_verdict_t v = mock_blocklist_verdict(&snap, "example.com", strlen("example.com"),
+                                                NULL, &feed_exc, NULL, &custom);
+        CHECK(v.state == BL_ALLOW, "feed exc $important expected to beat custom $important block: got state %d, rank %d",
+              v.state, v.rank);
+        CHECK(v.rank == 3, "expected rank 3, got %d", v.rank);
+        CHECK(v.src == 1, "expected src 1 (feed_exception), got %d", v.src);
+    }
+
+    /* Case D: Feed exception without $important (rank 1) loses to custom $important block (rank 2). */
+    {
+        synth_entry_t feed_exc_e[] = { { "example.com", 1, 0 } };  // plain ALLOW
+        synth_entry_t custom_e[]   = { { "example.com", 2, 0 } };  // BLOCK + $important
+        synth_ctx_t feed_exc = { feed_exc_e, 1, 0 };
+        synth_ctx_t custom   = { custom_e, 1, 0 };
+        bl_snapshot_t snap = { .exc_count = 1, .feed_max_rank = 1 };
+
+        bl_verdict_t v = mock_blocklist_verdict(&snap, "example.com", strlen("example.com"),
+                                                NULL, &feed_exc, NULL, &custom);
+        CHECK(v.state == BL_BLOCK, "custom $important block expected to beat plain feed exception: got state %d, rank %d",
+              v.state, v.rank);
+        CHECK(v.rank == 2, "expected rank 2, got %d", v.rank);
+        CHECK(v.src == 3, "expected src 3 (custom), got %d", v.src);
+    }
+}
+
 int main(void)
 {
     printf("verdict (rank resolver) host tests\n\n");
@@ -328,6 +460,7 @@ int main(void)
     test_cross_source();
     test_exact_scoping();
     test_walk_cost();
+    test_feed_exceptions_and_descriptor();
     printf("\n%s (%d failure%s)\n", g_fail ? "FAILED" : "PASSED", g_fail, g_fail == 1 ? "" : "s");
     return g_fail != 0;
 }

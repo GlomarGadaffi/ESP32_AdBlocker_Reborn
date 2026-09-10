@@ -2460,7 +2460,7 @@ int dns_server_metrics_json(char *out, size_t cap)
         "\"rejected\":{\"regex\":%" PRIu32 ",\"wildcard\":%" PRIu32 ",\"modifier\":%" PRIu32 ","
         "\"cosmetic\":%" PRIu32 ",\"cidr\":%" PRIu32 ",\"too_wide\":%" PRIu32 ","
         "\"important_block\":%" PRIu32 "},"
-        "\"exceptions_skipped\":%" PRIu32 ","
+        "\"exceptions_loaded\":%" PRIu32 ",\"exceptions_dropped\":%" PRIu32 ","
         "\"sd_status\":\"%s\",\"sd_bytes\":%" PRIu32 ","
         "\"flash_status\":\"%s\","
         "\"heap_free\":%u,\"heap_largest\":%u,\"psram_free\":%u,\"dns_task_stack_hwm\":%u,",
@@ -2491,7 +2491,8 @@ int dns_server_metrics_json(char *out, size_t cap)
         blocklist_rejected_regex(), blocklist_rejected_wildcard(), blocklist_rejected_modifier(),
         blocklist_rejected_cosmetic(), blocklist_rejected_cidr(), blocklist_rejected_too_wide(),
         blocklist_rejected_important_block(),
-        blocklist_exceptions_skipped(),
+        blocklist_exceptions_loaded(),
+        blocklist_exceptions_dropped(),
         blocklist_sd_status(), blocklist_sd_bytes(),
         blocklist_flash_status(),
         (unsigned)free_int, (unsigned)big_int, (unsigned)free_psr, (unsigned)hwm);

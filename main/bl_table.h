@@ -44,6 +44,9 @@ extern "C" {
 #define BL_ENT_BYTES     3u   /* live entry: 24-bit remainder, BE */
 #define BL_REM_MASK      0xFFFFFFu
 
+/* Maximum number of feed exception rules (@@) loaded across all feeds (#117) */
+#define BL_EXCEPT_CAPACITY  2048u
+
 /* Live image is a single allocation so one atomic pointer publishes the index
  * and the entries together:  [ uint32_t idx[65537] ][ 3-byte entries ] */
 #define BL_IMAGE_BYTES(n)  (BL_IDX_BYTES + (size_t)(n) * BL_ENT_BYTES)
@@ -83,6 +86,14 @@ uint32_t bl_dedup_records(uint8_t *recs, uint32_t n);
 /* Binary-search a sorted record array. Used for the extra-feed dedup against
  * the sorted prefix, so an entry carried by two feeds costs no capacity. */
 bool bl_records_contain(const uint8_t *recs, uint32_t n, uint64_t h40);
+
+/* Binary-search a sorted record array. Returns index 0..n-1 if found, or -1. */
+int32_t bl_records_find(const uint8_t *recs, uint32_t n, uint64_t h40);
+
+/* Drop equal neighbours from a sorted exception record array in place;
+ * returns the surviving count. Flags are merged: RULE_IMPORTANT is ORed,
+ * RULE_EXACT is ANDed. Distinct from bl_dedup_records() which has no data. */
+uint32_t bl_dedup_exceptions(uint8_t *recs, uint8_t *flags, uint32_t n);
 
 /*
  * Sort a[0..n) ascending and drop duplicates; returns the surviving count.

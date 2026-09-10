@@ -749,7 +749,7 @@ static esp_err_t handle_status(httpd_req_t *r)
         "document.getElementById('st-blocked').textContent=m.blocked;"
         "var pct=m.queries_total>0?(100*m.blocked/m.queries_total):0;"
         "document.getElementById('st-rate').textContent=pct.toFixed(1)+'%%';"
-        "var degraded=(m.blocklist_dropped>0)||(m.blocklist_feed_failures>0);"
+        "var degraded=(m.blocklist_dropped>0)||(m.blocklist_feed_failures>0)||(m.exceptions_dropped>0);"
         "var cls=m.blocklist_loading?'warn':(m.blocklist_paused?'warn':(degraded?'warn':'ok'));"
         "var txt=m.blocklist_loading?'Reloading':(m.blocklist_paused?'Paused':(degraded?'Degraded':'Active'));"
         "var st=document.getElementById('st-status');"
@@ -1177,6 +1177,13 @@ static esp_err_t handle_status(httpd_req_t *r)
             "the last reload — the live list is missing their entries.</p>",
             bl_feed_fail);
 
+    uint32_t bl_exc_drop = blocklist_exceptions_dropped();
+    if (bl_exc_drop > 0)
+        pb.appendf(
+            "<p class=warn>&#9888; %" PRIu32 " feed exception rule(s) dropped (capacity %u) — "
+            "allow-rules were dropped and affected names fail closed (remain blocked).</p>",
+            bl_exc_drop, (unsigned)BL_EXCEPT_CAPACITY);
+
     pb.appendf(
         "<p><small>After adding/removing a source, click <b>Reload blocklist</b> above. "
         "Any http(s) list in plain, hosts, adblock or *.wildcard format works. All sources "
@@ -1600,7 +1607,7 @@ static esp_err_t handle_metrics_view(httpd_req_t *r)
     " var m=flat(j),seen={},h='',i,s,k;\n"
     " var tot=+m.queries_total||0,blk=+m.blocked||0;\n"
     " var st=m.blocklist_loading?['Reloading','warn']:(m.blocklist_paused?['Paused','warn']:\n"
-    "  ((+m.blocklist_dropped>0||+m.blocklist_feed_failures>0)?['Degraded','warn']:['Active','ok']));\n"
+    "  ((+m.blocklist_dropped>0||+m.blocklist_feed_failures>0||+m.exceptions_dropped>0)?['Degraded','warn']:['Active','ok']));\n"
     " var chips=[[nf(m.blocklist_count),'Domains',''],[nf(tot),'Queries',''],[nf(blk),'Blocked',''],\n"
     "  [(tot?(100*blk/tot).toFixed(1):'0.0')+'%','Block rate',''],[st[0],'Status',st[1]],\n"
     "  [df(m.uptime_s),'Uptime','']];\n"
