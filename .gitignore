@@ -24,6 +24,10 @@
 # Serial monitor scratch output
 monitor_live.log
 
+# Python cruft (tools/board_client)
+__pycache__/
+*.pyc
+
 # local agent workflow scripts
 /.claude/workflows/
 /.claude/worktrees/
