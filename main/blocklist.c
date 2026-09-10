@@ -643,6 +643,12 @@ static void reload_diff_vs_sd(const uint8_t *neu, uint32_t n_new)
              n_new - common, hdr.count - common, hdr.count, n_new);
 }
 
+static bool check_stop_abort(void *ctx)
+{
+    (void)ctx;
+    return blocklist_stop_requested();
+}
+
 uint32_t blocklist_load(void)
 {
     atomic_store(&s_loading, true);
@@ -659,9 +665,11 @@ uint32_t blocklist_load(void)
     uint32_t feed_failures = 0;
 
     ESP_LOGI(TAG, "Downloading primary blocklist (old list stays live)...");
-    bool ok = http_fetch_lines(BLOCKLIST_URL, on_domain_line, &lc);
+    bool ok = http_fetch_lines_ex(BLOCKLIST_URL, on_domain_line, &lc, check_stop_abort, 30, 360);
     if (!ok || lc.n == 0) {
         ESP_LOGE(TAG, "Primary download failed or empty; keeping previous list");
+        feed_failures++;
+        atomic_store(&s_feed_failures, feed_failures);
         atomic_store(&s_loading, false);
         return 0;
     }
@@ -688,6 +696,11 @@ uint32_t blocklist_load(void)
     /* Fetch extra blocklists and append (deduped vs everything already loaded) */
     for (int i = 0; i < BLOCKLIST_EXTRA_MAX; i++) {
         if (s_extra_urls[i][0] == '\0') continue;
+        if (blocklist_stop_requested()) {
+            ESP_LOGW(TAG, "Stop requested, skipping remaining extra feeds");
+            feed_failures++;
+            break;
+        }
         if (!blocklist_extra_enabled_get(i)) {
             ESP_LOGI(TAG, "Extra list %d disabled — skipping", i);
             continue;
@@ -723,7 +736,7 @@ uint32_t blocklist_load(void)
             continue;
         }
         ESP_LOGI(TAG, "Downloading extra list %d: %s", i, s_extra_urls[i]);
-        bool feed_ok = http_fetch_lines(s_extra_urls[i], on_domain_line, &lc);
+        bool feed_ok = http_fetch_lines_ex(s_extra_urls[i], on_domain_line, &lc, check_stop_abort, 30, 360);
         if (!feed_ok) {
             /* 404, TLS/DNS failure or a stream that died mid-body. Whatever
              * arrived stays (a partial feed still blocks what it named), but the
@@ -1499,4 +1512,9 @@ void blocklist_stop_load(void)
     }
     atomic_store_explicit(&s_stop_requested, true, memory_order_relaxed);
     ESP_LOGW(TAG, "Blocklist load stop requested");
+}
+
+bool blocklist_stop_requested(void)
+{
+    return atomic_load_explicit(&s_stop_requested, memory_order_relaxed);
 }

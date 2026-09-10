@@ -1074,13 +1074,15 @@ static void download_task(void *)
          * the next 4h reload. Most boot failures are just the network not being
          * ready yet, so a few spaced retries recover without waiting hours. */
         static const int retry_delay_s[] = { 15, 60, 300 };
-        if (blocklist_load() == 0) {
+        if (blocklist_load() == 0 && !blocklist_stop_requested()) {
             for (size_t i = 0; i < sizeof(retry_delay_s) / sizeof(retry_delay_s[0]); i++) {
+                if (blocklist_stop_requested()) break;
                 ESP_LOGW(TAG, "Boot blocklist download failed — retry %u/%u in %ds",
                          (unsigned)(i + 1),
                          (unsigned)(sizeof(retry_delay_s) / sizeof(retry_delay_s[0])),
                          retry_delay_s[i]);
                 vTaskDelay(pdMS_TO_TICKS(retry_delay_s[i] * 1000));
+                if (blocklist_stop_requested()) break;
                 if (blocklist_load() > 0) break;
             }
             if (blocklist_domain_count() == 0)
@@ -1131,7 +1133,19 @@ static void download_task(void *)
             } else {
                 ESP_LOGI(TAG, "4h reload (clock not yet synced)...");
             }
-            blocklist_load();
+            if (blocklist_load() == 0 && !blocklist_stop_requested()) {
+                static const int reload_retry_delay_s[] = { 15, 60 };
+                for (size_t i = 0; i < sizeof(reload_retry_delay_s) / sizeof(reload_retry_delay_s[0]); i++) {
+                    if (blocklist_stop_requested()) break;
+                    ESP_LOGW(TAG, "Scheduled reload failed - retry %u/%u in %ds",
+                             (unsigned)(i + 1),
+                             (unsigned)(sizeof(reload_retry_delay_s) / sizeof(reload_retry_delay_s[0])),
+                             reload_retry_delay_s[i]);
+                    vTaskDelay(pdMS_TO_TICKS(reload_retry_delay_s[i] * 1000));
+                    if (blocklist_stop_requested()) break;
+                    if (blocklist_load() > 0) break;
+                }
+            }
             next_us += interval_us;
             if (next_us <= esp_timer_get_time())     /* fell behind — catch up */
                 next_us = esp_timer_get_time() + interval_us;
@@ -1140,7 +1154,19 @@ static void download_task(void *)
         if (s_reload_requested) {
             s_reload_requested = false;
             ESP_LOGI(TAG, "Manual reload...");
-            blocklist_load();   /* does not shift the 4h deadline */
+            if (blocklist_load() == 0 && !blocklist_stop_requested()) {
+                static const int reload_retry_delay_s[] = { 15, 60 };
+                for (size_t i = 0; i < sizeof(reload_retry_delay_s) / sizeof(reload_retry_delay_s[0]); i++) {
+                    if (blocklist_stop_requested()) break;
+                    ESP_LOGW(TAG, "Manual reload failed - retry %u/%u in %ds",
+                             (unsigned)(i + 1),
+                             (unsigned)(sizeof(reload_retry_delay_s) / sizeof(reload_retry_delay_s[0])),
+                             reload_retry_delay_s[i]);
+                    vTaskDelay(pdMS_TO_TICKS(reload_retry_delay_s[i] * 1000));
+                    if (blocklist_stop_requested()) break;
+                    if (blocklist_load() > 0) break;
+                }
+            }
             continue;
         }
         if (now_us >= next_save_us) {

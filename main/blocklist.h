@@ -216,6 +216,7 @@ uint32_t blocklist_generation(void);
  * for the primary, feed_failures++ for an extra — the old list keeps serving
  * either way. */
 void blocklist_stop_load(void);
+bool blocklist_stop_requested(void);
 
 /* Stats */
 uint32_t blocklist_domain_count(void);
