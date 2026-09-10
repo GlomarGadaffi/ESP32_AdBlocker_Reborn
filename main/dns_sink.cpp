@@ -1637,11 +1637,6 @@ static esp_err_t IRAM_ATTR l2_input_cb(esp_eth_handle_t h, uint8_t *buf, uint32_
             uint32_t rw = 0;
             if (rewrite_lookup_nb(name, nlen, &rw) != 0) break;
         }
-        /* (#117) Shared rank-ordered verdict — feed + whitelist + custom
-         * rules, including @@ exceptions and $important — instead of the
-         * block-only blocklist_is_blocked_nb() this used to call. A defer
-         * (must not guess) falls through to lwIP exactly like every other
-         * `break` in this hook. */
         /* (#109 item 3) Forward cache probe: replay fresh allowed upstream
          * replies straight from L2, skipping lwIP — the same socket-stack
          * overhead the blocked path already bypasses. On a cache hit, this
@@ -1650,7 +1645,15 @@ static esp_err_t IRAM_ATTR l2_input_cb(esp_eth_handle_t h, uint8_t *buf, uint32_
          * redundant hash call and matching the socket path (dns_server.cpp),
          * where cache_lookup runs before blocklist_verdict. dns_cache_l2_get()
          * only serves allowed entries stamped with the current blocklist
-         * generation (#85), so a hit is proven allowed by construction. */
+         * generation (#85), so a hit is proven allowed by construction.
+         *
+         * That proof depends on load_gen being the generation the ALLOW was
+         * actually authorised under, which is only true since #144: it used to
+         * be read at store time, an upstream RTT after the verdict, so a bump
+         * landing in that window stamped a pre-bump ALLOW as current. Probing
+         * the cache first is safe only on top of that fix — before it, this
+         * hook's verdict-first order was what shielded Ethernet clients from
+         * exactly those entries. */
         int clen = dns_cache_l2_get(domain_hash(name, nlen), qtype,
                                     tx + dns, (int)sizeof(tx) - dns);
         if (clen > 0) {
