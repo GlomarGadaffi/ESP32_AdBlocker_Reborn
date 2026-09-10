@@ -3,7 +3,7 @@
 All notable changes to ESP32_AdBlocker_Reborn. Versions follow SemVer; the
 firmware's `esp_app_desc` version string comes from `version.txt`.
 
-## [Unreleased]
+## [1.4.0] — 2026-09-10
 
 ### Behaviour changes
 
@@ -80,10 +80,10 @@ firmware's `esp_app_desc` version string comes from `version.txt`.
   firmware can't act on — now shows up as such (`rejected.regex`,
   `.wildcard`, `.modifier`, `.cosmetic`, `.cidr`, `.too_wide`,
   `.important_block`) instead of just a smaller-than-expected domain count.
-  `exceptions_skipped` counts `@@` lines seen in a feed that have nowhere to
-  be stored yet — feed-level exceptions are a separate, later change; a
-  feed's own `@@` lines have no effect at all until then, and this number is
-  how that gap stays visible instead of silent.
+  `exceptions_loaded` / `exceptions_dropped` report the feed exception table
+  (see below); they replace the `exceptions_skipped` counter that existed
+  only to make the pre-e-ii gap visible, and which is now always zero by
+  construction.
 - **L2 fast-path defer counters** (`l2_defer_lock_busy`, `l2_defer_snapshot`,
   `/metrics`): the Ethernet fast path now defers to the socket path rather
   than answer on a guess whenever it can't prove a verdict without
@@ -111,6 +111,26 @@ firmware's `esp_app_desc` version string comes from `version.txt`.
   instead of failing its boot-time allocation. Release packaging and the browser
   flasher carry per-board flash settings, since this target addresses 8 MB where
   the Ethernet boards use 16.
+
+- **Feed-level `@@` exceptions are now honoured (#117 stage e-ii).** A feed's
+  own exception lines previously parsed, counted, and were thrown away, so
+  only a hand-written custom rule could produce an ALLOW. The live block image
+  and a new feed exception table now publish together behind one atomic
+  snapshot descriptor, so the two can never be read from different reloads,
+  and a feed exception joins the same rank-ordered verdict as every other
+  source. On the AdGuard DNS filter this turns 194 previously-inert lines
+  live. Duplicate exceptions merge their flags (`$important` ORs, exact-match
+  ANDs) so the result does not depend on feed order; exceeding
+  `BL_EXCEPT_CAPACITY` (2048) fails **closed** — the SD/flash snapshot is
+  vetoed and `exceptions_dropped` is counted, because a dropped exception
+  sinkholes a site the list author explicitly unblocked, the opposite
+  direction from a dropped block entry.
+- **`tools/board_client/board_client.py`** — a small HTTP client for the admin
+  API (login, CSRF, `/metrics`, `POST /check`, whitelist and custom-rule
+  edits, reload-and-wait, OTA flash-and-wait). Replaces re-deriving the
+  login/CSRF dance in a throwaway script per task.
+- **A second upstream resolver from the DHCP lease is now accepted as a reply
+  source (#72).** See the behaviour note above for what the hedge does with it.
 
 ### Fixed
 
@@ -153,6 +173,49 @@ firmware's `esp_app_desc` version string comes from `version.txt`.
   receive loop (matching `handle_ota_update`'s pattern) instead of a single
   best-effort `recv()`; an over-cap decoded submission now answers 400 rather
   than being silently cut.
+- **A stalled TLS feed download could hang a reload indefinitely (#84).** The
+  blocklist fetch had no inactivity or total-duration bound, so a stream that
+  died mid-body left `blocklist_loading` true with no progress and no failure
+  — recoverable only by reboot. Downloads now run under a watchdog that aborts
+  a stalled or over-long fetch and distinguishes a caller-requested stop from
+  a dead feed, and boot/scheduled/manual reloads retry with backoff.
+- **The download watchdog could use the fetch context after it was freed
+  (#84).** `esp_timer`'s dispatcher releases the timer-list lock *before*
+  invoking a callback, so neither `esp_timer_stop()` nor `esp_timer_delete()`
+  waits for one already running — the watchdog could still be dereferencing
+  the fetch context and the HTTP client after the fetch had returned and freed
+  both. Teardown now waits for quiescence before either is released.
+- **Clicking Stop during a reload's retry backoff did nothing (#84).** The
+  retry slept with the load already marked finished, so the stop request hit a
+  "nothing is loading" guard and was discarded; the retry then fired anyway.
+- **The forward cache could serve an answer authorised under rules that had
+  since changed (#85).** Cached entries were stamped with the blocklist
+  generation at *store* time — one upstream round trip after the verdict that
+  allowed the forward — so a rule change landing in that window marked a
+  pre-change answer as current, exactly the state the stamp exists to reject.
+  The generation is now captured at the verdict and carried across the round
+  trip. Reachable from a whitelist removal, an unpause, or a reload publish.
+- **A blocked name could resolve for Ethernet clients after being re-blocked
+  (#109).** The L2 fast path now probes the forward cache before the blocklist,
+  which is only sound because of the generation fix above; it also removes a
+  duplicate hash, a mutex take and a PSRAM probe from every cache hit.
+- **A config-heavy board rendered a whole settings tab blank (#110).** A single
+  fixed-size page buffer silently truncated once the config grew, and the
+  markup for later tabs was simply never written — no error, no marker. Page
+  rendering now tracks truncation explicitly and always closes its markup.
+- **The socket-path watchdog false-fired on an idle board (#128).** "Nobody
+  asked us anything for 2 s" was indistinguishable from "the socket is
+  wedged", so a quiet stretch coinciding with ordinary link noise reopened
+  working sockets. It now accumulates confirmed DNS demand that went
+  unanswered, which an idle board never produces.
+- **`GET /` rebuilt a 5.5 KB constant page head on every request (#108).** The
+  head is now sent as two flash-resident chunks; only the CSRF token and
+  client IP between them are formatted per request.
+- **The NVS keyspace is now declared in one place (#111).** Nine modules shared
+  one namespace with prefixes kept disjoint only by convention — a collision
+  or a careless `nvs_erase_all()` silently eats unrelated config, which has
+  happened once already. No key changed: renaming one would orphan the value
+  on deployed boards rather than move it.
 
 ## [1.3.0] — 2026-09-04
 
