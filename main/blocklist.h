@@ -216,6 +216,13 @@ uint32_t blocklist_generation(void);
  * for the primary, feed_failures++ for an extra — the old list keeps serving
  * either way. */
 void blocklist_stop_load(void);
+bool blocklist_stop_requested(void);
+
+/* blocklist_load(), retried on failure with the given backoff (#57). delay_s[]
+ * holds n sleeps in seconds; `what` names the caller in the log lines. Stop is
+ * honoured between and during attempts. Returns the domain count, 0 if every
+ * attempt failed or a stop cut it short. */
+uint32_t blocklist_load_with_retry(const int *delay_s, size_t n, const char *what);
 
 /* Stats */
 uint32_t blocklist_domain_count(void);

@@ -1074,19 +1074,12 @@ static void download_task(void *)
          * the next 4h reload. Most boot failures are just the network not being
          * ready yet, so a few spaced retries recover without waiting hours. */
         static const int retry_delay_s[] = { 15, 60, 300 };
-        if (blocklist_load() == 0) {
-            for (size_t i = 0; i < sizeof(retry_delay_s) / sizeof(retry_delay_s[0]); i++) {
-                ESP_LOGW(TAG, "Boot blocklist download failed — retry %u/%u in %ds",
-                         (unsigned)(i + 1),
-                         (unsigned)(sizeof(retry_delay_s) / sizeof(retry_delay_s[0])),
-                         retry_delay_s[i]);
-                vTaskDelay(pdMS_TO_TICKS(retry_delay_s[i] * 1000));
-                if (blocklist_load() > 0) break;
-            }
-            if (blocklist_domain_count() == 0)
-                ESP_LOGE(TAG, "Blocklist still empty after retries — NOT blocking "
-                              "until the next 4h reload or a manual /reload");
-        }
+        blocklist_load_with_retry(retry_delay_s,
+                                  sizeof(retry_delay_s) / sizeof(retry_delay_s[0]),
+                                  "Boot blocklist download");
+        if (blocklist_domain_count() == 0)
+            ESP_LOGE(TAG, "Blocklist still empty after retries — NOT blocking "
+                          "until the next 4h reload or a manual /reload");
     } else {
         ESP_LOGI(TAG, "%s cache active (%" PRIu32 " domains) — skipping boot refresh",
                  from_flash ? "Flash" : "SD", blocklist_domain_count());
@@ -1131,7 +1124,10 @@ static void download_task(void *)
             } else {
                 ESP_LOGI(TAG, "4h reload (clock not yet synced)...");
             }
-            blocklist_load();
+            static const int reload_retry_delay_s[] = { 15, 60 };
+            blocklist_load_with_retry(reload_retry_delay_s,
+                                      sizeof(reload_retry_delay_s) / sizeof(reload_retry_delay_s[0]),
+                                      "Scheduled reload");
             next_us += interval_us;
             if (next_us <= esp_timer_get_time())     /* fell behind — catch up */
                 next_us = esp_timer_get_time() + interval_us;
@@ -1140,7 +1136,10 @@ static void download_task(void *)
         if (s_reload_requested) {
             s_reload_requested = false;
             ESP_LOGI(TAG, "Manual reload...");
-            blocklist_load();   /* does not shift the 4h deadline */
+            static const int manual_retry_delay_s[] = { 15, 60 };
+            blocklist_load_with_retry(manual_retry_delay_s,
+                                      sizeof(manual_retry_delay_s) / sizeof(manual_retry_delay_s[0]),
+                                      "Manual reload");
             continue;
         }
         if (now_us >= next_save_us) {
