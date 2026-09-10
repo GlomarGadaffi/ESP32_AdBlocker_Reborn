@@ -152,6 +152,12 @@ static uint32_t capacity_for_flash(size_t slot_bytes)
 }
 static _Atomic bool        s_stop_requested = false;  /* #1: mirrors upstream's xStop */
 
+/* True while blocklist_load_with_retry() is sleeping between attempts. A load
+ * is still in progress from the operator's point of view even though no
+ * blocklist_load() call is on the stack, so Stop has to be accepted here too —
+ * see blocklist_stop_load(). */
+static _Atomic bool        s_retry_pending = false;
+
 /* Any event that changes what a query SHOULD resolve to — a reload, a pause
  * flip — must call this so cached verdicts from before the change stop
  * being trusted (#85). */
@@ -697,8 +703,15 @@ uint32_t blocklist_load(void)
     for (int i = 0; i < BLOCKLIST_EXTRA_MAX; i++) {
         if (s_extra_urls[i][0] == '\0') continue;
         if (blocklist_stop_requested()) {
-            ESP_LOGW(TAG, "Stop requested, skipping remaining extra feeds");
-            feed_failures++;
+            /* Count every feed left, not just this one: the list about to be
+             * published is missing all of them, and feed_failures is what
+             * decides whether it is safe to snapshot (below) and what the UI
+             * reports as degraded. */
+            uint32_t skipped = 0;
+            for (int j = i; j < BLOCKLIST_EXTRA_MAX; j++)
+                if (s_extra_urls[j][0] != '\0' && blocklist_extra_enabled_get(j)) skipped++;
+            ESP_LOGW(TAG, "Stop requested, skipping %" PRIu32 " remaining extra feed(s)", skipped);
+            feed_failures += skipped;
             break;
         }
         if (!blocklist_extra_enabled_get(i)) {
@@ -852,6 +865,32 @@ uint32_t blocklist_load(void)
                  "the previous good snapshot", feed_failures);
     }
     return unique;
+}
+
+uint32_t blocklist_load_with_retry(const int *delay_s, size_t n, const char *what)
+{
+    uint32_t count = blocklist_load();
+    if (count > 0 || blocklist_stop_requested()) return count;
+
+    /* Keep Stop live across the sleeps. blocklist_load() clears s_stop_requested
+     * at entry, so the check after each delay — before the next attempt — is
+     * what makes a stop that landed mid-sleep actually stick. */
+    atomic_store_explicit(&s_retry_pending, true, memory_order_relaxed);
+    for (size_t i = 0; i < n; i++) {
+        if (blocklist_stop_requested()) break;
+        ESP_LOGW(TAG, "%s failed — retry %u/%u in %ds",
+                 what, (unsigned)(i + 1), (unsigned)n, delay_s[i]);
+        vTaskDelay(pdMS_TO_TICKS(delay_s[i] * 1000));
+        if (blocklist_stop_requested()) break;
+        count = blocklist_load();
+        if (count > 0) break;
+    }
+    atomic_store_explicit(&s_retry_pending, false, memory_order_relaxed);
+
+    if (count == 0 && !blocklist_stop_requested())
+        ESP_LOGE(TAG, "%s still failing after %u retries — giving up until the "
+                      "next scheduled reload", what, (unsigned)n);
+    return count;
 }
 
 /* is_blocked_impl() is gone (#117): it was a second, independent verdict
@@ -1506,7 +1545,8 @@ void blocklist_stop_load(void)
      * on s_loading turns that race into a clean, intentional no-op — "there's
      * nothing to stop yet" — instead of a request that looks accepted but
      * quietly evaporates. */
-    if (!atomic_load_explicit(&s_loading, memory_order_relaxed)) {
+    if (!atomic_load_explicit(&s_loading, memory_order_relaxed) &&
+        !atomic_load_explicit(&s_retry_pending, memory_order_relaxed)) {
         ESP_LOGW(TAG, "Stop requested but nothing is loading — ignored");
         return;
     }
