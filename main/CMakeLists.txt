@@ -4,6 +4,7 @@ idf_component_register(
         "dns_server.cpp"
         "blocklist.c"
         "bl_table.c"
+        "bl_rank.c"
         "rewrite.c"
         "localzone.c"
         "dot.c"
