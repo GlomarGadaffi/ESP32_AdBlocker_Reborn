@@ -404,8 +404,14 @@ struct PageBuf {
                 pos = strlen(buf);
             }
         }
-        httpd_resp_set_type(r, "text/html; charset=utf-8");
-        return httpd_resp_send(r, buf, HTTPD_RESP_USE_STRLEN);
+        /* (#108) The constant head already went out as its own chunk before
+         * anything was appended here, so this only ever finishes a response
+         * that is already open — hence send_chunk plus the empty terminator,
+         * never httpd_resp_send. Content-Type is set by the caller, before
+         * that first chunk. */
+        esp_err_t err = httpd_resp_send_chunk(r, buf, (ssize_t)pos);
+        if (err != ESP_OK) return err;
+        return httpd_resp_send_chunk(r, nullptr, 0);
     }
 };
 
@@ -628,39 +634,14 @@ static esp_err_t handle_logout(httpd_req_t *r)
 }
 
 /* ── GET / — status page ─────────────────────────────────────────── */
-static esp_err_t handle_status(httpd_req_t *r)
-{
-    uint32_t total   = s_dns ? (uint32_t)s_dns->queries_total()   : 0;
-    uint32_t blocked = s_dns ? (uint32_t)s_dns->queries_blocked() : 0;
-    uint32_t domains = blocklist_domain_count();
-    bool     loading = blocklist_is_loading();
-    bool     paused  = blocklist_is_paused();
-    uint32_t wl_n    = blocklist_whitelist_count();
-    /* F9: hoisted so the Dashboard chip below can reflect degradation, not
-     * just loading state — these were previously only read down in the
-     * Blocklist tab, which the auto-refreshing Dashboard never shows. */
-    uint32_t bl_dropped   = blocklist_dropped_count();
-    uint32_t bl_feed_fail = blocklist_feed_failures();
-
-    /* static: avoids stack overflow in httpd task. Sized at 64 KB in PSRAM
-     * (#110 item 4) with headroom for a fully-populated device (whitelist +
-     * ACL + rewrites + all extra sources) so later tabs like Upstream DNS/DoT
-     * are never dropped. PageBuf guarantees balanced closing markup and emits a
-     * visible marker if truncation ever occurs. */
-    static EXT_RAM_BSS_ATTR char page[65536];
-    PageBuf pb(page, sizeof(page));
-    char csrf[33] = "";
-    web_auth_session_csrf(s_req_sid, csrf, sizeof(csrf));
-    /* Hoisted here (was computed down in the pause section) so the head
-     * script can embed it — refreshDash's live pause-countdown rebuild
-     * needs to know which entry is "this device" the same way the
-     * server-rendered table already does. */
-    uint32_t me = req_peer_ip(r);
-    char my_ip_s[16];
-    snprintf(my_ip_s, sizeof(my_ip_s), "%u.%u.%u.%u",
-             (unsigned)((me>>24)&0xFF),(unsigned)((me>>16)&0xFF),
-             (unsigned)((me>>8)&0xFF),(unsigned)(me&0xFF));
-    pb.appendf(
+/* Constant head of the status page, split around the only two per-session
+ * values it carries (#108). It used to be one 5.5 KB printf FORMAT string
+ * re-scanned by vsnprintf and copied into `page` on every GET / just to
+ * substitute those two; now each half goes out as its own chunk straight
+ * from flash and never touches the page buffer. Emitted bytes are
+ * unchanged. These are no longer format strings, so a literal percent is
+ * written once, not doubled. */
+static const char STATUS_HEAD_1[] =
         "<!DOCTYPE html><html><head><meta charset=utf-8>"
         "<title>DNS Sinkhole</title>"
         /* No <meta refresh>: it dropped the URL fragment, so every reload
@@ -668,7 +649,7 @@ static esp_err_t handle_status(httpd_req_t *r)
          * form input on the config tabs (#63). Refresh is JS-driven below and
          * only runs while the Dashboard is actually showing. */
         "<style>body{font-family:monospace;max-width:700px;margin:2em auto;}"
-        "table{border-collapse:collapse;width:100%%}"
+        "table{border-collapse:collapse;width:100%}"
         "td,th{border:1px solid #ccc;padding:.4em .8em;text-align:left}"
         "th{background:#222;color:#eee}.ok{color:green}.warn{color:orange}"
         ".stats{display:flex;gap:1em;flex-wrap:wrap;margin:1em 0}"
@@ -681,14 +662,8 @@ static esp_err_t handle_status(httpd_req_t *r)
         "padding:.5em .9em;font:inherit;cursor:pointer;color:#555}"
         ".tabs button.active{border-bottom-color:#1a1a8c;color:#1a1a8c;font-weight:bold}"
         ".tab{display:none}.tab.active{display:block}</style>"
-        "<script>"
-        /* Per-session CSRF token. Every <form> gets it appended to its action
-         * as ?csrf= on submit and every fetch() sends it as X-CSRF, so no
-         * handler body-parsing had to change (csrf_ok reads the query string
-         * or the header). JS is already required for the tabs, and with JS
-         * off every POST simply fails closed with 403. */
-        "var CSRF='%s';"
-        "var MY_IP='%s';"
+        "<script>";
+static const char STATUS_HEAD_2[] =
         "document.addEventListener('submit',function(e){var f=e.target;"
         "if(f.method&&f.method.toLowerCase()=='post'){var a=f.getAttribute('action')||location.pathname;"
         "f.action=a+(a.indexOf('?')<0?'?':'&')+'csrf='+CSRF;}});"
@@ -748,7 +723,7 @@ static esp_err_t handle_status(httpd_req_t *r)
         "document.getElementById('st-queries').textContent=m.queries_total;"
         "document.getElementById('st-blocked').textContent=m.blocked;"
         "var pct=m.queries_total>0?(100*m.blocked/m.queries_total):0;"
-        "document.getElementById('st-rate').textContent=pct.toFixed(1)+'%%';"
+        "document.getElementById('st-rate').textContent=pct.toFixed(1)+'%';"
         "var degraded=(m.blocklist_dropped>0)||(m.blocklist_feed_failures>0)||(m.exceptions_dropped>0);"
         "var cls=m.blocklist_loading?'warn':(m.blocklist_paused?'warn':(degraded?'warn':'ok'));"
         "var txt=m.blocklist_loading?'Reloading':(m.blocklist_paused?'Paused':(degraded?'Degraded':'Active'));"
@@ -790,7 +765,7 @@ static esp_err_t handle_status(httpd_req_t *r)
         "var p=list[i];"
         "var who=p.ip=='all'?'<b>All devices</b>':p.ip;"
         "if(p.ip==MY_IP)who+=' (this device)';"
-        "var m=Math.floor(p.remaining_s/60),s=p.remaining_s%%60;"
+        "var m=Math.floor(p.remaining_s/60),s=p.remaining_s%60;"
         "h+='<tr><td>'+who+'</td><td>'+m+'m '+(s<10?'0':'')+s+'s</td>'+"
         "'<td><form method=post action=/pause/resume style=\"margin:0\">'+"
         "'<input type=hidden name=ip value=\"'+p.ip+'\"><button>Resume now</button></form></td></tr>';"
@@ -842,7 +817,57 @@ static esp_err_t handle_status(httpd_req_t *r)
         "<button id=btn-access onclick=\"showTab('access')\">Access</button>"
         "<button id=btn-upstream onclick=\"showTab('upstream')\">Upstream DNS</button>"
         "</div>"
-        "<div class='tab' id=tab-dashboard>", csrf, my_ip_s);
+        "<div class='tab' id=tab-dashboard>";
+
+static esp_err_t handle_status(httpd_req_t *r)
+{
+    uint32_t total   = s_dns ? (uint32_t)s_dns->queries_total()   : 0;
+    uint32_t blocked = s_dns ? (uint32_t)s_dns->queries_blocked() : 0;
+    uint32_t domains = blocklist_domain_count();
+    bool     loading = blocklist_is_loading();
+    bool     paused  = blocklist_is_paused();
+    uint32_t wl_n    = blocklist_whitelist_count();
+    /* F9: hoisted so the Dashboard chip below can reflect degradation, not
+     * just loading state — these were previously only read down in the
+     * Blocklist tab, which the auto-refreshing Dashboard never shows. */
+    uint32_t bl_dropped   = blocklist_dropped_count();
+    uint32_t bl_feed_fail = blocklist_feed_failures();
+
+    /* static: avoids stack overflow in httpd task. Sized at 64 KB in PSRAM
+     * (#110 item 4) with headroom for a fully-populated device (whitelist +
+     * ACL + rewrites + all extra sources) so later tabs like Upstream DNS/DoT
+     * are never dropped. PageBuf guarantees balanced closing markup and emits a
+     * visible marker if truncation ever occurs. */
+    static EXT_RAM_BSS_ATTR char page[65536];
+    PageBuf pb(page, sizeof(page));
+    char csrf[33] = "";
+    web_auth_session_csrf(s_req_sid, csrf, sizeof(csrf));
+    /* Hoisted here (was computed down in the pause section) so the head
+     * script can embed it — refreshDash's live pause-countdown rebuild
+     * needs to know which entry is "this device" the same way the
+     * server-rendered table already does. */
+    uint32_t me = req_peer_ip(r);
+    char my_ip_s[16];
+    snprintf(my_ip_s, sizeof(my_ip_s), "%u.%u.%u.%u",
+             (unsigned)((me>>24)&0xFF),(unsigned)((me>>16)&0xFF),
+             (unsigned)((me>>8)&0xFF),(unsigned)(me&0xFF));
+    /* Set before the first chunk: once chunked output has started the
+     * response headers are already on the wire. */
+    httpd_resp_set_type(r, "text/html; charset=utf-8");
+    if (httpd_resp_send_chunk(r, STATUS_HEAD_1, sizeof(STATUS_HEAD_1) - 1) != ESP_OK)
+        return ESP_FAIL;
+    /* Per-session CSRF token. Every <form> gets it appended to its action
+     * as ?csrf= on submit and every fetch() sends it as X-CSRF, so no
+     * handler body-parsing had to change (csrf_ok reads the query string
+     * or the header). JS is already required for the tabs, and with JS
+     * off every POST simply fails closed with 403. */
+    char head_vars[96];
+    int hv = snprintf(head_vars, sizeof(head_vars),
+                      "var CSRF='%s';var MY_IP='%s';", csrf, my_ip_s);
+    if (httpd_resp_send_chunk(r, head_vars, hv) != ESP_OK)
+        return ESP_FAIL;
+    if (httpd_resp_send_chunk(r, STATUS_HEAD_2, sizeof(STATUS_HEAD_2) - 1) != ESP_OK)
+        return ESP_FAIL;
     float pct = total > 0 ? 100.0f * (float)blocked / (float)total : 0.0f;
     /* F9: this chip had a DUPLICATE class attribute (class=val class='%s') —
      * HTML keeps only the first, so the ok/warn class never actually applied.
