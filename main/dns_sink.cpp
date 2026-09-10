@@ -153,11 +153,17 @@ static char               s_ip[16] = {};      /* Ethernet IP — the LAN-facing 
 static char               s_nm[16] = {};      /* Ethernet netmask */
 static char               s_gw[16] = {};      /* Ethernet DHCP gateway */
 static char               s_eth_dns[16] = {}; /* Ethernet DHCP-provided DNS server (option 6) — the real upstream target */
+/* (#72) The SECOND resolver from the same option-6 list, when the lease carries
+ * one. Empty is the normal, fully-supported case — see set_upstream(). Only
+ * DHCP fills this; the static-IP form has a single DNS field and leaves it
+ * empty, which is the same as having no secondary. */
+static char               s_eth_dns2[16] = {};
 #if CONFIG_ADBLOCK_NET_WIFI
 static char               s_wifi_ip[16] = {};
 static char               s_wifi_nm[16] = {};   /* Wi-Fi netmask */
 static char               s_wifi_gw[16] = {};   /* Wi-Fi DHCP gateway */
 static char               s_wifi_dns[16] = {};  /* Wi-Fi DHCP-provided DNS server — see s_eth_dns */
+static char               s_wifi_dns2[16] = {}; /* (#72) — see s_eth_dns2 */
 #endif
 
 /* ── Global singletons ───────────────────────────────────────────── */
@@ -239,11 +245,23 @@ static const char *pick_upstream(const char *dns, const char *gw)
 static const char *apply_upstream_iface(void)
 {
     const char *upstream = pick_upstream(s_eth_dns, s_gw);
+    /* (#72) The secondary comes from the SELECTED interface only, never mixed
+     * across interfaces: #53's routing argument (a resolver reachable only
+     * through one netif's subnet egresses out that netif automatically) holds
+     * per-interface, and a secondary on the other WAN would leave via the
+     * wrong one. The gateway fallback above is deliberately not repeated here
+     * — it is the primary's last resort, not a second opinion. */
+    const char *upstream2 = s_eth_dns2;
 #if CONFIG_ADBLOCK_NET_WIFI
-    if (strcmp(s_upstream_iface, "wifi") == 0)
-        upstream = pick_upstream(s_wifi_dns, s_wifi_gw);
+    if (strcmp(s_upstream_iface, "wifi") == 0) {
+        upstream  = pick_upstream(s_wifi_dns, s_wifi_gw);
+        upstream2 = s_wifi_dns2;
+    }
 #endif
-    s_dns.set_upstream(upstream);
+    /* A secondary identical to the primary is left alone: the hedge then goes
+     * to the same resolver it already would have, i.e. exactly pre-#72
+     * behaviour, so there is nothing to special-case. */
+    s_dns.set_upstream(upstream, upstream2);
     return upstream;
 }
 
@@ -473,16 +491,31 @@ extern "C" bool dns_sink_eth_built(void)
 #endif
 }
 
-/* Read the DHCP-provided DNS server (option 6) for a netif, if any. */
-static void fetch_dhcp_dns(esp_netif_t *netif, char *out, size_t cap)
+/* Read one DHCP-provided DNS server (option 6) for a netif, if any. */
+static void fetch_dhcp_dns_one(esp_netif_t *netif, esp_netif_dns_type_t type,
+                               char *out, size_t cap)
 {
     esp_netif_dns_info_t dns{};
-    if (esp_netif_get_dns_info(netif, ESP_NETIF_DNS_MAIN, &dns) == ESP_OK
+    if (esp_netif_get_dns_info(netif, type, &dns) == ESP_OK
         && dns.ip.type == ESP_IPADDR_TYPE_V4 && dns.ip.u_addr.ip4.addr != 0) {
         esp_ip4addr_ntoa(&dns.ip.u_addr.ip4, out, cap);
     } else {
         out[0] = '\0';
     }
+}
+
+/* (#72) Both DHCP-provided resolvers. Routers hand out option 6 as a LIST and
+ * lwIP already stores it — dhcp_bind() walks the list into DNS server slots
+ * 0..DNS_MAX_SERVERS-1 — so the second address costs a read, not a config
+ * field. MAIN and BACKUP always come from the same lease (the lwIP DNS table
+ * is global unless CONFIG_ESP_NETIF_SET_DNS_PER_DEFAULT_NETIF, which is off),
+ * so they can never end up being one router's primary and another's backup.
+ * A lease with only one server leaves *out2 empty; so does a static-IP netif. */
+static void fetch_dhcp_dns(esp_netif_t *netif, char *out, size_t cap,
+                           char *out2, size_t cap2)
+{
+    fetch_dhcp_dns_one(netif, ESP_NETIF_DNS_MAIN,   out,  cap);
+    fetch_dhcp_dns_one(netif, ESP_NETIF_DNS_BACKUP, out2, cap2);
 }
 
 #if CONFIG_ADBLOCK_NET_WIFI
@@ -497,8 +530,11 @@ static void ip_event_handler(void *, esp_event_base_t, int32_t event_id, void *e
         s_eth_ip_nbo.store(ev->ip_info.ip.addr, std::memory_order_relaxed);   /* (#106) */
         esp_ip4addr_ntoa(&ev->ip_info.netmask, s_nm, sizeof(s_nm));
         esp_ip4addr_ntoa(&ev->ip_info.gw, s_gw, sizeof(s_gw));
-        fetch_dhcp_dns(ev->esp_netif, s_eth_dns, sizeof(s_eth_dns));
-        ESP_LOGI(TAG, "Ethernet IP: %s  GW: %s  DNS: %s", s_ip, s_gw, s_eth_dns[0] ? s_eth_dns : "(none)");
+        fetch_dhcp_dns(ev->esp_netif, s_eth_dns, sizeof(s_eth_dns),
+                       s_eth_dns2, sizeof(s_eth_dns2));
+        ESP_LOGI(TAG, "Ethernet IP: %s  GW: %s  DNS: %s  DNS2: %s", s_ip, s_gw,
+                 s_eth_dns[0] ? s_eth_dns : "(none)",
+                 s_eth_dns2[0] ? s_eth_dns2 : "(none)");
         xEventGroupSetBits(s_eth_eg, ETH_GOT_IP_BIT);
         apply_upstream_iface();
 #if CONFIG_ADBLOCK_NET_WIFI
@@ -511,8 +547,11 @@ static void ip_event_handler(void *, esp_event_base_t, int32_t event_id, void *e
         esp_ip4addr_ntoa(&ev->ip_info.ip, s_wifi_ip, sizeof(s_wifi_ip));
         esp_ip4addr_ntoa(&ev->ip_info.netmask, s_wifi_nm, sizeof(s_wifi_nm));
         esp_ip4addr_ntoa(&ev->ip_info.gw, s_wifi_gw, sizeof(s_wifi_gw));
-        fetch_dhcp_dns(ev->esp_netif, s_wifi_dns, sizeof(s_wifi_dns));
-        ESP_LOGI(TAG, "Wi-Fi IP: %s  GW: %s  DNS: %s", s_wifi_ip, s_wifi_gw, s_wifi_dns[0] ? s_wifi_dns : "(none)");
+        fetch_dhcp_dns(ev->esp_netif, s_wifi_dns, sizeof(s_wifi_dns),
+                       s_wifi_dns2, sizeof(s_wifi_dns2));
+        ESP_LOGI(TAG, "Wi-Fi IP: %s  GW: %s  DNS: %s  DNS2: %s", s_wifi_ip, s_wifi_gw,
+                 s_wifi_dns[0] ? s_wifi_dns : "(none)",
+                 s_wifi_dns2[0] ? s_wifi_dns2 : "(none)");
         xEventGroupSetBits(s_eth_eg, WIFI_GOT_IP_BIT);
         apply_upstream_iface();
         stop_setup_ap_if_active();
