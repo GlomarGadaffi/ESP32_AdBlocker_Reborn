@@ -6,6 +6,7 @@ extern "C" {
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include "bl_rank.h"   /* bl_verdict_t and friends, for blocklist_verdict{,_nb}() below */
 
 /* OISD big list URL (domainswild2 format) */
 #define BLOCKLIST_URL  "https://big.oisd.nl/domainswild2"
@@ -70,22 +71,56 @@ bool blocklist_init(void);
 uint32_t blocklist_load(void);
 
 /*
+ * The shared rank-ordered verdict (#117): feed block table, NVS whitelist,
+ * and custom rules (both BLOCK and ALLOW/$important) resolved through one
+ * function instead of the hand-copied boolean ORs this issue closes out.
+ * See bl_rank.h for bl_verdict_t / BL_NO_MATCH / BL_ALLOW / BL_BLOCK.
+ *
+ * Socket path: bounded ~2ms take on the small tables; a busy take yields
+ * NO_MATCH with .unproven set rather than a guess — the caller forwards
+ * the query and must not cache that answer.
+ */
+bl_verdict_t blocklist_verdict(const char *name, size_t len);
+
+/* blocklist_verdict_nb()'s two "must defer" outcomes, distinguished so the
+ * caller can count each separately (dns_sink.cpp's l2_defer_lock_busy /
+ * l2_defer_snapshot). Both negative — a caller that only needs "must I
+ * defer" can just test the return value `< 0`. */
+#define BL_DEFER_LOCK_BUSY  (-1)   /* the zero-wait small-table take failed */
+#define BL_DEFER_SNAPSHOT   (-2)   /* a reload published underneath the walk */
+
+/*
+ * L2 hook: never blocks. Returns 1 with *out filled (a proven verdict the
+ * hook may act on), or one of the BL_DEFER_* values above meaning the hook
+ * must defer to the socket path — it could not prove an answer without
+ * stalling the Ethernet RX task.
+ */
+int blocklist_verdict_nb(const char *name, size_t len, bl_verdict_t *out);
+
+/* Human-readable label for a bl_verdict_t.src (#103): "feed", "whitelist",
+ * "custom", or "none" (state == BL_NO_MATCH). Reporting only. */
+const char *blocklist_verdict_src_name(uint8_t src);
+
+/*
  * Check if domain (already normalized, NUL-terminated) is blocked.
- * Walks all suffix components up to the bare TLD.
- * Returns true if blocked (exact or wildcard parent match).
- * Returns false during a reload's degraded window (live pointer == NULL).
+ * Thin wrapper over blocklist_verdict() — kept as a bool for callers that
+ * only ever needed one (pause.h and this header's own prose still name
+ * it); a second independent implementation would recreate the very
+ * "hand-copied ladder" defect #117 exists to close.
+ * During a reload's degraded window (live pointer == NULL) the feed table
+ * contributes nothing to the verdict; the whitelist and custom rules still
+ * apply as usual.
  */
 bool blocklist_is_blocked(const char *domain, size_t len);
-/* Non-blocking variant for the L2 eth RX task (#37 — see blocklist_whitelist_contains_nb). */
+/* Thin bool wrapper over blocklist_verdict_nb(): a deferred (-1) verdict
+ * collapses to false here, same as any other "could not prove" case this
+ * function has always folded into "not blocked". Prefer blocklist_verdict_nb()
+ * directly wherever the caller can act on the defer signal (the L2 hook does). */
 bool blocklist_is_blocked_nb(const char *domain, size_t len);
 
 /* Whitelist management (stored in NVS, survives reboot) */
 bool blocklist_whitelist_add(const char *domain);
 bool blocklist_whitelist_remove(const char *domain);
-bool blocklist_whitelist_contains(const char *domain, size_t len);
-/* Non-blocking variant for the L2 RX hook: returns false (allow-through) if
- * the mutex is held rather than stalling the Ethernet receive path (#37). */
-bool blocklist_whitelist_contains_nb(const char *domain, size_t len);
 uint32_t blocklist_whitelist_count(void);
 void blocklist_whitelist_get(char out[][64], uint32_t *count_inout);
 
@@ -138,22 +173,31 @@ void blocklist_extra_url_get(int idx, char *buf, size_t cap);
 bool blocklist_extra_enabled_get(int idx);
 bool blocklist_extra_enabled_set(int idx, bool enabled);
 
-/* Custom block rules — domains entered inline in the UI (#14).
- * Newline/space-separated list, stored in NVS as a single blob (max 4000 chars).
- * Supports plain domain names and hosts-file format ("0.0.0.0 domain").
- * Comments (#) are stripped. Applied as an overlay on top of the main blocklist. */
+/* Custom block/allow rules — the AdGuard rule-grammar subset entered inline
+ * in the UI (#14, #117). Newline/space-separated list, stored in NVS as a
+ * single blob (max 4000 chars). Supports plain domain names, hosts-file
+ * format ("0.0.0.0 domain"), ||/| anchors, @@ exceptions, and $important —
+ * see main/domain.h's rule_parse_next(). blocklist_custom_set() validates
+ * the WHOLE text before writing anything (no partial/truncated save) and
+ * refuses (returns false, NVS and the live rule set both untouched) if it
+ * would overflow CUSTOM_RULES_MAX entries or contain a token 64 chars or
+ * longer; an unsupported line (regex, wildcard, an unhandled modifier, ...)
+ * is skipped rather than stored, same as today, and does not fail the save.
+ * Applied as part of the shared blocklist_verdict{,_nb}() resolution, not a
+ * separate overlay — see #117 for why a bool-only "is this custom-blocked"
+ * function could never express an @@ rule and has been removed. */
 #define CUSTOM_RULES_MAX  256    /* max parsed entries */
 #define CUSTOM_RULES_CAP  4000   /* max raw text bytes */
-bool   blocklist_custom_set(const char *text);      /* save text, re-parse */
+bool   blocklist_custom_set(const char *text);      /* validate, save, re-parse */
 size_t blocklist_custom_get(char *buf, size_t cap); /* retrieve raw text */
-bool   blocklist_custom_is_blocked(const char *domain, size_t len);
 
 /* Global pause switch — mirrors upstream ESP32_AdBlocker's "Enable AdBlocker"
- * toggle. While paused, blocklist_is_blocked()/_nb() and
- * blocklist_custom_is_blocked() all return false (every query resolves
- * ALLOWED); whitelist, custom rules, and ACL data are untouched, only the
- * verdict is short-circuited, in the shared verdict path so the L2 hook and
- * the socket path can't diverge. NVS-persisted, survives reboot. */
+ * toggle. While paused, blocklist_verdict()/_nb() (and therefore
+ * blocklist_is_blocked()/_nb()) return NO_MATCH/false unconditionally (every
+ * query resolves ALLOWED); whitelist, custom rules, and ACL data are
+ * untouched, only the verdict is short-circuited, in the shared verdict
+ * path so the L2 hook and the socket path can't diverge. NVS-persisted,
+ * survives reboot. */
 void blocklist_set_paused(bool paused);
 bool blocklist_is_paused(void);
 
@@ -186,6 +230,25 @@ uint32_t blocklist_dropped_count(void);
  * missing whole sources — and that reload's SD snapshot was deliberately not
  * written, so the cached list on disk is the last complete one. */
 uint32_t blocklist_feed_failures(void);
+
+/* Per-reason feed-line rejects from the last reload (#117), split out of
+ * the plain total above so a list that's mostly regex/wildcard/modifier
+ * syntax a wave-1 sinkhole can't act on shows up as such, instead of just
+ * a smaller-than-expected domain count with no explanation. */
+uint32_t blocklist_rejected_regex(void);
+uint32_t blocklist_rejected_wildcard(void);
+uint32_t blocklist_rejected_modifier(void);
+uint32_t blocklist_rejected_cosmetic(void);
+uint32_t blocklist_rejected_cidr(void);
+uint32_t blocklist_rejected_too_wide(void);
+/* $important on a feed BLOCK rule — accepted from custom rules, rejected
+ * here because the feed block-table entry has no spare bit for the flag. */
+uint32_t blocklist_rejected_important_block(void);
+/* @@ exception lines seen in a feed on the last reload. Parsed and counted,
+ * but not yet stored anywhere (#117 stage e-ii adds the feed exception
+ * table) — non-zero here means those lines currently have no effect at
+ * all, which is worth surfacing rather than leaving silently invisible. */
+uint32_t blocklist_exceptions_skipped(void);
 
 #ifdef __cplusplus
 }

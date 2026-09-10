@@ -55,8 +55,11 @@ int IRAM_ATTR dns_extract_qname(const uint8_t *pkt, int pkt_len, int offset,
     return offset + 4;
 }
 
-/* Any single-label name (no dot) is treated as a bare TLD and never blocked. */
-bool domain_is_bare_tld(const char *name, size_t len)
+/* Any single-label name (no dot) is treated as a bare TLD and never blocked.
+ * IRAM_ATTR (#117): reached from the L2 fast path via bl_rank_resolve's
+ * per-suffix probe walk — closes the gap CONTRIBUTING.md §4 used to name
+ * explicitly as untagged. */
+bool IRAM_ATTR domain_is_bare_tld(const char *name, size_t len)
 {
     for (size_t i = 0; i < len; i++) {
         if (name[i] == '.') return false;
@@ -360,5 +363,13 @@ void rule_apply_feed_policy(rule_t *r)
         r->kind = RULE_REJECT;
         r->flags = 0;
         r->reject_reason = RULE_REJECT_IMPORTANT_BLOCK_UNSUPPORTED;
+        return;
     }
+    /* The feed block-table entry has no spare bit for RULE_EXACT either
+     * (same reason as $important above): widen a feed "|domain^" to
+     * sub-inclusive rather than drop it. Over-blocking is the safe
+     * direction here — the same call already made for a bare feed domain
+     * (domain_extract_token's "documented divergence"), just extended to
+     * the explicit exact-anchor form. */
+    if (r->kind == RULE_BLOCK) r->flags &= (uint8_t)~RULE_EXACT;
 }

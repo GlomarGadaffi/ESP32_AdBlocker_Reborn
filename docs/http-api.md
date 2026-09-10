@@ -56,7 +56,7 @@ metrics fields from `dns_server_metrics_json()` in `dns_server.cpp`.
 | POST | `/pause` | Set global pause to `on=1` (allow every query without unloading anything) or `on=0`. An absolute set, not a toggle — a body without `on=` un-pauses. NVS-persisted, survives reboot. |
 | POST | `/pause/timed` | Suspend blocking for `min` minutes (1–1440, enforced server-side). `scope=me` (default) applies to the requesting connection's own IP, `scope=host` with `ip=<IPv4>` to another host, `scope=all` to every client. A global pause renders a confirmation page unless `confirm=1` is also sent. Never persisted: a reboot resumes blocking. |
 | POST | `/pause/resume` | End a timed pause early. `ip=<IPv4>` for one host, `ip=all` for the every-client entry, `ip=every` to clear the table. |
-| POST | `/check` | Test one domain against the current verdict ladder. |
+| POST | `/check` | Test one domain against the shared verdict (#117): reports `BLOCKED`/`ALLOWED` plus which source decided it (`feed`, `whitelist`, `custom`), or `REWRITE -> ip` if a rewrite matched first (#103). |
 | POST | `/auth/set` | Change the admin account (`cur` = current password, `user`, `pass`). Drops every session. |
 | POST | `/whitelist/add` | Add a domain to the whitelist. |
 | POST | `/whitelist/remove` | Remove a whitelist entry. |
@@ -68,7 +68,7 @@ metrics fields from `dns_server_metrics_json()` in `dns_server.cpp`.
 | GET | `/log` | Recent query log (512-entry ring, wall-clock timestamps). |
 | GET | `/top` | Top domains/clients plus the 60-bucket per-minute CSS bar graph. |
 | GET | `/census` | Passive L2 census (#73): every client seen via ARP, DHCP, or a DNS query, up to 64 MAC-keyed entries. Flags a client "suspected bypass" if it's been on the LAN over 2 minutes but has never sent this board a DNS query — a signal, not proof; it may simply be using another resolver. IP and hostname are last-writer-wins across sighting kinds, so either can briefly show a stale value after a lease change. |
-| POST | `/custom/rules` | Save the custom block-rules textarea (hosts format or bare domains). |
+| POST | `/custom/rules` | Save the custom rules textarea: hosts format, bare domains, `\|\|`/`\|` anchors, `@@` exceptions, and `$important` (#117). Validated as a whole before saving — a rule count over 256, or any single entry 64 characters or longer, is refused (400) with no partial save; an unsupported line (regex, wildcard, an unhandled `$` modifier, ...) is skipped rather than stored, and does not fail the save. |
 | POST | `/acl/add` | Add a client IP to the ACL. |
 | POST | `/acl/remove` | Remove one ACL entry. |
 | POST | `/acl/clear` | Empty the ACL (empty = allow all). |
@@ -110,6 +110,8 @@ A single JSON object. Field names are exactly as emitted.
 | `l2_tx_fail` | int | Fast-path replies `esp_eth_transmit()` refused (#101). |
 | `l2_fallthrough` | int | Frames the L2 hook handed to lwIP unanswered — DNS or not. Proof the link is alive, independent of whether `dns_task`'s own sockets are progressing (#77). |
 | `l2_dns_fallthrough` | int | Subset of `l2_fallthrough`: only confirmed, well-formed DNS queries the hook deferred to lwIP, not ARP/DHCP/other link noise. This, not `l2_fallthrough`, is what the #77 watchdog (#128) checks against `queries_total` for progress. |
+| `l2_defer_lock_busy` | int | L2-hook queries that deferred to the socket path because the shared verdict's zero-wait small-table take failed (#117) — an admin write to the whitelist or custom rules was in flight. Flat in steady state. |
+| `l2_defer_snapshot` | int | L2-hook queries that deferred because a blocklist reload published underneath the verdict walk (#117). Flat outside a reload window. |
 | `wd_restarts` | int | Times the socket-path watchdog (#77) recreated `csock`/`usock` because wire traffic was arriving with no query progress for ~2s. Not reset by `/metrics/reset` (same convention as the `l2_*` counters). |
 | `case_mismatch` | int | DNS 0x20 (#72): replies whose question section didn't echo the exact case we sent. Observability only — never rejected; see `process_reply()`'s H2 check for why a hard reject isn't safe without first proving this stays ~0 against the real configured upstream. |
 | `l2_log_dropped` | int | L2 query-log staging ring (#124) overflows: entries the L2 hook couldn't hand to `dns_task` before the next tick because the 32-slot ring was still full. Dropped, not blocked — the L2 hook never waits on the log. A nonzero count means a burst outran the drain rate for that window, not a bug; which specific queries were lost isn't recorded, only the count. |
@@ -136,6 +138,14 @@ A single JSON object. Field names are exactly as emitted.
 | `bypass_count` | int | Entries on the standing per-client bypass list (#74 Part 2). |
 | `blocklist_dropped` | int | Entries lost to `BLOCKLIST_CAPACITY` on the last reload. |
 | `blocklist_feed_failures` | int | Extra feeds that hard-failed on the last publishing reload. Non-zero means the live list is missing whole sources, and the SD snapshot is vetoed. |
+| `rejected.regex` | int | Feed lines rejected as a `/regex/` pattern on the last reload (#117). No regex support on this board. |
+| `rejected.wildcard` | int | Feed lines rejected for a mid-pattern wildcard (`ex*.com`) on the last reload — distinct from the `*.domain` prefix shorthand, which is accepted and collapsed to the parent. |
+| `rejected.modifier` | int | Feed lines rejected for an unsupported `$` modifier (`$dnstype`, `$dnsrewrite`, `$denyallow`, `$badfilter`, an empty or duplicate modifier list, ...) on the last reload. |
+| `rejected.cosmetic` | int | Feed lines rejected as a `##` cosmetic/element-hiding rule on the last reload. |
+| `rejected.cidr` | int | Feed lines rejected as an IP/CIDR pattern on the last reload — this firmware filters names, not answers. |
+| `rejected.too_wide` | int | Feed lines rejected as too generic to mean anything (under 3 characters, or made only of `.` and `*`) on the last reload. |
+| `rejected.important_block` | int | Feed lines rejected because they combined `$important` with a plain block rule on the last reload — the feed block-table entry has no spare bit to carry the flag, so it's rejected and counted rather than silently accepted and then losing precedence fights it was written to win. `$important` is accepted on custom rules (see the `/custom/rules` row above). |
+| `exceptions_skipped` | int | `@@` exception lines seen in a feed on the last reload. Parsed and counted, but not yet stored anywhere — feed-level exceptions need a second table that doesn't exist yet, so these currently have no effect on any verdict. Non-zero here is a real, visible gap, not a bug. |
 | `sd_status` | string | SD-snapshot state: `unknown`, `absent` (no file — no card, or nothing written yet), `bad-magic`, `format-mismatch`, `bad-count`, `short-read`, `invalid-index`, `loaded`, `saved`, `open-failed`, `short-write`. On a board with no card fitted the steady state is `open-failed`: the boot load sets `absent`, then the post-download save fails to open the path. |
 | `sd_bytes` | int | Size of the SD snapshot seen at boot, bytes; 0 if there was none. |
 | `flash_status` | string | Flash-slot persistence state (#70): `unknown`, `absent` (partitions missing — pre-#70 image), `empty` (never written), `bad-count`, `short-read`, `invalid-index`, `loaded`, `saved`, `too-big`, `erase-failed`, `write-failed`. |

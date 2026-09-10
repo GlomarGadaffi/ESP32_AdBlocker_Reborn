@@ -111,15 +111,17 @@ bool rule_parse_next(const char *line, size_t len, size_t *cursor, rule_t *out);
 
 /*
  * FEED-only policy layered on top of the source-agnostic parse above: the
- * feed block-table entry is a bare 3-byte remainder with no spare bit (see
- * #117), so a FEED block rule cannot carry $important — accepting it and
- * silently dropping the flag would make it lose a precedence fight it was
- * explicitly written to win. Downgrades exactly that case (BLOCK with
+ * feed block-table entry is a bare 3-byte remainder with no spare bit for
+ * either flag (see #117). $important: accepting it and silently dropping
+ * the flag would make a FEED block rule lose a precedence fight it was
+ * explicitly written to win, so this downgrades that case (BLOCK with
  * RULE_IMPORTANT set) to REJECT/IMPORTANT_BLOCK_UNSUPPORTED in place.
- * Every other rule (any ALLOW, or a BLOCK without $important) is
- * untouched. Never call this for exception or custom rules — they have
- * somewhere to store the flag.
- */
+ * RULE_EXACT: same problem, opposite direction — there is nowhere to
+ * store "exact-only" either, so a feed "|domain^" is widened to
+ * sub-inclusive instead (over-blocking is the safe direction, same call
+ * already made for a bare feed domain). Every ALLOW rule is untouched —
+ * exception/custom rules have somewhere to store both flags, so this
+ * must never be called on them. */
 void rule_apply_feed_policy(rule_t *r);
 
 #ifdef __cplusplus

@@ -1867,13 +1867,37 @@ static esp_err_t handle_check(httpd_req_t *r)
     /* parse domain=xxx from form body */
     char decoded[256]; form_field(body, "domain", decoded, sizeof(decoded));
     char norm[256]; size_t nlen = domain_normalize(norm, sizeof(norm), decoded, strlen(decoded));
-    /* Match the real verdict path (dns_server.cpp): main list OR custom rules.
-     * Previously checked only the main list, so a domain blocked solely by a
-     * custom rule showed ALLOWED here even though it was genuinely sinkholed
-     * on the wire — the tool meant to verify a rule couldn't verify its own
+
+    /* (#103, #117) Match the real verdict path exactly, in the same order:
+     * rewrite first — a name with a matching rewrite never reaches the
+     * resolver at all on the wire — then the shared rank-ordered verdict
+     * (feed + whitelist + custom, including @@ exceptions and $important),
+     * reporting which source decided it. Previously this only checked the
+     * main list and never rewrites, so a rewritten or custom-rule-only
+     * name showed the wrong answer here even though the wire behaved
+     * correctly — the tool meant to verify a rule couldn't verify its own
      * kind of rule. */
-    bool blocked = (nlen > 0) &&
-        (blocklist_is_blocked(norm, nlen) || blocklist_custom_is_blocked(norm, nlen));
+    char verdict_text[64] = "ALLOWED";
+    const char *color = "green";
+    if (nlen > 0) {
+        uint32_t rw_ip = rewrite_lookup(norm);
+        if (rw_ip) {
+            snprintf(verdict_text, sizeof(verdict_text), "REWRITE -&gt; %u.%u.%u.%u",
+                     (unsigned)((rw_ip >> 24) & 0xFF), (unsigned)((rw_ip >> 16) & 0xFF),
+                     (unsigned)((rw_ip >> 8) & 0xFF), (unsigned)(rw_ip & 0xFF));
+            color = "blue";
+        } else {
+            bl_verdict_t v = blocklist_verdict(norm, nlen);
+            bool blocked = v.state == BL_BLOCK;
+            color = blocked ? "red" : "green";
+            if (v.state == BL_NO_MATCH) {
+                snprintf(verdict_text, sizeof(verdict_text), "ALLOWED");
+            } else {
+                snprintf(verdict_text, sizeof(verdict_text), "%s (%s)",
+                         blocked ? "BLOCKED" : "ALLOWED", blocklist_verdict_src_name(v.src));
+            }
+        }
+    }
 
     char safe[384]; html_escape(safe, sizeof(safe), norm);
     char page[768];
@@ -1881,7 +1905,7 @@ static esp_err_t handle_check(httpd_req_t *r)
         "<!DOCTYPE html><html><body><h2>Check result</h2>"
         "<p><b>%s</b> is <b style='color:%s'>%s</b></p>"
         "<a href='/'>Back</a></body></html>",
-        safe, blocked ? "red" : "green", blocked ? "BLOCKED" : "ALLOWED");
+        safe, color, verdict_text);
     send_html(r, page);
     return ESP_OK;
 }
@@ -2221,7 +2245,11 @@ static esp_err_t handle_custom_rules(httpd_req_t *r)
         return ESP_FAIL;
     }
     if (!blocklist_custom_set(decoded)) {
-        httpd_resp_send_err(r, HTTPD_500_INTERNAL_SERVER_ERROR, "");
+        /* (#117) blocklist_custom_set() validates before writing anything —
+         * the only realistic way to reach here from user input is too many
+         * rules or one too long, not an NVS failure. */
+        httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST,
+            "too many rules (max 256) or a rule over 63 chars");
         return ESP_FAIL;
     }
     httpd_resp_set_status(r, "303 See Other");

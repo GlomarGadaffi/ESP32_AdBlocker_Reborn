@@ -1,5 +1,6 @@
 #include "blocklist.h"
 #include "bl_table.h"
+#include "bl_rank.h"
 #include "domain.h"
 #include "http_fetch.h"
 #include "esp_heap_caps.h"
@@ -165,6 +166,20 @@ static _Atomic uint32_t    s_dropped = 0;   /* entries lost to capacity on last 
  * vetoes the SD snapshot so a degraded list can't become the warm-boot list. */
 static _Atomic uint32_t    s_feed_failures = 0;
 
+/* #117 per-reason reject counts from the last reload, published from
+ * load_ctx_t the same way s_dropped is — see on_domain_line(). A list
+ * that's mostly regex/wildcard/modifier rules a wave-1 sinkhole can't act
+ * on shows up here as such, instead of just as a smaller-than-expected
+ * domain count with no explanation. */
+static _Atomic uint32_t    s_rejected_regex            = 0;
+static _Atomic uint32_t    s_rejected_wildcard         = 0;
+static _Atomic uint32_t    s_rejected_modifier         = 0;
+static _Atomic uint32_t    s_rejected_cosmetic         = 0;
+static _Atomic uint32_t    s_rejected_cidr             = 0;
+static _Atomic uint32_t    s_rejected_too_wide         = 0;
+static _Atomic uint32_t    s_rejected_important_block  = 0;
+static _Atomic uint32_t    s_exceptions_skipped        = 0;
+
 /* Mutex guarding the whitelist AND custom-rules arrays. Created first thing in
  * blocklist_init(), before any NVS loader runs, so every writer/reader below can
  * rely on it. Serializes the httpd config-writer task against the dns_task
@@ -173,12 +188,24 @@ static SemaphoreHandle_t s_wl_mutex = NULL;
 
 /* ── Custom blocking rules (NVS-backed, inline text blob) (#14) ── */
 static char s_custom_entries[CUSTOM_RULES_MAX][64];
+/* Per-entry rank + exactness (#117), parallel to s_custom_entries: bits
+ * 0-1 are the rule's rank (rule_rank(), 0..3), bit 2 is RULE_EXACT. Kept
+ * as a packed byte rather than a second struct member on s_custom_entries
+ * so custom_probe_locked's scan touches only what it needs. */
+static uint8_t s_custom_flags[CUSTOM_RULES_MAX];
 static uint32_t s_custom_count = 0;
+/* Written only in custom_parse() under s_wl_mutex; read via atomic_load
+ * (relaxed) by the socket-path probe builder without the lock (the walk
+ * itself is what needs the lock, not this one summary byte). */
+static _Atomic uint8_t s_custom_max_rank = 0;   /* max rule_rank() over every entry */
 
-/* Caller must hold s_wl_mutex. */
+/* Caller must hold s_wl_mutex. Mirrors custom_validate() exactly — same
+ * parser, same input, same line-splitting — so a text that already passed
+ * validate cannot fail here; this pass only stores. */
 static void custom_parse(const char *text)
 {
     s_custom_count = 0;
+    uint8_t max_rank = 0;
     const char *p = text;
     while (*p && s_custom_count < CUSTOM_RULES_MAX) {
         /* isolate one line */
@@ -187,26 +214,67 @@ static void custom_parse(const char *text)
         size_t llen = (size_t)(p - line);
         if (*p) p++;
         while (llen > 0 && (line[llen-1] == '\r' || line[llen-1] == ' ')) llen--;
-        if (llen == 0 || line[0] == '#' || line[0] == '!') continue;
 
-        /* same extractor as the URL feeds: hosts prefixes, ||anchors^,
-         * digit-leading bare domains all handled in one place */
-        const char *start;
-        size_t len = domain_extract_token(line, llen, &start);
-        if (len == 0 || len >= 64) continue;
-        /* strip trailing dot */
-        while (len > 0 && start[len-1] == '.') len--;
-        if (len == 0) continue;
-        for (size_t i = 0; i < len; i++)
-            s_custom_entries[s_custom_count][i] = (char)tolower((unsigned char)start[i]);
-        s_custom_entries[s_custom_count][len] = '\0';
-        s_custom_count++;
+        size_t cursor = 0;
+        rule_t r;
+        while (s_custom_count < CUSTOM_RULES_MAX && rule_parse_next(line, llen, &cursor, &r)) {
+            if (r.kind == RULE_REJECT) continue;   /* unsupported syntax: skip, as today */
+            /* custom_validate() already refused the whole text if any token
+             * is >= 64 chars; defensive rather than trusting that across a
+             * future edit to either function. */
+            if (r.len >= sizeof(s_custom_entries[0])) continue;
+
+            for (size_t i = 0; i < r.len; i++)
+                s_custom_entries[s_custom_count][i] = (char)tolower((unsigned char)r.tok[i]);
+            s_custom_entries[s_custom_count][r.len] = '\0';
+
+            uint8_t rank  = rule_rank(r.kind, r.flags);
+            uint8_t exact = (r.flags & RULE_EXACT) ? 1 : 0;
+            s_custom_flags[s_custom_count] = (uint8_t)(rank | (exact << 2));
+            if (rank > max_rank) max_rank = rank;
+
+            s_custom_count++;
+        }
     }
+    atomic_store_explicit(&s_custom_max_rank, max_rank, memory_order_relaxed);
+}
+
+/* Side-effect-free dry run of custom_parse() over the same text: counts
+ * what would be stored and refuses the whole save if it would overflow
+ * CUSTOM_RULES_MAX or silently truncate an over-length entry — the #91/#92
+ * defect class (a rejected edit that looked like success) applied to the
+ * one remaining place it could still happen. Unsupported-syntax lines
+ * (regex, wildcard, an unhandled modifier, ...) are NOT a validation
+ * failure — those are skipped in the stored set exactly as today; only
+ * "this text would silently lose or truncate a rule it should have kept"
+ * refuses the save. Returns the rule count on success, or UINT32_MAX. */
+static uint32_t custom_validate(const char *text)
+{
+    uint32_t count = 0;
+    const char *p = text;
+    while (*p) {
+        const char *line = p;
+        while (*p && *p != '\n') p++;
+        size_t llen = (size_t)(p - line);
+        if (*p) p++;
+        while (llen > 0 && (line[llen-1] == '\r' || line[llen-1] == ' ')) llen--;
+
+        size_t cursor = 0;
+        rule_t r;
+        while (rule_parse_next(line, llen, &cursor, &r)) {
+            if (r.kind == RULE_REJECT) continue;
+            if (r.len >= sizeof(s_custom_entries[0])) return UINT32_MAX;
+            count++;
+        }
+    }
+    return count > CUSTOM_RULES_MAX ? UINT32_MAX : count;
 }
 
 bool blocklist_custom_set(const char *text)
 {
     if (!text) return false;
+    if (custom_validate(text) == UINT32_MAX) return false;
+
     nvs_handle_t h;
     if (nvs_open(NVS_NS, NVS_READWRITE, &h) != ESP_OK) return false;
     nvs_set_str(h, "custom_blk", text);
@@ -234,38 +302,11 @@ size_t blocklist_custom_get(char *buf, size_t cap)
     return len > 0 ? len - 1 : 0;
 }
 
-bool blocklist_custom_is_blocked(const char *domain, size_t len)
-{
-    if (!domain) return false;
-    if (atomic_load_explicit(&s_paused, memory_order_relaxed)) return false;
-    /* Bounded take: if the writer is mid-rewrite, treat as no-match and forward
-     * (fail-open) rather than stall the dns_task hot path. Same contract as
-     * blocklist_whitelist_contains (C1). */
-    /* (#99) No rules -> no lock: this ran on every uncached query and was the
-     * main source of contention against the L2 hook's zero-wait take. */
-    if (s_custom_count == 0) return false;
-    if (xSemaphoreTake(s_wl_mutex, pdMS_TO_TICKS(2)) != pdTRUE) return false;
-    bool blocked = false;
-    {
-        const char *name = domain;
-        while (name < domain + len) {
-            size_t rlen = (size_t)((domain + len) - name);
-            for (uint32_t i = 0; i < s_custom_count; i++) {
-                size_t elen = strlen(s_custom_entries[i]);
-                if (rlen == elen && memcmp(name, s_custom_entries[i], rlen) == 0) {
-                    blocked = true;
-                    break;
-                }
-            }
-            if (blocked) break;
-            const char *dot = memchr(name, '.', rlen);
-            if (!dot) break;
-            name = dot + 1;
-        }
-    }
-    xSemaphoreGive(s_wl_mutex);
-    return blocked;
-}
+/* blocklist_custom_is_blocked() is gone (#117): its bool-only contract is
+ * exactly the defect this issue exists to close — a custom @@ rule cannot
+ * be expressed through a boolean at all. custom_probe_locked() below is
+ * its replacement, feeding the shared rank resolver rather than a second
+ * standalone verdict. */
 
 static void custom_load_nvs(void)
 {
@@ -373,7 +414,15 @@ typedef struct {
     uint8_t  *buf;            /* staging records, BL_REC_BYTES each */
     uint32_t  cap;
     uint32_t  n;
-    uint32_t  rejected;
+    uint32_t  rejected;       /* total, every reason */
+    uint32_t  rejected_regex;
+    uint32_t  rejected_wildcard;
+    uint32_t  rejected_modifier;
+    uint32_t  rejected_cosmetic;
+    uint32_t  rejected_cidr;
+    uint32_t  rejected_too_wide;
+    uint32_t  rejected_important_block;  /* #117: $important on a feed BLOCK rule */
+    uint32_t  exceptions_skipped;        /* #117: @@ rules seen, no table yet (e-ii) */
     uint32_t  dropped;        /* lost to capacity (surfaced after load) */
     uint32_t  sorted_prefix;  /* buf[0..sorted_prefix) is sorted+deduped - every
                                * feed folded in so far, not just the primary;
@@ -393,32 +442,59 @@ static bool on_domain_line(const char *line, size_t len, void *ctx)
      * than needing a distinct stopped state threaded through blocklist_load. */
     if (atomic_load_explicit(&s_stop_requested, memory_order_relaxed)) return false;
 
-    /* Hosts-format prefixes and adblock ||anchors^ must be peeled off, or the
-     * whole raw line hashes as one junk entry: the feed then reports a healthy
-     * domain count while blocking nothing (silent-corruption bug, wave 1). */
-    const char *tok;
-    size_t tlen = domain_extract_token(line, len, &tok);
-    if (tlen == 0) { lc->rejected++; return true; }
+    /* #117: a line can now yield more than one rule (hosts-format multi-
+     * domain), so this is a loop rather than a single extract-and-store. */
+    size_t cursor = 0;
+    rule_t r;
+    while (rule_parse_next(line, len, &cursor, &r)) {
+        /* FEED-only policy: $important can't be honoured on a block entry
+         * (the 3-byte table has no spare bit), and RULE_EXACT can't either
+         * (same reason) — widened to sub-inclusive, the safe over-block
+         * direction, same call as the bare-domain divergence already
+         * documented in domain_extract_token(). */
+        rule_apply_feed_policy(&r);
 
-    char norm[256];
-    size_t nlen = domain_normalize(norm, sizeof(norm), tok, tlen);
-    if (nlen == 0 || domain_is_bare_tld(norm, nlen)) return true;
+        if (r.kind == RULE_REJECT) {
+            lc->rejected++;
+            switch (r.reject_reason) {
+                case RULE_REJECT_REGEX:               lc->rejected_regex++; break;
+                case RULE_REJECT_WILDCARD:            lc->rejected_wildcard++; break;
+                case RULE_REJECT_MODIFIER:             lc->rejected_modifier++; break;
+                case RULE_REJECT_COSMETIC:             lc->rejected_cosmetic++; break;
+                case RULE_REJECT_CIDR:                 lc->rejected_cidr++; break;
+                case RULE_REJECT_TOO_WIDE:             lc->rejected_too_wide++; break;
+                case RULE_REJECT_IMPORTANT_BLOCK_UNSUPPORTED: lc->rejected_important_block++; break;
+                default: break;   /* MALFORMED folds into the total only */
+            }
+            continue;
+        }
+        if (r.kind == RULE_ALLOW) {
+            /* No feed exception table yet (#117 stage e-ii) — counted so the
+             * gap is visible rather than the line silently vanishing. */
+            lc->exceptions_skipped++;
+            continue;
+        }
 
-    uint64_t h = bl_hash40(norm, nlen);
-    /* Extra-list entry: binary-search everything already folded into the sorted
-     * prefix so a duplicate costs no capacity. Capacity binds near the DEDUPED
-     * union instead of the raw one - what makes OISD + Ultimate + TIF fit. */
-    if (lc->sorted_prefix && bl_records_contain(lc->buf, lc->sorted_prefix, h)) {
-        lc->deduped++;
-        return true;
+        char norm[256];
+        size_t nlen = domain_normalize(norm, sizeof(norm), r.tok, r.len);
+        if (nlen == 0 || domain_is_bare_tld(norm, nlen)) continue;
+
+        uint64_t h = bl_hash40(norm, nlen);
+        /* Extra-list entry: binary-search everything already folded into the sorted
+         * prefix so a duplicate costs no capacity. Capacity binds near the DEDUPED
+         * union instead of the raw one - what makes OISD + Ultimate + TIF fit. */
+        if (lc->sorted_prefix && bl_records_contain(lc->buf, lc->sorted_prefix, h)) {
+            lc->deduped++;
+            continue;
+        }
+        /* Capacity check belongs HERE, not at entry: everything above can still
+         * decide this line stores nothing (junk, bare TLD, already present), and
+         * counting those as drops inflated the figure severalfold - a feed of
+         * comments read as thousands of "lost domains". Only a genuinely storable
+         * new hash that has nowhere to go is a drop. */
+        if (lc->n >= lc->cap) { lc->dropped++; continue; }  /* surfaced after load, never silent */
+        bl_rec_put(lc->buf + (size_t)lc->n++ * BL_REC_BYTES, h);
     }
-    /* Capacity check belongs HERE, not at entry: everything above can still
-     * decide this line stores nothing (junk, bare TLD, already present), and
-     * counting those as drops inflated the figure severalfold - a feed of
-     * comments read as thousands of "lost domains". Only a genuinely storable
-     * new hash that has nowhere to go is a drop. */
-    if (lc->n >= lc->cap) { lc->dropped++; return true; }  /* surfaced after load, never silent */
-    bl_rec_put(lc->buf + (size_t)lc->n++ * BL_REC_BYTES, h);
     return true;
 }
 
@@ -687,6 +763,14 @@ uint32_t blocklist_load(void)
     }
     atomic_store(&s_dropped, lc.dropped);
     atomic_store(&s_feed_failures, feed_failures);
+    atomic_store(&s_rejected_regex, lc.rejected_regex);
+    atomic_store(&s_rejected_wildcard, lc.rejected_wildcard);
+    atomic_store(&s_rejected_modifier, lc.rejected_modifier);
+    atomic_store(&s_rejected_cosmetic, lc.rejected_cosmetic);
+    atomic_store(&s_rejected_cidr, lc.rejected_cidr);
+    atomic_store(&s_rejected_too_wide, lc.rejected_too_wide);
+    atomic_store(&s_rejected_important_block, lc.rejected_important_block);
+    atomic_store(&s_exceptions_skipped, lc.exceptions_skipped);
     if (feed_failures > 0)
         ESP_LOGE(TAG, "%" PRIu32 " extra feed(s) failed — the live list is missing whole sources",
                  feed_failures);
@@ -757,50 +841,12 @@ uint32_t blocklist_load(void)
     return unique;
 }
 
-/* Internal: binary search in sorted PSRAM array + whitelist check.
- * wl_check is either blocklist_whitelist_contains (blocking) or
- * blocklist_whitelist_contains_nb (non-blocking for L2 eth RX task). */
-typedef bool (*wl_fn_t)(const char *, size_t);
-
-/* IRAM_ATTR (#78): blocklist_is_blocked_nb() -> here is the verdict call on
- * the L2 fast path (dns_sink.cpp's l2_input_cb), which must never fault to
- * flash. domain_is_bare_tld() and the wl_check callback it invokes are NOT
- * tagged — out of this pass's scope, a real gap if full coverage matters. */
-static bool IRAM_ATTR is_blocked_impl(const char *domain, size_t len, wl_fn_t wl_check)
-{
-    if (atomic_load_explicit(&s_paused, memory_order_relaxed)) return false;
-    const uint8_t *img = atomic_load_explicit(&s_live, memory_order_acquire);
-    if (!img) return false;
-    if (atomic_load_explicit(&s_count, memory_order_relaxed) == 0) return false;
-
-    const char *p = domain;
-    size_t remaining = len;
-
-    while (remaining > 0) {
-        if (!domain_is_bare_tld(p, remaining)) {
-            if (wl_check(p, remaining)) return false;
-
-            /* One index read picks the bucket, then a few probes inside it —
-             * against ~20 scattered probes over the whole array before. */
-            if (bl_image_contains(img, bl_hash40(p, remaining))) return true;
-        }
-        const char *dot = (const char *)memchr(p, '.', remaining);
-        if (!dot) break;
-        remaining -= (size_t)(dot - p) + 1;
-        p = dot + 1;
-    }
-    return false;
-}
-
-bool blocklist_is_blocked(const char *domain, size_t len)
-{
-    return is_blocked_impl(domain, len, blocklist_whitelist_contains);
-}
-
-bool blocklist_is_blocked_nb(const char *domain, size_t len)
-{
-    return is_blocked_impl(domain, len, blocklist_whitelist_contains_nb);
-}
+/* is_blocked_impl() is gone (#117): it was a second, independent verdict
+ * implementation next to the hand-copied ORs in dns_server.cpp/web_ui.cpp —
+ * exactly the "fifth ladder" this issue exists to close. Its suffix walk
+ * lives on as bl_rank_resolve()'s (bl_rank.c); blocklist_verdict{,_nb}()
+ * below, defined once wl_contains_locked() is in scope, are what replace
+ * it and blocklist_is_blocked{,_nb}() are now thin wrappers over those. */
 
 bool blocklist_is_paused(void)
 {
@@ -882,7 +928,7 @@ bool blocklist_whitelist_remove(const char *domain)
     return found;
 }
 
-static bool wl_contains_locked(const char *domain, size_t len)
+static bool IRAM_ATTR wl_contains_locked(const char *domain, size_t len)
 {
     for (uint32_t i = 0; i < s_wl_count; i++) {
         size_t wlen = strlen(s_whitelist[i]);
@@ -892,32 +938,180 @@ static bool wl_contains_locked(const char *domain, size_t len)
     return false;
 }
 
-bool blocklist_whitelist_contains(const char *domain, size_t len)
+/* ── Rank-ordered verdict (#117) ──────────────────────────────────────
+ * The shared resolver every verdict path now goes through: bl_rank.c's
+ * pure suffix walk, fed the feed block table + whitelist + custom rules
+ * as rank_source_t probes. No feed exception table yet (#117 stage e-ii)
+ * — a feed's @@ lines parse and are counted (on_domain_line's
+ * exceptions_skipped) but have nowhere to be stored, so they cannot yet
+ * change a verdict; only custom @@ rules and the whitelist can. */
+
+/* Probe: feed block table. ctx is the published image pointer, read once
+ * by the caller before the walk starts (not re-read per probe call — a
+ * mid-walk reload is caught by the snapshot-changed check in
+ * blocklist_verdict_nb, not by this probe). Always rank 0: a FEED
+ * $important block is downgraded to REJECT before it ever reaches this
+ * table (rule_apply_feed_policy, called from on_domain_line), and a feed
+ * can only ever produce a block in this stage. */
+static bool IRAM_ATTR feed_probe(void *ctx, const char *suffix, size_t len,
+                                  uint8_t depth, uint8_t *rank_out)
 {
-    /* Use a bounded wait so the dns_task hot path can't stall indefinitely if
-     * an NVS commit from whitelist_add is holding the mutex (same contract as
-     * the _nb non-blocking variant used by the L2 eth RX task). */
-    if (xSemaphoreTake(s_wl_mutex, pdMS_TO_TICKS(2)) != pdTRUE)
-        return false;  /* mutex busy — treat as not whitelisted; safe fail-closed */
-    bool found = wl_contains_locked(domain, len);
-    xSemaphoreGive(s_wl_mutex);
-    return found;
+    (void)depth;
+    const uint8_t *img = (const uint8_t *)ctx;
+    if (!img) return false;
+    if (!bl_image_contains(img, bl_hash40(suffix, len))) return false;
+    *rank_out = 0;
+    return true;
 }
 
-/* Non-blocking: used from the L2 eth RX task where portMAX_DELAY would stall
- * all Ethernet while a whitelist NVS commit is in progress (#37). */
-bool blocklist_whitelist_contains_nb(const char *domain, size_t len)
+/* Probe: NVS whitelist. Caller holds s_wl_mutex for the whole walk — this
+ * does not take it. Always rank 1 (ALLOW), sub-inclusive (flags=0, never
+ * RULE_EXACT): a whitelist entry unblocks its whole subtree, matching
+ * today's wl_contains_locked-inside-the-suffix-walk behaviour exactly —
+ * see the "BEHAVIOUR CHANGE: the whitelist becomes rank-dominant" note in
+ * #117 for why a feed block under a whitelisted parent now loses. */
+static bool IRAM_ATTR wl_probe_locked(void *ctx, const char *suffix, size_t len,
+                                       uint8_t depth, uint8_t *rank_out)
 {
-    /* (#99) Busy -> report "whitelisted". That makes is_blocked_impl say
-     * "not blocked", so the L2 hook doesn't answer and hands the frame to
-     * lwIP, where the socket path re-decides with its bounded wait. The old
-     * `return false` meant "not whitelisted" = BLOCK, i.e. the exact opposite
-     * of the allow-through this comment always claimed. */
-    if (xSemaphoreTake(s_wl_mutex, 0) != pdTRUE)
-        return true;
-    bool found = wl_contains_locked(domain, len);
+    (void)ctx; (void)depth;
+    if (!wl_contains_locked(suffix, len)) return false;
+    *rank_out = 1;
+    return true;
+}
+
+/* Probe: custom rules. Caller holds s_wl_mutex for the whole walk — this
+ * does not take it. s_custom_flags[i] packs rank (bits 0-1) and RULE_EXACT
+ * (bit 2), set once at parse time by custom_parse(); rank_rule_applies()
+ * gates an exact entry to depth 0 exactly as any other source's would. */
+static bool IRAM_ATTR custom_probe_locked(void *ctx, const char *suffix, size_t len,
+                                           uint8_t depth, uint8_t *rank_out)
+{
+    (void)ctx;
+    bool found = false;
+    uint8_t best = 0;
+    for (uint32_t i = 0; i < s_custom_count; i++) {
+        size_t elen = strlen(s_custom_entries[i]);
+        if (elen != len || memcmp(s_custom_entries[i], suffix, len) != 0) continue;
+        uint8_t flagbyte = s_custom_flags[i];
+        uint8_t exact_flag = (flagbyte & (1u << 2)) ? RULE_EXACT : 0;
+        if (!rank_rule_applies(exact_flag, depth)) continue;
+        uint8_t r = flagbyte & 0x3;
+        if (!found || r > best) { best = r; found = true; }
+    }
+    if (!found) return false;
+    *rank_out = best;
+    return true;
+}
+
+/* Socket path: bounded ~2ms take on the small tables (whitelist + custom
+ * rules share one lock, one take for the whole walk — strictly LESS
+ * contention than the old is_blocked_impl()'s per-suffix-level wl_check
+ * take). A busy take fails open: NO_MATCH with .unproven set,
+ * so the caller forwards the query without caching the answer — the same
+ * #99-class fail-open contract the old per-caller whitelist checks used
+ * to have, now expressed once instead of independently per caller. */
+bl_verdict_t blocklist_verdict(const char *name, size_t len)
+{
+    bl_verdict_t v = { .state = BL_NO_MATCH, .rank = 0, .unproven = 0, .src = 0xFF, .depth = 0 };
+    if (atomic_load_explicit(&s_paused, memory_order_relaxed)) return v;
+
+    const uint8_t *img = atomic_load_explicit(&s_live, memory_order_acquire);
+
+    if (xSemaphoreTake(s_wl_mutex, pdMS_TO_TICKS(2)) != pdTRUE) {
+        v.unproven = 1;
+        return v;   /* fail open: forward, don't cache — caller's job */
+    }
+
+    rank_source_t srcs[3];
+    size_t n = 0;
+    srcs[n++] = (rank_source_t){ .probe = feed_probe, .ctx = (void *)img, .max_rank = 0 };
+    srcs[n++] = (rank_source_t){ .probe = wl_probe_locked, .ctx = NULL,
+                                  .max_rank = s_wl_count ? 1 : 0 };
+    srcs[n++] = (rank_source_t){ .probe = custom_probe_locked, .ctx = NULL,
+                                  .max_rank = atomic_load_explicit(&s_custom_max_rank, memory_order_relaxed) };
+
+    v = bl_rank_resolve(name, len, srcs, n);
     xSemaphoreGive(s_wl_mutex);
-    return found;
+    return v;
+}
+
+/* L2 hook: never blocks. Returns 1 with *out filled (a proven verdict —
+ * the hook may act on it); BL_DEFER_LOCK_BUSY or BL_DEFER_SNAPSHOT means
+ * the hook must defer (hand the frame to lwIP) because this could not be
+ * proven without stalling — distinguished so the caller can count each
+ * reason separately (dns_sink.cpp's l2_defer_lock_busy / l2_defer_snapshot).
+ * Both values are negative, so a caller that only cares "must I defer" can
+ * still just test `< 0`.
+ *
+ * Issue #117 §5's literal defer condition only defers "if the zero-wait
+ * take fails AND an allow-capable table is non-empty" — which would mean
+ * reading s_wl_count, or an ALLOW-rule count for the custom table, WITHOUT
+ * the lock, since the take already failed. That is exactly the wrong
+ * moment to trust an unlocked read: the one busy window is precisely when
+ * a writer might be flipping
+ * one of those counts 0 -> 1, and a stale "0" read right then would walk
+ * feed-only and block a name someone just unblocked — one wrong verdict
+ * per first-allow-rule, reproducible with a single client. Deferring
+ * unconditionally on ANY failed take closes that race. s_wl_mutex guards
+ * ONLY the whitelist and custom-rules arrays, so "the take is busy" is
+ * already synonymous with "an admin write to one of them is in flight" —
+ * the cost is one fast-path miss per query during that window, which is
+ * not a steady state. */
+int IRAM_ATTR blocklist_verdict_nb(const char *name, size_t len, bl_verdict_t *out)
+{
+    *out = (bl_verdict_t){ .state = BL_NO_MATCH, .rank = 0, .unproven = 0, .src = 0xFF, .depth = 0 };
+    if (atomic_load_explicit(&s_paused, memory_order_relaxed)) return 1;
+
+    const uint8_t *img = atomic_load_explicit(&s_live, memory_order_acquire);
+
+    if (xSemaphoreTake(s_wl_mutex, 0) != pdTRUE) return BL_DEFER_LOCK_BUSY;   /* see comment above: never guess */
+
+    rank_source_t srcs[3];
+    size_t n = 0;
+    srcs[n++] = (rank_source_t){ .probe = feed_probe, .ctx = (void *)img, .max_rank = 0 };
+    srcs[n++] = (rank_source_t){ .probe = wl_probe_locked, .ctx = NULL,
+                                  .max_rank = s_wl_count ? 1 : 0 };
+    srcs[n++] = (rank_source_t){ .probe = custom_probe_locked, .ctx = NULL,
+                                  .max_rank = atomic_load_explicit(&s_custom_max_rank, memory_order_relaxed) };
+
+    *out = bl_rank_resolve(name, len, srcs, n);
+    xSemaphoreGive(s_wl_mutex);
+
+    /* Defer condition 3 (#117 §5): a reload published underneath this
+     * walk. The image pointer read above could be stale by the time the
+     * walk finished — re-read and compare rather than trust it. */
+    if (atomic_load_explicit(&s_live, memory_order_acquire) != img) return BL_DEFER_SNAPSHOT;
+    return 1;
+}
+
+/* Human-readable label for a bl_verdict_t.src (#103, #117) — POST /check
+ * and the query log, reporting only, never precedence law. Indices match
+ * the srcs[] construction order in blocklist_verdict{,_nb}() above
+ * (feed, whitelist, custom) — the two must be kept in sync; there's
+ * nothing else tying them together. */
+const char *blocklist_verdict_src_name(uint8_t src)
+{
+    switch (src) {
+        case 0:  return "feed";
+        case 1:  return "whitelist";
+        case 2:  return "custom";
+        default: return "none";
+    }
+}
+
+/* Thin wrappers (#117): blocklist_is_blocked{,_nb}() stay bool-only,
+ * because pause.h and this header's own prose still name them, and a
+ * second boolean implementation next to blocklist_verdict{,_nb}() would
+ * be exactly the "fifth ladder" defect this issue exists to close. */
+bool blocklist_is_blocked(const char *domain, size_t len)
+{
+    return blocklist_verdict(domain, len).state == BL_BLOCK;
+}
+
+bool blocklist_is_blocked_nb(const char *domain, size_t len)
+{
+    bl_verdict_t v;
+    return blocklist_verdict_nb(domain, len, &v) == 1 && v.state == BL_BLOCK;
 }
 
 uint32_t blocklist_whitelist_count(void)
@@ -1279,6 +1473,15 @@ uint32_t blocklist_domain_count(void)  { return atomic_load(&s_count); }
 bool     blocklist_is_loading(void)    { return atomic_load(&s_loading); }
 uint32_t blocklist_dropped_count(void) { return atomic_load(&s_dropped); }
 uint32_t blocklist_feed_failures(void) { return atomic_load(&s_feed_failures); }
+
+uint32_t blocklist_rejected_regex(void)            { return atomic_load(&s_rejected_regex); }
+uint32_t blocklist_rejected_wildcard(void)         { return atomic_load(&s_rejected_wildcard); }
+uint32_t blocklist_rejected_modifier(void)         { return atomic_load(&s_rejected_modifier); }
+uint32_t blocklist_rejected_cosmetic(void)         { return atomic_load(&s_rejected_cosmetic); }
+uint32_t blocklist_rejected_cidr(void)             { return atomic_load(&s_rejected_cidr); }
+uint32_t blocklist_rejected_too_wide(void)         { return atomic_load(&s_rejected_too_wide); }
+uint32_t blocklist_rejected_important_block(void)  { return atomic_load(&s_rejected_important_block); }
+uint32_t blocklist_exceptions_skipped(void)        { return atomic_load(&s_exceptions_skipped); }
 
 void blocklist_stop_load(void)
 {

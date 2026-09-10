@@ -1,11 +1,11 @@
 #include "bl_rank.h"
 #include <string.h>
 
-/* IRAM_ATTR (#117, following #78's precedent on bl_image_contains /
- * is_blocked_impl): this becomes the L2 fast-path verdict call once (e)
- * wires blocklist.c's _nb probes through it. On the definition only — see
- * bl_rank.h's comment and bl_table.h's bl_hash40 for why repeating it on
- * the declaration fails under -Werror=attributes. */
+/* IRAM_ATTR (#117, following #78's precedent on bl_image_contains and the
+ * old is_blocked_impl): this is the L2 fast-path verdict call, reached via
+ * blocklist_verdict_nb()'s probe walk (stage e-i, blocklist.c). On the
+ * definition only — see bl_rank.h's comment and bl_table.h's bl_hash40 for
+ * why repeating it on the declaration fails under -Werror=attributes. */
 bl_verdict_t IRAM_ATTR bl_rank_resolve(const char *name, size_t len,
                                         const rank_source_t *srcs, size_t nsrcs)
 {

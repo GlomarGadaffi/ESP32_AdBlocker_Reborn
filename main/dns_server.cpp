@@ -693,6 +693,15 @@ struct UpstreamEntry {
                                         answer, and a paused client never rides an existing
                                         flight whose reply would still get the ordinary
                                         cloaking check. */
+    bool             exempt;         /* (#117) the queried name's own verdict was ALLOW
+                                        (an @@ exception or whitelist entry outranked
+                                        every BLOCK for it). The CNAME-cloaking check in
+                                        process_reply is skipped for it, same reasoning
+                                        as `paused` above: a user who explicitly allowed
+                                        this name does not want a blocklisted CNAME
+                                        target to sinkhole it anyway. Independent of
+                                        `paused` — either alone gates the cloaking check
+                                        at the same line. */
     uint8_t          n_wait;         /* coalesced waiters (#76) */
     bool             hedged;         /* (#69) retransmit already fired — at most one per flight */
     uint16_t         hedge_qlen;     /* (#69) stashed wire bytes in s_hedge_q; 0 = not
@@ -762,6 +771,7 @@ static UpstreamEntry *upstream_alloc(uint16_t *our_txid_out)
             s_upstream[i].refresh_only = false;
             s_upstream[i].no_cache     = false;   /* (#106) recycled slot */
             s_upstream[i].paused       = false;   /* (#48) ditto — never inherit a pause */
+            s_upstream[i].exempt       = false;   /* (#117) ditto — never inherit an exemption */
             s_upstream[i].n_wait       = 0;   /* (#76) a recycled slot must not
                                                  fan out to its predecessor's waiters */
             s_upstream[i].hedged       = false; /* (#69) hedge state is per-flight: a stale
@@ -1161,10 +1171,11 @@ static bool decompress_name(const uint8_t *pkt, int len, int *off,
 
 static inline bool name_is_blocked_any(const char *name, size_t len)
 {
-    /* Both checks, same OR the two real call sites (UDP ~line 1661, TCP
-     * ~line 1811) already use — blocklist_is_blocked() and the custom
-     * inline-rules list are independent, not one-covers-the-other. */
-    return blocklist_is_blocked(name, len) || blocklist_custom_is_blocked(name, len);
+    /* (#117) blocklist_is_blocked() is now a thin wrapper over the shared
+     * rank resolver (feed + whitelist + custom, including @@ and
+     * $important) — the hand-copied OR with blocklist_custom_is_blocked()
+     * this used to need is gone along with that function. */
+    return blocklist_is_blocked(name, len);
 }
 
 /* CNAME-cloaking inspection (#74): a tracker hiding behind a CNAME to a
@@ -1409,8 +1420,12 @@ void DnsSinkServer::run_loop()
              * answer before either delivery or caching sees it. */
             /* (#48) A paused requester is the one case where a reply whose own
              * name is on the blocklist must be delivered verbatim — re-blocking
-             * it here would undo the pause after the fact. */
-            bool cloaked = !ue->paused && cname_chain_is_blocked(pkt, plen, rqend);
+             * it here would undo the pause after the fact.
+             * (#117) Same idea for `exempt`: if the queried name's own verdict
+             * was ALLOW (an @@ exception or the whitelist outranked every
+             * BLOCK), a blocklisted CNAME target must not sinkhole it anyway —
+             * that is exactly what the user's explicit allow was for. */
+            bool cloaked = !ue->paused && !ue->exempt && cname_chain_is_blocked(pkt, plen, rqend);
             if (cloaked) {
                 static uint8_t cloak_blocked[320];  /* worst case: 271 B question (12 hdr +
                                                         255 B max name + 4 qtype/qclass) +
@@ -1827,6 +1842,12 @@ void DnsSinkServer::run_loop()
                 bool paused_client   = cls_in && pause_active_for(ntohl(client_addr.sin_addr.s_addr));
                 bool bypassed_client = cls_in && bypass_active_for(ntohl(client_addr.sin_addr.s_addr));
                 bool fwd_no_cache    = paused_client || bypassed_client;
+                /* (#117) Set from the verdict below, independent of the pause/
+                 * bypass override on is_blk — this reflects the queried name's
+                 * own verdict, not what gets delivered to this particular
+                 * client. Declared here, same reason as the flags above: ahead
+                 * of `goto forward`. */
+                bool verdict_exempt  = false;
 
                 /* (#100) The rewrite verdict is taken BEFORE the cache, not after
                  * it. A rule added while an answer for that name sat in the cache
@@ -1959,8 +1980,20 @@ void DnsSinkServer::run_loop()
                  * local initializations (illegal in C++). */
                 {
                     int64_t t_lk = esp_timer_get_time();
-                    bool is_blk = cls_in && (blocklist_is_blocked(name, nlen) ||
-                                             blocklist_custom_is_blocked(name, nlen));
+                    /* (#117) One shared rank-ordered verdict — feed + whitelist
+                     * + custom rules, including @@ exceptions and $important —
+                     * instead of the hand-copied OR this used to be. Skipped
+                     * for a non-IN query exactly as the old OR was (short-
+                     * circuited by cls_in && ...), not just its result discarded. */
+                    bl_verdict_t v = { .state = BL_NO_MATCH, .rank = 0,
+                                        .unproven = 0, .src = 0xFF, .depth = 0 };
+                    if (cls_in) v = blocklist_verdict(name, nlen);
+                    bool is_blk = v.state == BL_BLOCK;
+                    verdict_exempt = v.state == BL_ALLOW;
+                    /* A busy small-table take (.unproven) must not poison the
+                     * cache with a guessed verdict — isolate this delivery
+                     * exactly like a pause/bypass does, for the same reason. */
+                    fwd_no_cache |= v.unproven;
                     hist_record(&s_h_lookup, esp_timer_get_time() - t_lk);
                     if (paused_client || bypassed_client) {
                         /* (#48/#74) If the verdict is BLOCKED, that is what the
@@ -2032,6 +2065,7 @@ void DnsSinkServer::run_loop()
                     ue->env_hash    = eh;
                     ue->no_cache    = !cls_in || fwd_no_cache;   /* (#106) class; (#48) pause */
                     ue->paused      = fwd_no_cache;              /* (#48) */
+                    ue->exempt      = verdict_exempt;             /* (#117) */
                     randomize_qname_case(rx, qend);   /* (#72) */
                     ue->case_hash   = query_case_hash(rx, qend);
 
@@ -2126,6 +2160,7 @@ void DnsSinkServer::run_loop()
                         bool paused_client   = cls_in && pause_active_for(s_tcp.peer_ip);
                         bool bypassed_client = cls_in && bypass_active_for(s_tcp.peer_ip);
                         bool tcp_no_cache    = paused_client || bypassed_client;
+                        bool verdict_exempt  = false;   /* (#117), set below; see UDP's twin */
 
                         /* (#100) Rewrite verdict before the cache, as on UDP. */
                         uint32_t rw_pre = (cls_in && qtype == 1) ? rewrite_lookup(name) : 0;
@@ -2153,9 +2188,13 @@ void DnsSinkServer::run_loop()
                             }
                         } else {
                             uint32_t rw_ip = rw_pre;
-                            bool is_blk = !rw_ip && cls_in &&
-                                          (blocklist_is_blocked(name, nlen) ||
-                                           blocklist_custom_is_blocked(name, nlen));
+                            /* (#117) Shared rank-ordered verdict, as on UDP. */
+                            bl_verdict_t v = { .state = BL_NO_MATCH, .rank = 0,
+                                                .unproven = 0, .src = 0xFF, .depth = 0 };
+                            if (!rw_ip && cls_in) v = blocklist_verdict(name, nlen);
+                            bool is_blk = v.state == BL_BLOCK;
+                            verdict_exempt = v.state == BL_ALLOW;
+                            tcp_no_cache |= v.unproven;
                             if (paused_client || bypassed_client) {
                                 /* (#48/#74) As on UDP: if the direct name is
                                  * BLOCKED, the cache learns it and this
@@ -2222,6 +2261,7 @@ void DnsSinkServer::run_loop()
                                     ue->env_hash = eh;
                                     ue->no_cache = !cls_in || tcp_no_cache;   /* (#106); (#48) */
                                     ue->paused   = tcp_no_cache;             /* (#48) */
+                                    ue->exempt   = verdict_exempt;           /* (#117) */
                                     ue->via_tcp  = true;
                                     ue->tcp_gen  = s_tcp.gen;
                                     randomize_qname_case(q, qend);   /* (#72) */
@@ -2296,6 +2336,8 @@ uint64_t DnsSinkServer::queries_blocked() const { return s_cnt_blocked; }
 extern "C" uint32_t dns_sink_l2_blocked(void);  /* L2 fast-path counters (dns_sink.cpp) */
 extern "C" uint32_t dns_sink_l2_cached(void);
 extern "C" uint32_t dns_sink_l2_tx_fail(void);
+extern "C" uint32_t dns_sink_l2_defer_lock_busy(void);   /* (#117) */
+extern "C" uint32_t dns_sink_l2_defer_snapshot(void);    /* (#117) */
 
 static void do_metrics_reset(void)
 {
@@ -2367,6 +2409,7 @@ int dns_server_metrics_json(char *out, size_t cap)
         "\"tcp_queries\":%" PRIu32 ","
         "\"l2_blocked\":%" PRIu32 ",\"l2_cached\":%" PRIu32 ",\"l2_tx_fail\":%" PRIu32 ","
         "\"l2_fallthrough\":%" PRIu32 ",\"l2_dns_fallthrough\":%" PRIu32 ",\"wd_restarts\":%" PRIu32 ","
+        "\"l2_defer_lock_busy\":%" PRIu32 ",\"l2_defer_snapshot\":%" PRIu32 ","
         "\"l2_log_dropped\":%" PRIu32 ","
         "\"census_dropped\":%" PRIu32 ","
         "\"case_mismatch\":%" PRIu32 ","
@@ -2384,6 +2427,13 @@ int dns_server_metrics_json(char *out, size_t cap)
         "\"bypass_count\":%" PRIu32 ","
         "\"blocklist_dropped\":%" PRIu32 ","
         "\"blocklist_feed_failures\":%" PRIu32 ","
+        /* (#117) Per-reason feed-line rejects from the last reload, so a
+         * list that's mostly regex/wildcard/modifier syntax a wave-1
+         * sinkhole can't act on shows up as such. */
+        "\"rejected\":{\"regex\":%" PRIu32 ",\"wildcard\":%" PRIu32 ",\"modifier\":%" PRIu32 ","
+        "\"cosmetic\":%" PRIu32 ",\"cidr\":%" PRIu32 ",\"too_wide\":%" PRIu32 ","
+        "\"important_block\":%" PRIu32 "},"
+        "\"exceptions_skipped\":%" PRIu32 ","
         "\"sd_status\":\"%s\",\"sd_bytes\":%" PRIu32 ","
         "\"flash_status\":\"%s\","
         "\"heap_free\":%u,\"heap_largest\":%u,\"psram_free\":%u,\"dns_task_stack_hwm\":%u,",
@@ -2394,6 +2444,7 @@ int dns_server_metrics_json(char *out, size_t cap)
         s_cnt_tcp,
         dns_sink_l2_blocked(), dns_sink_l2_cached(), dns_sink_l2_tx_fail(),
         dns_sink_l2_fallthrough(), dns_sink_l2_dns_fallthrough(), s_cnt_wd_restarts,
+        dns_sink_l2_defer_lock_busy(), dns_sink_l2_defer_snapshot(),
         dns_sink_l2log_dropped(),
         dns_sink_census_dropped(),
         s_cnt_case_mismatch,
@@ -2410,6 +2461,10 @@ int dns_server_metrics_json(char *out, size_t cap)
         bypass_count(),
         blocklist_dropped_count(),
         blocklist_feed_failures(),
+        blocklist_rejected_regex(), blocklist_rejected_wildcard(), blocklist_rejected_modifier(),
+        blocklist_rejected_cosmetic(), blocklist_rejected_cidr(), blocklist_rejected_too_wide(),
+        blocklist_rejected_important_block(),
+        blocklist_exceptions_skipped(),
         blocklist_sd_status(), blocklist_sd_bytes(),
         blocklist_flash_status(),
         (unsigned)free_int, (unsigned)big_int, (unsigned)free_psr, (unsigned)hwm);

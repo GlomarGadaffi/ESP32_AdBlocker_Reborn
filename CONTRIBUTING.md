@@ -24,13 +24,23 @@ A query can be answered from either of two places, in different tasks:
 
 The asymmetry that makes this safe is that **the L2 hook may only answer a query
 it can classify exactly as the socket path would, and must otherwise hand the
-frame over**. It answers in exactly two cases — a BLOCK verdict from
-`blocklist_is_blocked_nb()`, or a live forward-cache hit from
+frame over**. It answers in exactly two cases — a proven verdict from
+`blocklist_verdict_nb()`, or a live forward-cache hit from
 `dns_cache_l2_get()` — and *every other outcome falls through* to
 `esp_netif_receive()`, where the socket path runs the full ladder
-(ACL, rewrites, `blocklist_is_blocked() || blocklist_custom_is_blocked()`,
-upstream forward). So the hook's cheaper check set is not a divergence: it is a
-short-circuit that only fires where the full ladder would agree.
+(ACL, rewrites, `blocklist_verdict()`, upstream forward). So the hook's cheaper
+check set is not a divergence: it is a short-circuit that only fires where the
+full ladder would agree.
+
+**`blocklist_verdict{,_nb}()` (#117) is *the* verdict call, both paths.** It
+resolves the feed block table, the NVS whitelist, and custom rules — including
+`@@` exceptions and `$important` — into one rank-ordered answer instead of a
+hand-copied boolean OR; there is no second ladder left to drift out of sync.
+The `_nb` variant never blocks: it returns a proven verdict, or one of two
+distinct defer signals (`BL_DEFER_LOCK_BUSY`, `BL_DEFER_SNAPSHOT` —
+`dns_sink.cpp`'s `l2_defer_lock_busy` / `l2_defer_snapshot` counters, surfaced
+in `/metrics`) that fold into the same `break`-to-lwIP rule as everything else
+in this hook.
 
 Everything the hook cannot vouch for `break`s, and every `break` means "let lwIP
 have it" — never "drop it". That covers a header it will not trust, a lock it
@@ -45,12 +55,19 @@ provable ACL pass from `acl_permits_nb()`; and no matching entry in
 answer, only a slower one.
 
 If you add a rule that can turn a BLOCK into an ALLOW — a new whitelist-like
-exemption — it must be visible to `blocklist_is_blocked_nb()`, or the L2 hook
+exemption — it must be visible to `blocklist_verdict_nb()`, or the L2 hook
 will sinkhole something the socket path would have let through. A rule that
 *changes* the answer rather than allowing it (rewrites) must make the hook
-defer, not answer. Adding a rule that only ever creates *more* blocking (like
-the custom inline rules) is safe to leave off the hook; it just doesn't get the
-fast path.
+defer, not answer. **A custom or feed rule that only ever creates *more*
+blocking is safe to leave off the hook — that half is still true — but it stops
+being the whole story the moment the same table can also carry an ALLOW
+(`@@`).** A BLOCK-kind entry costs the fast path nothing extra; an ALLOW-kind
+entry rides the whitelist's single zero-wait take (`s_wl_mutex`, one take for
+the whole suffix walk that also covers the custom-rule table — an empty
+custom table just means a zero-iteration probe once that take succeeds) and,
+if the take is busy, the hook defers unconditionally rather than trust an
+unlocked read of whether an exception exists — see `blocklist_verdict_nb()`'s
+own comment for why.
 
 The ACL gap this file used to document — a non-ACL client still getting
 sinkhole replies and cache hits over Ethernet — was #87, and is fixed.
@@ -64,15 +81,12 @@ leak into every later client's answer. Two rules follow:
 * **Global state → bump the generation.** `blocklist_generation_bump()` in
   `blocklist.c` increments `s_blocklist_gen`; every cache entry is stamped with
   the generation live at store time, and a lookup under a newer generation is
-  treated as a miss. Today exactly two events bump it: a reload that swaps in a
-  new live list (#85) and a pause flip (#86).
-
-  Note that `blocklist_whitelist_add()` / `_remove()` and
-  `blocklist_custom_set()` do **not** bump, even though `is_blocked_impl()`
-  consults the whitelist inside the cached verdict. A cached BLOCK therefore
-  survives a whitelist add, and a cached ALLOW survives a custom-rule add,
-  until the entry's TTL expires. If you touch these paths, that is the bump
-  they are missing.
+  treated as a miss. A reload that swaps in a new live list (#85), a pause
+  flip (#86), and every whitelist/custom-rule mutation
+  (`blocklist_whitelist_add()`/`_remove()`, `blocklist_custom_set()`, #88)
+  all bump it, since `blocklist_verdict{,_nb}()` consults both tables inside
+  the cached verdict. If you add a new source of state that
+  `blocklist_verdict()` reads, this is the bump it needs.
 
 * **Per-client state → never cache it.** A verdict that depends on the source
   address (ACL is the live example) must be evaluated outside the cached
@@ -119,15 +133,17 @@ DMA driver can't get is a live outage (the W5500 driver logs
 ### 4. `IRAM_ATTR` on definitions only
 
 Tag the *definition*, never the declaration in the header. The L2 hook must
-never fault to flash, so `l2_input_cb`, `l2_qname`, `is_blocked_impl`,
+never fault to flash, so `l2_input_cb`, `l2_qname`, `blocklist_verdict_nb`,
 `dns_cache_l2_get` and `blocklist_generation` carry `IRAM_ATTR` at their
-definitions (#78). `CONFIG_LWIP_IRAM_OPTIMIZATION` covers lwIP's own sources
-only — it does not reach this callback, which `esp_eth` invokes through a
-stored function pointer.
+definitions (#78, #117). `CONFIG_LWIP_IRAM_OPTIMIZATION` covers lwIP's own
+sources only — it does not reach this callback, which `esp_eth` invokes
+through a stored function pointer.
 
-`domain_is_bare_tld()` and the whitelist callbacks reached from
-`is_blocked_impl()` are *not* tagged. That is a known incomplete edge, not a
-claim of full coverage.
+`bl_rank_resolve()`, its three rank-source probes (`feed_probe`,
+`wl_probe_locked`, `custom_probe_locked`), `wl_contains_locked()`, and
+`domain_is_bare_tld()` all sit on this path and carry `IRAM_ATTR` too
+(#117) — this list is meant to be exhaustive for what the L2 hook can
+reach; if you add a new probe or a function one calls, tag it here.
 
 ## Cross-task reads
 
