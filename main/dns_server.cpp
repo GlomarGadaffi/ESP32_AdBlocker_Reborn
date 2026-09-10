@@ -186,10 +186,16 @@ struct CacheEntry {
     uint16_t   resp_len;              /* allowed: cached raw response length (0 = blocked) */
     uint64_t   refresh_after_ms;      /* stale-refresh rate gate; dns_task only, not
                                          read by the L2 path so no seqlock needed */
-    uint32_t   load_gen;              /* blocklist_generation() at store time (#85) — a
-                                         lookup under a newer generation treats this entry
-                                         as a miss instead of trusting a verdict made
-                                         under a blocklist that's no longer current */
+    uint32_t   load_gen;              /* blocklist_generation() as of the VERDICT that
+                                         authorised this entry (#85) — a lookup under a
+                                         newer generation treats this entry as a miss
+                                         instead of trusting a verdict made under a
+                                         blocklist that's no longer current. Read at the
+                                         verdict, not here at the store: an upstream reply
+                                         lands one RTT later, and a bump inside that window
+                                         would otherwise stamp a pre-bump ALLOW with the
+                                         post-bump generation — the exact state this field
+                                         exists to reject. */
     uint8_t    resp[FWD_RESP_MAX];    /* allowed: raw upstream response */
 };
 static CacheEntry *s_cache = nullptr; /* CACHE_ENTRIES entries in PSRAM */
@@ -269,18 +275,21 @@ static CacheEntry *cache_victim(uint32_t h, uint16_t qtype, uint64_t now_ms)
         s_cnt_cache_evict++;
     return victim;
 }
-static void cache_store_blocked(uint32_t h, uint16_t qtype, uint32_t ttl_s, uint64_t now_ms)
+/* load_gen is the generation as of the verdict that authorised this store, passed
+ * in by the caller — never re-read here. See CacheEntry::load_gen. */
+static void cache_store_blocked(uint32_t h, uint16_t qtype, uint32_t ttl_s, uint64_t now_ms,
+                                uint32_t load_gen)
 {
     CacheEntry *e = cache_victim(h, qtype, now_ms);
     cache_write_begin();
     e->key_hash = h; e->qtype = qtype; e->blocked = true; e->valid = true;
     e->resp_len = 0;
     e->ttl_deadline_ms = now_ms + (uint64_t)ttl_s * 1000u;
-    e->load_gen = blocklist_generation();  /* (#85) */
+    e->load_gen = load_gen;  /* (#85) */
     cache_write_end();
 }
 static void cache_store_resp(uint32_t h, uint16_t qtype, const uint8_t *resp, int len,
-                             uint32_t ttl_s, uint64_t now_ms)
+                             uint32_t ttl_s, uint64_t now_ms, uint32_t load_gen)
 {
     if (len <= 0) return;
     if (len > FWD_RESP_MAX) { s_cnt_cache_toobig++; return; }
@@ -291,7 +300,7 @@ static void cache_store_resp(uint32_t h, uint16_t qtype, const uint8_t *resp, in
     memcpy(e->resp, resp, len);
     e->ttl_deadline_ms   = now_ms + (uint64_t)ttl_s * 1000u;
     e->refresh_after_ms  = 0;
-    e->load_gen           = blocklist_generation();  /* (#85) */
+    e->load_gen          = load_gen;  /* (#85) */
     cache_write_end();
 }
 
@@ -672,6 +681,10 @@ struct UpstreamEntry {
     uint32_t         case_hash;      /* (#72) 0x20: case-SENSITIVE hash of the exact bytes
                                         sent upstream — qhash stays case-insensitive since
                                         it also keys the forward cache. */
+    uint32_t         load_gen;       /* (#85) blocklist_generation() as of the verdict that
+                                        allowed this forward, carried across the upstream
+                                        round trip so the reply is cached under the
+                                        generation it was actually authorised by. */
     uint16_t         qtype;
     bool             in_use;
     bool             via_tcp;        /* reply goes to the TCP conn, not client_addr */
@@ -1525,12 +1538,12 @@ void DnsSinkServer::run_loop()
                  * so storing a CH/HS reply here would hand it to a later IN query
                  * for the same name and type. Deliver it and forget it. */
             } else if (cloaked) {
-                cache_store_blocked(ue->qhash, ue->qtype, BLOCKED_TTL_S, now_ms_);
+                cache_store_blocked(ue->qhash, ue->qtype, BLOCKED_TTL_S, now_ms_, ue->load_gen);
             } else {
                 uint8_t rcode = pkt[3] & 0x0F;
                 if (!truncated && (rcode == 0 || rcode == 3))
                     cache_store_resp(ue->qhash, ue->qtype, pkt, plen,
-                                     dns_resp_min_ttl(pkt, plen, 30), now_ms_);
+                                     dns_resp_min_ttl(pkt, plen, 30), now_ms_, ue->load_gen);
             }
             if (ue->hedged) s_cnt_hedged_done++;   /* (#69) see the counter's caveat */
             ue->in_use = false;
@@ -1848,6 +1861,11 @@ void DnsSinkServer::run_loop()
                  * client. Declared here, same reason as the flags above: ahead
                  * of `goto forward`. */
                 bool verdict_exempt  = false;
+                /* (#85) The generation the verdict below is taken under. Read
+                 * once, here, and carried to every cache store this query can
+                 * cause — including the one an upstream reply triggers an RTT
+                 * later. Declared here for the same `goto forward` reason. */
+                uint32_t verdict_gen = blocklist_generation();
 
                 /* (#100) The rewrite verdict is taken BEFORE the cache, not after
                  * it. A rule added while an answer for that name sat in the cache
@@ -1938,6 +1956,12 @@ void DnsSinkServer::run_loop()
                                 ue->qhash        = h;
                                 ue->qtype        = qtype;
                                 ue->refresh_only = true;
+                                /* (#85) A refresh consults no verdict of its own —
+                                 * it re-stores what cache_lookup_stale already
+                                 * matched against the current generation, so that
+                                 * entry's own stamp is the authorising one. Copy
+                                 * the value: se may be evicted before the reply. */
+                                ue->load_gen     = se->load_gen;
                                 /* env_hash deliberately left unset: a
                                  * refresh_only entry is never a coalescing
                                  * target, so nobody can ride its envelope. */
@@ -2005,7 +2029,7 @@ void DnsSinkServer::run_loop()
                          * nothing to record — but the query still isolates
                          * below in case the upstream answer CNAME-cloaks to a
                          * blocked target. */
-                        if (is_blk) cache_store_blocked(h, qtype, BLOCKED_TTL_S, now_ms);
+                        if (is_blk) cache_store_blocked(h, qtype, BLOCKED_TTL_S, now_ms, verdict_gen);
                         is_blk = false;
                     }
                     if (is_blk) {
@@ -2016,7 +2040,7 @@ void DnsSinkServer::run_loop()
                             sendto(csock, tx, tlen, 0, (sockaddr *)&client_addr, clen);
                             hist_record(&s_h_sendto, esp_timer_get_time() - t_s0);
                         }
-                        cache_store_blocked(h, qtype, BLOCKED_TTL_S, now_ms);
+                        cache_store_blocked(h, qtype, BLOCKED_TTL_S, now_ms, verdict_gen);
                         hist_record(&s_h_blocked, esp_timer_get_time() - t_recv);
                         query_log_record(name, qtype,
                             ntohl(client_addr.sin_addr.s_addr), true, false);
@@ -2066,6 +2090,7 @@ void DnsSinkServer::run_loop()
                     ue->no_cache    = !cls_in || fwd_no_cache;   /* (#106) class; (#48) pause */
                     ue->paused      = fwd_no_cache;              /* (#48) */
                     ue->exempt      = verdict_exempt;             /* (#117) */
+                    ue->load_gen    = verdict_gen;                /* (#85) */
                     randomize_qname_case(rx, qend);   /* (#72) */
                     ue->case_hash   = query_case_hash(rx, qend);
 
@@ -2161,6 +2186,7 @@ void DnsSinkServer::run_loop()
                         bool bypassed_client = cls_in && bypass_active_for(s_tcp.peer_ip);
                         bool tcp_no_cache    = paused_client || bypassed_client;
                         bool verdict_exempt  = false;   /* (#117), set below; see UDP's twin */
+                        uint32_t verdict_gen = blocklist_generation();  /* (#85); see UDP's twin */
 
                         /* (#100) Rewrite verdict before the cache, as on UDP. */
                         uint32_t rw_pre = (cls_in && qtype == 1) ? rewrite_lookup(name) : 0;
@@ -2207,7 +2233,7 @@ void DnsSinkServer::run_loop()
                                  * name, so it must not be trusted to decide
                                  * whether to cache_store_blocked in that case
                                  * either. */
-                                if (is_blk) cache_store_blocked(h, qtype, BLOCKED_TTL_S, now_ms);
+                                if (is_blk) cache_store_blocked(h, qtype, BLOCKED_TTL_S, now_ms, verdict_gen);
                                 is_blk = false;
                             }
                             if (rw_ip) {
@@ -2216,7 +2242,7 @@ void DnsSinkServer::run_loop()
                             } else if (is_blk) {
                                 s_cnt_blocked++;
                                 tlen = build_blocked_any(q, qend, qtype, tx, sizeof(tx));
-                                cache_store_blocked(h, qtype, BLOCKED_TTL_S, now_ms);
+                                cache_store_blocked(h, qtype, BLOCKED_TTL_S, now_ms, verdict_gen);
                                 query_log_record(name, qtype, s_tcp.peer_ip, true, false);
                                 hist_record(&s_h_blocked, esp_timer_get_time() - t_recv);
                             } else {
@@ -2262,6 +2288,7 @@ void DnsSinkServer::run_loop()
                                     ue->no_cache = !cls_in || tcp_no_cache;   /* (#106); (#48) */
                                     ue->paused   = tcp_no_cache;             /* (#48) */
                                     ue->exempt   = verdict_exempt;           /* (#117) */
+                                    ue->load_gen = verdict_gen;              /* (#85) */
                                     ue->via_tcp  = true;
                                     ue->tcp_gen  = s_tcp.gen;
                                     randomize_qname_case(q, qend);   /* (#72) */
