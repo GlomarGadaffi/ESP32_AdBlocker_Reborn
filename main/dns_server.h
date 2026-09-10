@@ -63,8 +63,16 @@ public:
     /* Re-point upstream forwarding at a new resolver IP without restarting
      * the task (#53: dual-WAN — switching which interface egresses upstream
      * queries shouldn't drop in-flight client traffic). Safe to call from any
-     * task; run_loop() reads the address atomically each forward/reply. */
-    void set_upstream(const char *upstream_ip);
+     * task; run_loop() reads the address atomically each forward/reply.
+     *
+     * (#72) secondary_ip is the OTHER resolver the same DHCP lease offered, or
+     * "" / nullptr when there is only one — the ordinary case on plenty of
+     * routers, and the state every board is in before this feature. Every
+     * query is still forwarded to the primary; the secondary is used only as
+     * the target of #69's hedged retransmit, and is additionally accepted as a
+     * reply source. An unparseable secondary clears it rather than keeping a
+     * stale one, so "no secondary" is always reachable. */
+    void set_upstream(const char *upstream_ip, const char *secondary_ip);
     void upstream_ip(char *out, size_t cap) const;
 
     uint64_t queries_total()  const;
@@ -76,6 +84,7 @@ private:
 
     char             _upstream_ip[16];
     std::atomic<uint32_t> _upstream_addr{0};  /* in_addr_t, network byte order */
+    std::atomic<uint32_t> _upstream_addr2{0}; /* (#72) secondary; 0 = none configured */
     TaskHandle_t     _taskHandle = nullptr;
     std::atomic<int> _client_fd{-1};
     std::atomic<int> _upstream_fd{-1};

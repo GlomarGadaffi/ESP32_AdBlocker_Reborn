@@ -213,6 +213,11 @@ static std::atomic<uint32_t> s_cache_seq{0};
  * from other tasks and would be a torn read. Updated at exactly the two sites
  * that store _upstream_addr - keep them together. */
 static std::atomic<uint32_t> s_upstream_addr_pub{0};
+/* (#72) Same idea for the secondary resolver; 0 when the lease offered only
+ * one. Written only by set_upstream(), which is the sole site that stores
+ * _upstream_addr2 — run_loop's boot-time seeding deliberately touches the
+ * primary alone, so it cannot clobber a secondary already applied. */
+static std::atomic<uint32_t> s_upstream_addr2_pub{0};
 
 static inline void cache_write_begin(void)
 {
@@ -717,6 +722,8 @@ struct UpstreamEntry {
                                         at the same line. */
     uint8_t          n_wait;         /* coalesced waiters (#76) */
     bool             hedged;         /* (#69) retransmit already fired — at most one per flight */
+    bool             hedge_local;    /* (#72) this flight's name is split-horizon: hedge to the
+                                        SAME resolver, never the secondary — see the sweep */
     uint16_t         hedge_qlen;     /* (#69) stashed wire bytes in s_hedge_q; 0 = not
                                         hedge-eligible (refresh_only, DoT flight, oversize
                                         query, or no stash RAM) */
@@ -793,6 +800,9 @@ static UpstreamEntry *upstream_alloc(uint16_t *our_txid_out)
                                                    the predecessor's question */
             s_upstream[i].hedge_qlen   = 0;
             s_upstream[i].hedge_deadline_ms = 0;
+            s_upstream[i].hedge_local  = false;   /* (#72) a stale flag would pin this
+                                                     flight's hedge to the primary for
+                                                     a name that is not split-horizon */
             *our_txid_out = t;
             return &s_upstream[i];
         }
@@ -944,13 +954,26 @@ static int upstream_inflight(void)
  * client happened to retry — 104 such timeouts measured, every one masked by
  * serve-stale (#68), which is why nobody noticed. Once a flight has outlived
  * the observed p95 of upstream RTT, retransmit the same bytes once and keep
- * waiting. The hedge goes to the SAME upstream by necessity, not preference:
- * the #24 source-address filter in the reply drain rejects any datagram not
- * from _upstream_addr, so a hedge aimed at a second resolver would have its
- * reply silently discarded unless the anti-spoofing surface were widened —
- * which is why true dual-WAN racing stays a stretch goal. A same-upstream
- * hedge is a retransmit: the right medicine for packet loss (the observed
- * failure), useless against a wedged resolver.
+ * waiting.
+ *
+ * (#72) The hedge now goes to the SECONDARY resolver when the DHCP lease
+ * offered one, and to the primary otherwise. #69 could only ever retransmit to
+ * the same server because the #24 source-address filter in the reply drain
+ * rejected any datagram not from _upstream_addr; that filter now also accepts
+ * _upstream_addr2, which is the whole unblock. Note this changes what the
+ * hedge is medicine FOR. Against the observed failure — a lost datagram — a
+ * same-server retransmit was the exact remedy, and asking a different server
+ * is now a bet that the secondary is at least as healthy. What it buys in
+ * return is the case a retransmit could never fix: a primary that is up but
+ * wedged, slow, or answering nothing. hedges_sent vs hedged_completions is the
+ * pair that says whether that bet is paying off on a given deployment.
+ *
+ * This is per-query rescue, not failover. The occupancy gate below stops
+ * hedging above 3/4 of the table — precisely the state a fully dead primary
+ * produces — so a dead resolver still degrades to 3 s timeouts masked by
+ * serve-stale rather than handing over to the secondary. Relaxing that gate
+ * would trade the amplification protection it exists for; real failover wants
+ * its own decision, not a wider hedge.
  *
  * The stash lives in PSRAM (64 x 512 B = 32 KB): #76 just spent 8 KB of
  * internal .bss and left heap_free at ~35 KB, while psram_free sits at
@@ -1003,12 +1026,14 @@ static uint32_t hedge_delay_ms(void)
  * nobody is waiting on one, so rescuing it buys nothing and #68's refresh
  * gate simply re-arms on the next stale hit. DoT flights never get here
  * either (see the sweep in run_loop for why). */
-static void hedge_stash(UpstreamEntry *ue, const uint8_t *q, int qlen, uint32_t now_ms)
+static void hedge_stash(UpstreamEntry *ue, const uint8_t *q, int qlen, uint32_t now_ms,
+                        bool local)
 {
     if (!s_hedge_q || qlen <= 0 || qlen > HEDGE_QMAX) return;
     memcpy(s_hedge_q + (size_t)(ue - s_upstream) * HEDGE_QMAX, q, (size_t)qlen);
     ue->hedge_qlen        = (uint16_t)qlen;
     ue->hedge_deadline_ms = now_ms + hedge_delay_ms();
+    ue->hedge_local       = local;   /* (#72) see the sweep's resolver choice */
 }
 
 /* ── DNS response builders ───────────────────────────────────────── */
@@ -1252,13 +1277,23 @@ bool DnsSinkServer::start(const char *upstream_ip) {
     return true;
 }
 
-void DnsSinkServer::set_upstream(const char *upstream_ip) {
+void DnsSinkServer::set_upstream(const char *upstream_ip, const char *secondary_ip) {
     struct in_addr a{};
     if (!inet_aton(upstream_ip, &a)) return;
+    /* (#72) The secondary is stored even when the primary parse above is the
+     * only thing that gates the call, because "no secondary" is a first-class
+     * state: a lease that drops from two resolvers to one must clear it, not
+     * inherit the previous lease's address as a hedge target. */
+    struct in_addr b{};
+    uint32_t sec = (secondary_ip && secondary_ip[0] && inet_aton(secondary_ip, &b))
+                   ? b.s_addr : 0;
     snprintf(_upstream_ip, sizeof(_upstream_ip), "%s", upstream_ip);
     _upstream_addr.store(a.s_addr, std::memory_order_release);
+    _upstream_addr2.store(sec, std::memory_order_release);
     s_upstream_addr_pub.store(a.s_addr, std::memory_order_release);   /* #80 */
-    ESP_LOGI(TAG, "Upstream re-pointed to %s", _upstream_ip);
+    s_upstream_addr2_pub.store(sec, std::memory_order_release);       /* #72 */
+    ESP_LOGI(TAG, "Upstream re-pointed to %s (secondary %s)",
+             _upstream_ip, sec ? secondary_ip : "none");
 }
 
 void DnsSinkServer::upstream_ip(char *out, size_t cap) const {
@@ -1698,11 +1733,23 @@ void DnsSinkServer::run_loop()
                                     (sockaddr *)&from, &fromlen);
                 if (rlen < 0) break;                           /* EWOULDBLOCK: drained */
                 if (rlen < (int)sizeof(DnsHeader)) continue;
-                /* Reject replies not from our configured upstream (#24).
-                 * Address is re-read live so set_upstream() takes effect without
-                 * dropping in-flight queries sent to the previous upstream. */
-                if (from.sin_addr.s_addr != _upstream_addr.load(std::memory_order_acquire) ||
-                    from.sin_port        != upstream_addr.sin_port) continue;
+                /* Reject replies not from a configured upstream (#24).
+                 * Addresses are re-read live so set_upstream() takes effect
+                 * without dropping in-flight queries sent to the previous
+                 * upstream.
+                 * (#72) The secondary is accepted here because a hedge is sent
+                 * to it (see the hedge sweep below) and its reply is the whole
+                 * point. When none is configured the comparison is against 0,
+                 * which no real datagram's source address can be — so a
+                 * one-resolver board accepts and rejects exactly what it did
+                 * before, with no separate case to get wrong. The widening is
+                 * two addresses, not "any": an off-path spoofer still has to
+                 * forge one of our own resolvers' addresses AND the port AND
+                 * the txid AND the question (the H2 gate in process_reply). */
+                uint32_t from_a = from.sin_addr.s_addr;
+                if ((from_a != _upstream_addr.load(std::memory_order_acquire) &&
+                     from_a != _upstream_addr2.load(std::memory_order_acquire)) ||
+                    from.sin_port != upstream_addr.sin_port) continue;
                 process_reply(rx, rlen, esp_timer_get_time(), now_ms);
             }
 
@@ -1794,8 +1841,29 @@ void DnsSinkServer::run_loop()
                     if (!he->in_use || he->hedged || he->hedge_qlen == 0) continue;
                     if ((int32_t)((uint32_t)now_ms - he->hedge_deadline_ms) < 0)
                         continue;   /* wrap-safe, like eviction's subtraction */
-                    upstream_addr.sin_addr.s_addr =
-                        _upstream_addr.load(std::memory_order_acquire);
+                    /* (#72) Prefer the secondary resolver, falling back to the
+                     * primary when the lease offered only one. Same bytes
+                     * either way — this is still a retransmit of the identical
+                     * question with the identical txid, so whichever server
+                     * answers first lands on this same table entry and the
+                     * loser is dropped by process_reply's `if (!ue) return`.
+                     *
+                     * EXCEPT for split-horizon names, which stay on the
+                     * primary. Racing two servers is only safe while both can
+                     * answer the question the same way, and for a local zone
+                     * exactly one of them can: the router knows `nas.lan`, the
+                     * secondary returns NXDOMAIN for it. Since the loser's
+                     * reply is discarded, a fast NXDOMAIN from the secondary
+                     * would beat the router's real answer, pass the H2 gate
+                     * (which validates the QUESTION, not the answer), and get
+                     * delivered AND cached. #69 was immune to this only
+                     * because its retransmit went to the same resolver — this
+                     * flag is what keeps that property now that it may not. */
+                    uint32_t hedge_a = he->hedge_local
+                                       ? 0
+                                       : _upstream_addr2.load(std::memory_order_acquire);
+                    if (!hedge_a) hedge_a = _upstream_addr.load(std::memory_order_acquire);
+                    upstream_addr.sin_addr.s_addr = hedge_a;
                     sendto(usock, s_hedge_q + (size_t)i * HEDGE_QMAX,
                            he->hedge_qlen, 0,
                            (sockaddr *)&upstream_addr, sizeof(upstream_addr));
@@ -2101,7 +2169,8 @@ void DnsSinkServer::run_loop()
                     /* Local-zone names (split-horizon) skip DoT: the router is
                      * the only resolver that knows them. Plain UDP to the
                      * configured upstream, hedged like any UDP flight. */
-                    bool use_dot = dot_is_enabled() && !localzone_match(name, nlen);
+                    bool is_local = localzone_match(name, nlen);
+                    bool use_dot  = dot_is_enabled() && !is_local;
                     if (!(use_dot && dot_enqueue(rx, rlen))) {
                         upstream_addr.sin_addr.s_addr = _upstream_addr.load(std::memory_order_acquire);
                         sendto(usock, rx, rlen, 0,
@@ -2113,7 +2182,7 @@ void DnsSinkServer::run_loop()
                          * retransmits is the wrong reflex, and skipping keeps
                          * the no-plaintext-hedge-under-DoT proof one line. */
                         if (!use_dot)
-                            hedge_stash(ue, rx, rlen, (uint32_t)now_ms);
+                            hedge_stash(ue, rx, rlen, (uint32_t)now_ms, is_local);
                     }
                     s_cnt_forwarded++;
                 }
@@ -2295,7 +2364,8 @@ void DnsSinkServer::run_loop()
                                     ue->case_hash = query_case_hash(q, qend);
                                     qh->id = htons(our_txid);
                                     ue->upstream_us = esp_timer_get_time();
-                                    bool use_dot = dot_is_enabled() && !localzone_match(name, nlen);
+                                    bool is_local = localzone_match(name, nlen);
+                                    bool use_dot  = dot_is_enabled() && !is_local;
                                     if (!(use_dot && dot_enqueue(q, mlen))) {
                                         /* (#66) forwarding the client's own EDNS-less
                                          * query gets it classic-truncated at 512 B by
@@ -2326,7 +2396,8 @@ void DnsSinkServer::run_loop()
                                          * then leaves the flight un-hedged,
                                          * same graceful no-op as before. */
                                         if (!use_dot)
-                                            hedge_stash(ue, edns_q, elen, (uint32_t)now_ms);
+                                            hedge_stash(ue, edns_q, elen, (uint32_t)now_ms,
+                                                        is_local);
                                     }
                                     s_cnt_forwarded++;
                                     s_tcp.awaiting = true;
@@ -2416,9 +2487,21 @@ int dns_server_metrics_json(char *out, size_t cap)
              (unsigned)(ua & 0xFFu), (unsigned)((ua >> 8) & 0xFFu),
              (unsigned)((ua >> 16) & 0xFFu), (unsigned)((ua >> 24) & 0xFFu));
 
+    /* (#72) The secondary resolver — where a hedged retransmit goes and which
+     * second source address the reply drain accepts. Same #80 reasoning as
+     * above: a hedge target nobody can see is a misconfiguration nobody
+     * notices. Empty string when the lease offered only one resolver, which
+     * reads more honestly in the JSON than "0.0.0.0". */
+    uint32_t ua2 = s_upstream_addr2_pub.load(std::memory_order_acquire);
+    char upstream2_s[16] = "";
+    if (ua2)
+        snprintf(upstream2_s, sizeof(upstream2_s), "%u.%u.%u.%u",
+                 (unsigned)(ua2 & 0xFFu), (unsigned)((ua2 >> 8) & 0xFFu),
+                 (unsigned)((ua2 >> 16) & 0xFFu), (unsigned)((ua2 >> 24) & 0xFFu));
+
     int n = snprintf(out, cap,
         "{"
-        "\"upstream\":\"%s\","
+        "\"upstream\":\"%s\",\"upstream2\":\"%s\","
         /* #75: how the system clock got its value, and where it stands now.
          * clock_src is LATCHED at boot - the floor decision is only visible
          * for the 1-3 s before SNTP lands, which is too short to catch by
@@ -2464,7 +2547,7 @@ int dns_server_metrics_json(char *out, size_t cap)
         "\"sd_status\":\"%s\",\"sd_bytes\":%" PRIu32 ","
         "\"flash_status\":\"%s\","
         "\"heap_free\":%u,\"heap_largest\":%u,\"psram_free\":%u,\"dns_task_stack_hwm\":%u,",
-        upstream_s,
+        upstream_s, upstream2_s,
         timesync_state(), timesync_source(), (long long)time(NULL),
         (long long)(esp_timer_get_time() / 1000000),
         s_cnt_total, s_cnt_blocked, s_cnt_forwarded,
