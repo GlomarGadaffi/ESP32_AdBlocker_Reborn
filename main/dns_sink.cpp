@@ -1637,23 +1637,26 @@ static esp_err_t IRAM_ATTR l2_input_cb(esp_eth_handle_t h, uint8_t *buf, uint32_
             uint32_t rw = 0;
             if (rewrite_lookup_nb(name, nlen, &rw) != 0) break;
         }
-        /* (#117) Shared rank-ordered verdict — feed + whitelist + custom
-         * rules, including @@ exceptions and $important — instead of the
-         * block-only blocklist_is_blocked_nb() this used to call. A defer
-         * (must not guess) falls through to lwIP exactly like every other
-         * `break` in this hook. */
-        bl_verdict_t v;
-        int vr = blocklist_verdict_nb(name, nlen, &v);
-        if (vr == BL_DEFER_LOCK_BUSY)      { s_l2_defer_lock_busy++; break; }
-        if (vr == BL_DEFER_SNAPSHOT)       { s_l2_defer_snapshot++;  break; }
-        if (v.state != BL_BLOCK) {      /* not blocked → try L2 cache, else lwIP */
-            /* Forward-cache hit answered straight from L2, skipping lwIP — the
-             * same socket-stack overhead the blocked path already bypasses. Lay
-             * the eth+ip+udp headers into tx, then the seqlock-protected reader
-             * copies the cached DNS reply right after them. Miss/race → lwIP. */
-            int clen = dns_cache_l2_get(domain_hash(name, nlen), qtype,
-                                        tx + dns, (int)sizeof(tx) - dns);
-            if (clen <= 0) break;                        /* miss/expired/race → lwIP */
+        /* (#109 item 3) Forward cache probe: replay fresh allowed upstream
+         * replies straight from L2, skipping lwIP — the same socket-stack
+         * overhead the blocked path already bypasses. On a cache hit, this
+         * answers immediately and skips blocklist_verdict_nb() (and its
+         * bl_hash40 + s_wl_mutex + PSRAM probe) entirely, de-duplicating the
+         * redundant hash call and matching the socket path (dns_server.cpp),
+         * where cache_lookup runs before blocklist_verdict. dns_cache_l2_get()
+         * only serves allowed entries stamped with the current blocklist
+         * generation (#85), so a hit is proven allowed by construction.
+         *
+         * That proof depends on load_gen being the generation the ALLOW was
+         * actually authorised under, which is only true since #144: it used to
+         * be read at store time, an upstream RTT after the verdict, so a bump
+         * landing in that window stamped a pre-bump ALLOW as current. Probing
+         * the cache first is safe only on top of that fix — before it, this
+         * hook's verdict-first order was what shielded Ethernet clients from
+         * exactly those entries. */
+        int clen = dns_cache_l2_get(domain_hash(name, nlen), qtype,
+                                    tx + dns, (int)sizeof(tx) - dns);
+        if (clen > 0) {
             memcpy(tx, buf, dns);                         /* eth+ip+udp headers */
             tx[dns] = buf[dns]; tx[dns+1] = buf[dns+1];   /* patch txid to this query */
             l2_finish_reply(tx, ihl, udp, clen);
@@ -1663,6 +1666,18 @@ static esp_err_t IRAM_ATTR l2_input_cb(esp_eth_handle_t h, uint8_t *buf, uint32_
             free(buf);                                    /* consumed (== eth_l2_free) */
             return ESP_OK;
         }
+
+        /* (#117) Shared rank-ordered verdict — feed + whitelist + custom
+         * rules, including @@ exceptions and $important — for queries not
+         * answered from the forward cache above. A defer (must not guess)
+         * falls through to lwIP exactly like every other `break` in this hook.
+         * An allowed verdict (not blocked) also falls through to lwIP to be
+         * forwarded upstream since the cache missed. */
+        bl_verdict_t v;
+        int vr = blocklist_verdict_nb(name, nlen, &v);
+        if (vr == BL_DEFER_LOCK_BUSY)      { s_l2_defer_lock_busy++; break; }
+        if (vr == BL_DEFER_SNAPSHOT)       { s_l2_defer_snapshot++;  break; }
+        if (v.state != BL_BLOCK) break;                  /* not blocked → lwIP forwards */
 
         /* ── craft blocked response in tx ── */
         int rdlen = (qtype == 28) ? 16 : 4;
