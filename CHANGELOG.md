@@ -24,8 +24,28 @@ firmware's `esp_app_desc` version string comes from `version.txt`.
   verdict, so an explicitly-allowed name that CNAME-cloaked to a blocklisted
   target was sinkholed anyway — exactly the outcome an explicit allow exists
   to prevent. Same reasoning, same code path, as the existing pause exemption.
+- **A hedged retransmit (#69) now goes to the DHCP lease's *second* resolver
+  when there is one, not to the same server again (#72).** #69 could only ever
+  retransmit to the primary because the #24 reply-source filter rejected any
+  datagram from another address; that filter now also accepts the secondary.
+  This changes what the hedge is medicine for: against the lost datagram #69
+  actually measured, a same-server retransmit was the exact remedy, and asking
+  a different server is a bet that the secondary is at least as healthy. What
+  it buys in return is the case a retransmit could never fix — a primary that
+  is up but wedged, slow, or silent. `hedges_sent` vs `hedged_completions`
+  in `/metrics` is the pair that says whether the bet is paying off. A lease
+  offering only one resolver is unaffected: the hedge falls back to the
+  primary, exactly as before.
 
 ### Added
+
+- **A secondary upstream resolver, read from the DHCP lease (#72).** Routers
+  hand out option 6 as a list and lwIP already stored the second address; the
+  firmware read only `ESP_NETIF_DNS_MAIN` and discarded it. It is now carried
+  through as the hedge target (above) and accepted as a reply source, and is
+  reported as `upstream2` in `/metrics`. No configuration: the address comes
+  from the lease, so there is nothing to set. Sticky `qhash % N` sharding
+  (the other half of #72) is deliberately still unbuilt — see the issue.
 
 - **The AdGuard DNS rule-grammar subset (#117): custom rules can now write
   `@@` exceptions and `$important`, not just block-only entries.** A custom
