@@ -38,7 +38,13 @@ firmware's `esp_app_desc` version string comes from `version.txt`.
   construction), but as a regression detector: a drop against the
   same-server baseline means the secondary is worse than a plain retransmit.
   A lease offering only one resolver is unaffected: the hedge falls back to
-  the primary, exactly as before.
+  the primary, exactly as before. **Split-horizon names are excluded and stay
+  on the primary**: racing two resolvers is only safe while both answer the
+  question the same way, and for a local zone exactly one of them can — the
+  router knows `nas.lan`, the secondary NXDOMAINs it. Since the losing reply
+  is discarded, an unexcluded local-zone hedge would let a fast NXDOMAIN beat
+  the router's real answer, pass the question-matching check, and be both
+  delivered and cached.
 
 ### Added
 

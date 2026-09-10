@@ -722,6 +722,8 @@ struct UpstreamEntry {
                                         at the same line. */
     uint8_t          n_wait;         /* coalesced waiters (#76) */
     bool             hedged;         /* (#69) retransmit already fired — at most one per flight */
+    bool             hedge_local;    /* (#72) this flight's name is split-horizon: hedge to the
+                                        SAME resolver, never the secondary — see the sweep */
     uint16_t         hedge_qlen;     /* (#69) stashed wire bytes in s_hedge_q; 0 = not
                                         hedge-eligible (refresh_only, DoT flight, oversize
                                         query, or no stash RAM) */
@@ -798,6 +800,9 @@ static UpstreamEntry *upstream_alloc(uint16_t *our_txid_out)
                                                    the predecessor's question */
             s_upstream[i].hedge_qlen   = 0;
             s_upstream[i].hedge_deadline_ms = 0;
+            s_upstream[i].hedge_local  = false;   /* (#72) a stale flag would pin this
+                                                     flight's hedge to the primary for
+                                                     a name that is not split-horizon */
             *our_txid_out = t;
             return &s_upstream[i];
         }
@@ -1021,12 +1026,14 @@ static uint32_t hedge_delay_ms(void)
  * nobody is waiting on one, so rescuing it buys nothing and #68's refresh
  * gate simply re-arms on the next stale hit. DoT flights never get here
  * either (see the sweep in run_loop for why). */
-static void hedge_stash(UpstreamEntry *ue, const uint8_t *q, int qlen, uint32_t now_ms)
+static void hedge_stash(UpstreamEntry *ue, const uint8_t *q, int qlen, uint32_t now_ms,
+                        bool local)
 {
     if (!s_hedge_q || qlen <= 0 || qlen > HEDGE_QMAX) return;
     memcpy(s_hedge_q + (size_t)(ue - s_upstream) * HEDGE_QMAX, q, (size_t)qlen);
     ue->hedge_qlen        = (uint16_t)qlen;
     ue->hedge_deadline_ms = now_ms + hedge_delay_ms();
+    ue->hedge_local       = local;   /* (#72) see the sweep's resolver choice */
 }
 
 /* ── DNS response builders ───────────────────────────────────────── */
@@ -1839,8 +1846,22 @@ void DnsSinkServer::run_loop()
                      * either way — this is still a retransmit of the identical
                      * question with the identical txid, so whichever server
                      * answers first lands on this same table entry and the
-                     * loser is dropped by process_reply's `if (!ue) return`. */
-                    uint32_t hedge_a = _upstream_addr2.load(std::memory_order_acquire);
+                     * loser is dropped by process_reply's `if (!ue) return`.
+                     *
+                     * EXCEPT for split-horizon names, which stay on the
+                     * primary. Racing two servers is only safe while both can
+                     * answer the question the same way, and for a local zone
+                     * exactly one of them can: the router knows `nas.lan`, the
+                     * secondary returns NXDOMAIN for it. Since the loser's
+                     * reply is discarded, a fast NXDOMAIN from the secondary
+                     * would beat the router's real answer, pass the H2 gate
+                     * (which validates the QUESTION, not the answer), and get
+                     * delivered AND cached. #69 was immune to this only
+                     * because its retransmit went to the same resolver — this
+                     * flag is what keeps that property now that it may not. */
+                    uint32_t hedge_a = he->hedge_local
+                                       ? 0
+                                       : _upstream_addr2.load(std::memory_order_acquire);
                     if (!hedge_a) hedge_a = _upstream_addr.load(std::memory_order_acquire);
                     upstream_addr.sin_addr.s_addr = hedge_a;
                     sendto(usock, s_hedge_q + (size_t)i * HEDGE_QMAX,
@@ -2148,7 +2169,8 @@ void DnsSinkServer::run_loop()
                     /* Local-zone names (split-horizon) skip DoT: the router is
                      * the only resolver that knows them. Plain UDP to the
                      * configured upstream, hedged like any UDP flight. */
-                    bool use_dot = dot_is_enabled() && !localzone_match(name, nlen);
+                    bool is_local = localzone_match(name, nlen);
+                    bool use_dot  = dot_is_enabled() && !is_local;
                     if (!(use_dot && dot_enqueue(rx, rlen))) {
                         upstream_addr.sin_addr.s_addr = _upstream_addr.load(std::memory_order_acquire);
                         sendto(usock, rx, rlen, 0,
@@ -2160,7 +2182,7 @@ void DnsSinkServer::run_loop()
                          * retransmits is the wrong reflex, and skipping keeps
                          * the no-plaintext-hedge-under-DoT proof one line. */
                         if (!use_dot)
-                            hedge_stash(ue, rx, rlen, (uint32_t)now_ms);
+                            hedge_stash(ue, rx, rlen, (uint32_t)now_ms, is_local);
                     }
                     s_cnt_forwarded++;
                 }
@@ -2342,7 +2364,8 @@ void DnsSinkServer::run_loop()
                                     ue->case_hash = query_case_hash(q, qend);
                                     qh->id = htons(our_txid);
                                     ue->upstream_us = esp_timer_get_time();
-                                    bool use_dot = dot_is_enabled() && !localzone_match(name, nlen);
+                                    bool is_local = localzone_match(name, nlen);
+                                    bool use_dot  = dot_is_enabled() && !is_local;
                                     if (!(use_dot && dot_enqueue(q, mlen))) {
                                         /* (#66) forwarding the client's own EDNS-less
                                          * query gets it classic-truncated at 512 B by
@@ -2373,7 +2396,8 @@ void DnsSinkServer::run_loop()
                                          * then leaves the flight un-hedged,
                                          * same graceful no-op as before. */
                                         if (!use_dot)
-                                            hedge_stash(ue, edns_q, elen, (uint32_t)now_ms);
+                                            hedge_stash(ue, edns_q, elen, (uint32_t)now_ms,
+                                                        is_local);
                                     }
                                     s_cnt_forwarded++;
                                     s_tcp.awaiting = true;

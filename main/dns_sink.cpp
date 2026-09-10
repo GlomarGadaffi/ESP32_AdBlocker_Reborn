@@ -519,11 +519,15 @@ static void fetch_dhcp_dns_one(esp_netif_t *netif, esp_netif_dns_type_t type,
  * dual-WAN board whose eth lease carries two resolvers and whose wifi lease
  * carries one ends up reporting MAIN=wifi's, BACKUP=eth's; likewise a re-lease
  * that shrinks from two servers to one keeps the old secondary until reboot.
- * The blast radius is bounded to one hedged retransmit: a hedge to a wrong or
- * unreachable secondary simply gets no answer, the flight keeps waiting on the
- * primary exactly as it did before #69, and no wrong answer can be produced
- * (process_reply's H2 gate still has to match OUR question). The real fix is
- * per-netif DNS, which is a build-config change and out of scope here.
+ * The blast radius is bounded to one hedged retransmit: a hedge to an
+ * unreachable secondary simply gets no answer and the flight keeps waiting on
+ * the primary exactly as it did before #69. What it is NOT bounded against is
+ * a secondary that answers *differently* — process_reply's H2 gate validates
+ * the question, not the answer, so a resolver with a different view can win
+ * the race with a wrong answer. Split-horizon names are the case where that is
+ * guaranteed rather than hypothetical, and they are pinned to the primary at
+ * the hedge sweep (see UpstreamEntry::hedge_local). The real fix for the stale
+ * slot itself is per-netif DNS, a build-config change and out of scope here.
  *
  * A lease with only one server leaves *out2 empty; so does a static-IP netif. */
 static void fetch_dhcp_dns(esp_netif_t *netif, char *out, size_t cap,
