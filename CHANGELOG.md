@@ -32,10 +32,13 @@ firmware's `esp_app_desc` version string comes from `version.txt`.
   actually measured, a same-server retransmit was the exact remedy, and asking
   a different server is a bet that the secondary is at least as healthy. What
   it buys in return is the case a retransmit could never fix — a primary that
-  is up but wedged, slow, or silent. `hedges_sent` vs `hedged_completions`
-  in `/metrics` is the pair that says whether the bet is paying off. A lease
-  offering only one resolver is unaffected: the hedge falls back to the
-  primary, exactly as before.
+  is up but wedged, slow, or silent. Watch `hedges_sent` vs
+  `hedged_completions` in `/metrics` — not as proof the secondary answered
+  (both copies share a txid, so which one replied is unknowable by
+  construction), but as a regression detector: a drop against the
+  same-server baseline means the secondary is worse than a plain retransmit.
+  A lease offering only one resolver is unaffected: the hedge falls back to
+  the primary, exactly as before.
 
 ### Added
 

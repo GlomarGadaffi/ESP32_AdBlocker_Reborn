@@ -245,12 +245,15 @@ static const char *pick_upstream(const char *dns, const char *gw)
 static const char *apply_upstream_iface(void)
 {
     const char *upstream = pick_upstream(s_eth_dns, s_gw);
-    /* (#72) The secondary comes from the SELECTED interface only, never mixed
-     * across interfaces: #53's routing argument (a resolver reachable only
-     * through one netif's subnet egresses out that netif automatically) holds
-     * per-interface, and a secondary on the other WAN would leave via the
-     * wrong one. The gateway fallback above is deliberately not repeated here
-     * — it is the primary's last resort, not a second opinion. */
+    /* (#72) Take the secondary from the SELECTED interface's slot, matching
+     * the primary: #53's routing argument (a resolver reachable only through
+     * one netif's subnet egresses out that netif automatically) holds
+     * per-interface, so a secondary belonging to the other WAN would leave via
+     * the wrong one. lwIP's global DNS table can still hand us exactly that on
+     * a dual-WAN board — see fetch_dhcp_dns for why, and why the cost is one
+     * unanswered hedge rather than a wrong answer. The gateway fallback above
+     * is deliberately not repeated here: it is the primary's last resort, not
+     * a second opinion. */
     const char *upstream2 = s_eth_dns2;
 #if CONFIG_ADBLOCK_NET_WIFI
     if (strcmp(s_upstream_iface, "wifi") == 0) {
@@ -507,9 +510,21 @@ static void fetch_dhcp_dns_one(esp_netif_t *netif, esp_netif_dns_type_t type,
 /* (#72) Both DHCP-provided resolvers. Routers hand out option 6 as a LIST and
  * lwIP already stores it — dhcp_bind() walks the list into DNS server slots
  * 0..DNS_MAX_SERVERS-1 — so the second address costs a read, not a config
- * field. MAIN and BACKUP always come from the same lease (the lwIP DNS table
- * is global unless CONFIG_ESP_NETIF_SET_DNS_PER_DEFAULT_NETIF, which is off),
- * so they can never end up being one router's primary and another's backup.
+ * field.
+ *
+ * Known limitation, deliberately not worked around: that table is GLOBAL, not
+ * per-netif (CONFIG_ESP_NETIF_SET_DNS_PER_DEFAULT_NETIF is off), and
+ * dhcp_bind() writes slot n only for servers the lease actually provided —
+ * it never clears the rest. So slot 1 can outlive the lease that wrote it. A
+ * dual-WAN board whose eth lease carries two resolvers and whose wifi lease
+ * carries one ends up reporting MAIN=wifi's, BACKUP=eth's; likewise a re-lease
+ * that shrinks from two servers to one keeps the old secondary until reboot.
+ * The blast radius is bounded to one hedged retransmit: a hedge to a wrong or
+ * unreachable secondary simply gets no answer, the flight keeps waiting on the
+ * primary exactly as it did before #69, and no wrong answer can be produced
+ * (process_reply's H2 gate still has to match OUR question). The real fix is
+ * per-netif DNS, which is a build-config change and out of scope here.
+ *
  * A lease with only one server leaves *out2 empty; so does a static-IP netif. */
 static void fetch_dhcp_dns(esp_netif_t *netif, char *out, size_t cap,
                            char *out2, size_t cap2)
