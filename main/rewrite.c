@@ -1,4 +1,5 @@
 #include "rewrite.h"
+#include "nvs_keys.h"     /* every NVS key this project owns, in one place (#111) */
 #include "esp_attr.h"
 #include "nvs_flash.h"
 #include "nvs.h"
@@ -9,7 +10,7 @@
 #include <stdio.h>
 
 static const char *TAG = "rewrite";
-#define NVS_NS "dns_sink"
+#define NVS_NS NVS_NS_MAIN
 
 typedef struct {
     char     domain[64];
@@ -54,7 +55,7 @@ static void save_nvs(void)
     nvs_handle_t h;
     if (nvs_open(NVS_NS, NVS_READWRITE, &h) != ESP_OK) return;
     for (int i = 0; i < REWRITE_MAX; i++) {
-        char key[12]; snprintf(key, sizeof(key), "rw_%d", i);
+        char key[12]; snprintf(key, sizeof(key), NVSK_REWRITE_FMT, i);
         if (i < (int)s_count) {
             char val[80]; entry_to_str(&s_rules[i], val, sizeof(val));
             nvs_set_str(h, key, val);
@@ -74,7 +75,7 @@ bool rewrite_init(void)
     nvs_handle_t h;
     if (nvs_open(NVS_NS, NVS_READONLY, &h) != ESP_OK) return true;
     for (int i = 0; i < REWRITE_MAX; i++) {
-        char key[12]; snprintf(key, sizeof(key), "rw_%d", i);
+        char key[12]; snprintf(key, sizeof(key), NVSK_REWRITE_FMT, i);
         char val[80]; size_t vlen = sizeof(val);
         if (nvs_get_str(h, key, val, &vlen) != ESP_OK) continue;
         RewriteEntry e;

@@ -1,4 +1,5 @@
 #include "web_auth.h"
+#include "nvs_keys.h"     /* every NVS key this project owns, in one place (#111) */
 #include "esp_log.h"
 #include "esp_random.h"
 #include "esp_timer.h"
@@ -12,10 +13,10 @@ static const char *TAG = "web_auth";
 
 /* Same namespace the old Basic-auth code used, so the one-time migration below
  * can find and destroy the legacy plaintext password. */
-#define AUTH_NVS_NS   "dns_sink"
-#define KEY_USER      "http_user"
-#define KEY_LEGACY    "http_pass"      /* plaintext — v1.1 and earlier */
-#define KEY_HASH      "http_pw2"       /* blob: struct pw_record */
+#define AUTH_NVS_NS   NVS_NS_MAIN
+#define KEY_USER      NVSK_HTTP_USER
+#define KEY_LEGACY    NVSK_HTTP_PW_LEGACY   /* plaintext — v1.1 and earlier */
+#define KEY_HASH      NVSK_HTTP_PW_HASH     /* blob: struct pw_record */
 
 /* PBKDF2 cost. SHA-256 is hardware-accelerated on the S3; 8k iterations lands
  * around 250 ms per verify, which is invisible on a login form and still a

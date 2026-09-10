@@ -1,4 +1,5 @@
 #include "dot.h"
+#include "nvs_keys.h"     /* every NVS key this project owns, in one place (#111) */
 #include "esp_tls.h"
 #include "esp_crt_bundle.h"
 #include "nvs_flash.h"
@@ -14,7 +15,7 @@
 #include <stdatomic.h>
 
 static const char *TAG = "dot";
-#define NVS_NS  "dns_sink"
+#define NVS_NS  NVS_NS_MAIN
 #define DOT_PORT 853
 
 /* Per-operation TLS bound. This now runs in the worker task, so a slow DoT
@@ -207,9 +208,9 @@ void dot_set(bool enabled, const char *server_ip, const char *sni)
      * can't race a second dot_set(). */
     nvs_handle_t h;
     if (nvs_open(NVS_NS, NVS_READWRITE, &h) == ESP_OK) {
-        nvs_set_u8(h,  "dot_en",  enabled ? 1 : 0);
-        nvs_set_str(h, "dot_srv", s_server);
-        nvs_set_str(h, "dot_sni", s_sni);
+        nvs_set_u8(h,  NVSK_DOT_EN,  enabled ? 1 : 0);
+        nvs_set_str(h, NVSK_DOT_SERVER, s_server);
+        nvs_set_str(h, NVSK_DOT_SNI, s_sni);
         nvs_commit(h);
         nvs_close(h);
     }
@@ -230,12 +231,12 @@ bool dot_init_nvs(void)
     nvs_handle_t h;
     if (nvs_open(NVS_NS, NVS_READONLY, &h) != ESP_OK) return true;
     uint8_t en = 0;
-    nvs_get_u8(h, "dot_en", &en);
+    nvs_get_u8(h, NVSK_DOT_EN, &en);
     s_enabled = (en != 0);
     size_t len = sizeof(s_server);
-    nvs_get_str(h, "dot_srv", s_server, &len);
+    nvs_get_str(h, NVSK_DOT_SERVER, s_server, &len);
     len = sizeof(s_sni);
-    nvs_get_str(h, "dot_sni", s_sni, &len);
+    nvs_get_str(h, NVSK_DOT_SNI, s_sni, &len);
     nvs_close(h);
     if (s_enabled) {
         ESP_LOGI(TAG, "DoT upstream enabled: %s (SNI: %s)", s_server, s_sni);

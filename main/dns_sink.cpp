@@ -6,6 +6,7 @@
  * T-ETH-Elite (default) or Waveshare ESP32-S3-ETH.
  */
 
+#include "nvs_keys.h"     /* every NVS key this project owns, in one place (#111) */
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
@@ -177,8 +178,8 @@ extern "C" void dns_sink_trigger_reload(void)
  * *outbound* forwarding socket, via lwIP's subnet-based routing: sending to
  * a gateway IP that only one netif's subnet contains routes out that netif
  * automatically, no explicit interface binding needed. */
-#define NVS_NS       "dns_sink"
-#define NVS_KEY_UPIF "up_if"
+#define NVS_NS       NVS_NS_MAIN
+#define NVS_KEY_UPIF NVSK_UPSTREAM_IF
 static char s_upstream_iface[8] = "eth";   /* "eth" or "wifi" */
 
 /* #80: how long to let the SELECTED upstream interface finish DHCP before
@@ -316,13 +317,13 @@ static void netcfg_load(const char *prefix, NetStaticCfg *cfg)
     if (nvs_open(NVS_NS, NVS_READONLY, &h) != ESP_OK) return;
     char key[24];
     uint8_t mode = 1;   /* default: DHCP */
-    snprintf(key, sizeof(key), "%s_mode", prefix); nvs_get_u8(h, key, &mode);
+    snprintf(key, sizeof(key), NVSK_NET_MODE_FMT, prefix); nvs_get_u8(h, key, &mode);
     cfg->dhcp = (mode != 0);
     size_t len;
-    len = sizeof(cfg->ip);  snprintf(key, sizeof(key), "%s_ip",  prefix); nvs_get_str(h, key, cfg->ip,  &len);
-    len = sizeof(cfg->nm);  snprintf(key, sizeof(key), "%s_nm",  prefix); nvs_get_str(h, key, cfg->nm,  &len);
-    len = sizeof(cfg->gw);  snprintf(key, sizeof(key), "%s_gw",  prefix); nvs_get_str(h, key, cfg->gw,  &len);
-    len = sizeof(cfg->dns); snprintf(key, sizeof(key), "%s_dns", prefix); nvs_get_str(h, key, cfg->dns, &len);
+    len = sizeof(cfg->ip);  snprintf(key, sizeof(key), NVSK_NET_IP_FMT,  prefix); nvs_get_str(h, key, cfg->ip,  &len);
+    len = sizeof(cfg->nm);  snprintf(key, sizeof(key), NVSK_NET_NM_FMT,  prefix); nvs_get_str(h, key, cfg->nm,  &len);
+    len = sizeof(cfg->gw);  snprintf(key, sizeof(key), NVSK_NET_GW_FMT,  prefix); nvs_get_str(h, key, cfg->gw,  &len);
+    len = sizeof(cfg->dns); snprintf(key, sizeof(key), NVSK_NET_DNS_FMT, prefix); nvs_get_str(h, key, cfg->dns, &len);
     nvs_close(h);
 }
 
@@ -342,11 +343,11 @@ extern "C" bool dns_sink_net_set_static(const char *iface, bool dhcp,
     nvs_handle_t h;
     if (nvs_open(NVS_NS, NVS_READWRITE, &h) != ESP_OK) return false;
     char key[24];
-    snprintf(key, sizeof(key), "%s_mode", iface); nvs_set_u8(h, key, dhcp ? 1 : 0);
-    snprintf(key, sizeof(key), "%s_ip",   iface); nvs_set_str(h, key, ip ? ip : "");
-    snprintf(key, sizeof(key), "%s_nm",   iface); nvs_set_str(h, key, nm ? nm : "");
-    snprintf(key, sizeof(key), "%s_gw",   iface); nvs_set_str(h, key, gw ? gw : "");
-    snprintf(key, sizeof(key), "%s_dns",  iface); nvs_set_str(h, key, dns_ip ? dns_ip : "");
+    snprintf(key, sizeof(key), NVSK_NET_MODE_FMT, iface); nvs_set_u8(h, key, dhcp ? 1 : 0);
+    snprintf(key, sizeof(key), NVSK_NET_IP_FMT,   iface); nvs_set_str(h, key, ip ? ip : "");
+    snprintf(key, sizeof(key), NVSK_NET_NM_FMT,   iface); nvs_set_str(h, key, nm ? nm : "");
+    snprintf(key, sizeof(key), NVSK_NET_GW_FMT,   iface); nvs_set_str(h, key, gw ? gw : "");
+    snprintf(key, sizeof(key), NVSK_NET_DNS_FMT,  iface); nvs_set_str(h, key, dns_ip ? dns_ip : "");
     nvs_commit(h);
     nvs_close(h);
     return true;
@@ -536,10 +537,10 @@ static void wifi_creds_init_nvs(void)
     bool have_ssid = false;
     if (nvs_open(NVS_NS, NVS_READONLY, &h) == ESP_OK) {
         size_t len = sizeof(s_wifi_ssid);
-        if (nvs_get_str(h, "wifi_ssid", s_wifi_ssid, &len) == ESP_OK && s_wifi_ssid[0] != '\0')
+        if (nvs_get_str(h, NVSK_WIFI_SSID, s_wifi_ssid, &len) == ESP_OK && s_wifi_ssid[0] != '\0')
             have_ssid = true;
         len = sizeof(s_wifi_pass);
-        nvs_get_str(h, "wifi_pass", s_wifi_pass, &len);
+        nvs_get_str(h, NVSK_WIFI_PASS, s_wifi_pass, &len);
         nvs_close(h);
     }
     if (!have_ssid) {
@@ -547,8 +548,8 @@ static void wifi_creds_init_nvs(void)
         snprintf(s_wifi_ssid, sizeof(s_wifi_ssid), "%s", CONFIG_ADBLOCK_WIFI_SSID);
         snprintf(s_wifi_pass, sizeof(s_wifi_pass), "%s", CONFIG_ADBLOCK_WIFI_PASSWORD);
         if (nvs_open(NVS_NS, NVS_READWRITE, &h) == ESP_OK) {
-            nvs_set_str(h, "wifi_ssid", s_wifi_ssid);
-            nvs_set_str(h, "wifi_pass", s_wifi_pass);
+            nvs_set_str(h, NVSK_WIFI_SSID, s_wifi_ssid);
+            nvs_set_str(h, NVSK_WIFI_PASS, s_wifi_pass);
             nvs_commit(h);
             nvs_close(h);
         }
@@ -581,12 +582,12 @@ static void setup_ap_passphrase(char *out, size_t cap)
     nvs_handle_t h;
     size_t len = cap;
     if (nvs_open(NVS_NS, NVS_READWRITE, &h) != ESP_OK) { snprintf(out, cap, "%s", "setup-nvs-fail"); return; }
-    if (nvs_get_str(h, "setup_psk", out, &len) != ESP_OK || strlen(out) < 8) {
+    if (nvs_get_str(h, NVSK_SETUP_PSK, out, &len) != ESP_OK || strlen(out) < 8) {
         static const char alpha[] = "abcdefghjkmnpqrstuvwxyz23456789";   /* no 0/O/1/l/i */
         uint8_t rnd[16]; esp_fill_random(rnd, sizeof(rnd));
         for (int i = 0; i < 16 && i < (int)cap - 1; i++) out[i] = alpha[rnd[i] % (sizeof(alpha) - 1)];
         out[16 < (int)cap - 1 ? 16 : (int)cap - 1] = '\0';
-        nvs_set_str(h, "setup_psk", out);
+        nvs_set_str(h, NVSK_SETUP_PSK, out);
         nvs_commit(h);
     }
     nvs_close(h);
@@ -913,8 +914,8 @@ extern "C" bool dns_sink_wifi_set_creds(const char *ssid, const char *pass)
 
     nvs_handle_t h;
     if (nvs_open(NVS_NS, NVS_READWRITE, &h) == ESP_OK) {
-        nvs_set_str(h, "wifi_ssid", s_wifi_ssid);
-        nvs_set_str(h, "wifi_pass", s_wifi_pass);
+        nvs_set_str(h, NVSK_WIFI_SSID, s_wifi_ssid);
+        nvs_set_str(h, NVSK_WIFI_PASS, s_wifi_pass);
         nvs_commit(h);
         nvs_close(h);
     }

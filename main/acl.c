@@ -1,4 +1,5 @@
 #include "acl.h"
+#include "nvs_keys.h"     /* every NVS key this project owns, in one place (#111) */
 #include "esp_attr.h"
 #include "nvs_flash.h"
 #include "nvs.h"
@@ -9,7 +10,7 @@
 #include <stdio.h>
 
 static const char *TAG = "acl";
-#define NVS_NS "dns_sink"
+#define NVS_NS NVS_NS_MAIN
 
 /* s_ips/s_count are mutated from the httpd task and read from the dns_task hot
  * path. The mutex serializes the in-memory mutation against the reader (H3).
@@ -31,7 +32,7 @@ static void save_nvs(void)
     nvs_handle_t h;
     if (nvs_open(NVS_NS, NVS_READWRITE, &h) != ESP_OK) return;
     for (int i = 0; i < ACL_MAX; i++) {
-        char key[12]; snprintf(key, sizeof(key), "acl_%d", i);
+        char key[12]; snprintf(key, sizeof(key), NVSK_ACL_FMT, i);
         if (i < (int)s_count) {
             char val[20]; snprintf(val, sizeof(val), "%u.%u.%u.%u",
                 (unsigned)((s_ips[i]>>24)&0xFF),(unsigned)((s_ips[i]>>16)&0xFF),
@@ -53,7 +54,7 @@ bool acl_init(void)
     nvs_handle_t h;
     if (nvs_open(NVS_NS, NVS_READONLY, &h) != ESP_OK) return true;
     for (int i = 0; i < ACL_MAX; i++) {
-        char key[12]; snprintf(key, sizeof(key), "acl_%d", i);
+        char key[12]; snprintf(key, sizeof(key), NVSK_ACL_FMT, i);
         char val[24]; size_t vlen = sizeof(val);
         if (nvs_get_str(h, key, val, &vlen) != ESP_OK) continue;
         uint32_t ip = acl_parse_ip4(val);
