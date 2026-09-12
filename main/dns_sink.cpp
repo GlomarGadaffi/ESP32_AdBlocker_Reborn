@@ -188,6 +188,15 @@ extern "C" void dns_sink_trigger_reload(void)
 #define NVS_KEY_UPIF NVSK_UPSTREAM_IF
 static char s_upstream_iface[8] = "eth";   /* "eth" or "wifi" */
 
+#if CONFIG_ADBLOCK_NET_WIFI
+/* Whether Wi-Fi STA is actually brought up this boot. CONFIG_ADBLOCK_NET_WIFI
+ * used to be both "compiled in" and "active" at once, which meant disabling
+ * dual-WAN needed a reflash. It now only gates compilation; this NVS-backed
+ * flag (seeded from Kconfig on first boot — see wifi_enabled_init_nvs) is the
+ * runtime switch, toggleable from the web UI's Network tab. */
+static bool s_wifi_enabled = false;
+#endif
+
 /* #80: how long to let the SELECTED upstream interface finish DHCP before
  * giving up and starting on the fallback resolver. Long enough for a normal
  * lease, short enough that a cable-out boot is not visibly stalled. */
@@ -205,6 +214,75 @@ extern "C" bool dns_sink_wifi_built(void)
     return true;
 #else
     return false;
+#endif
+}
+
+/* Whether Wi-Fi is actually up (or will be, next boot) — distinct from
+ * dns_sink_wifi_built(): a build can have Wi-Fi compiled in but currently
+ * disabled at runtime. */
+extern "C" bool dns_sink_wifi_enabled(void)
+{
+#if CONFIG_ADBLOCK_NET_WIFI
+    return s_wifi_enabled;
+#else
+    return false;
+#endif
+}
+
+/* Called from web_ui.cpp POST /net/wifi/enable. Persists to NVS ONLY —
+ * deliberately does NOT touch s_wifi_enabled. Same contract as
+ * dns_sink_net_set_static: takes effect on next reboot, not live (starting
+ * or tearing down esp_wifi on a running system is the same class of risky
+ * transition this codebase already avoids for DHCP). Mutating the live flag
+ * here would let dns_sink_set_upstream_iface() and dns_sink_wifi_set_creds()
+ * act as though the radio were already up when it isn't — see
+ * dns_sink_wifi_enabled_pending() for the NVS-only view the web UI checkbox
+ * needs instead. Returns false if this board has no Ethernet to fall back to
+ * (#49) and the caller tried to turn Wi-Fi off. */
+extern "C" bool dns_sink_wifi_set_enabled(bool on)
+{
+#if !CONFIG_ADBLOCK_NET_WIFI
+    (void)on;
+    return false;
+#else
+#if !CONFIG_ADBLOCK_NET_ETH
+    if (!on) return false;
+#endif
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_u8(h, NVSK_WIFI_EN, on ? 1 : 0);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+    return true;
+#endif
+}
+
+/* The saved-for-next-boot value, for the web UI checkbox — distinct from
+ * dns_sink_wifi_enabled()'s live value, which only changes on reboot. Falls
+ * back to the live value when NVS has no entry yet (pre-migration boot,
+ * between wifi_enabled_init_nvs() seeding it and this being read — in
+ * practice never, since app_main seeds it before web_ui_start(), but a
+ * missing key must not read as "false" and show the wrong pending state). */
+extern "C" bool dns_sink_wifi_enabled_pending(void)
+{
+#if !CONFIG_ADBLOCK_NET_WIFI
+    return false;
+#else
+#if !CONFIG_ADBLOCK_NET_ETH
+    return true;
+#else
+    nvs_handle_t h;
+    uint8_t en;
+    if (nvs_open(NVS_NS, NVS_READONLY, &h) == ESP_OK) {
+        if (nvs_get_u8(h, NVSK_WIFI_EN, &en) == ESP_OK) {
+            nvs_close(h);
+            return en != 0;
+        }
+        nvs_close(h);
+    }
+    return s_wifi_enabled;
+#endif
 #endif
 }
 
@@ -280,7 +358,7 @@ extern "C" bool dns_sink_set_upstream_iface(const char *iface)
     if (strcmp(iface, "eth") == 0) known = true;
 #endif
 #if CONFIG_ADBLOCK_NET_WIFI
-    if (strcmp(iface, "wifi") == 0) known = true;
+    if (strcmp(iface, "wifi") == 0) known = s_wifi_enabled;
 #endif
     if (!known) return false;
 
@@ -299,7 +377,8 @@ extern "C" bool dns_sink_set_upstream_iface(const char *iface)
 static void upstream_iface_init_nvs(void)
 {
 #if CONFIG_ADBLOCK_NET_WIFI
-    snprintf(s_upstream_iface, sizeof(s_upstream_iface), "wifi");  /* default when built dual-stack */
+    if (s_wifi_enabled)
+        snprintf(s_upstream_iface, sizeof(s_upstream_iface), "wifi");  /* default when dual-stack and active */
 #endif
 #if !CONFIG_ADBLOCK_NET_ETH
     /* (#49) Wi-Fi is the only link: an NVS value of "eth" (left by an
@@ -312,6 +391,12 @@ static void upstream_iface_init_nvs(void)
     size_t len = sizeof(s_upstream_iface);
     nvs_get_str(h, NVS_KEY_UPIF, s_upstream_iface, &len);
     nvs_close(h);
+#if CONFIG_ADBLOCK_NET_WIFI
+    /* A saved "wifi" preference from before Wi-Fi was disabled at runtime
+     * would otherwise egress on the 1.1.1.1 fallback with s_wifi_dns empty. */
+    if (!s_wifi_enabled && strcmp(s_upstream_iface, "wifi") == 0)
+        snprintf(s_upstream_iface, sizeof(s_upstream_iface), "eth");
+#endif
 }
 
 /* ── Static IP vs DHCP (#55) ────────────────────────────────────────────
@@ -614,6 +699,43 @@ static void wifi_creds_init_nvs(void)
     }
 }
 
+/* ── Wi-Fi enable: NVS-backed, Kconfig only as first-boot seed ───────────
+ * Mirrors wifi_creds_init_nvs above: CONFIG_ADBLOCK_NET_WIFI used to mean
+ * both "compiled in" and "bring it up," so disabling dual-WAN needed a
+ * reflash. Every deployed sdkconfig already sets it y, so seeding true on
+ * first boot (NVS empty) preserves current behavior exactly; from then on
+ * the web UI's Network tab flips this flag instead. Always reads the creds
+ * too, regardless of enabled state, so the SSID field on the web UI still
+ * shows what's configured even while Wi-Fi is off. The Wi-Fi-only board
+ * (#49) has no Ethernet to fall back to, so it ignores NVS here entirely —
+ * see dns_sink_wifi_set_enabled for the matching refusal to turn it off. */
+static void wifi_enabled_init_nvs(void)
+{
+    wifi_creds_init_nvs();
+#if !CONFIG_ADBLOCK_NET_ETH
+    s_wifi_enabled = true;
+    return;
+#else
+    nvs_handle_t h;
+    uint8_t en;
+    if (nvs_open(NVS_NS, NVS_READONLY, &h) == ESP_OK) {
+        if (nvs_get_u8(h, NVSK_WIFI_EN, &en) == ESP_OK) {
+            nvs_close(h);
+            s_wifi_enabled = (en != 0);
+            return;
+        }
+        nvs_close(h);
+    }
+    ESP_LOGI(TAG, "No Wi-Fi enable flag in NVS — seeding enabled from Kconfig default");
+    s_wifi_enabled = true;
+    if (nvs_open(NVS_NS, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_u8(h, NVSK_WIFI_EN, 1);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+#endif
+}
+
 /* ── Setup AP — zero-touch first-boot Wi-Fi config (#1, mirrors upstream
  * ESP32_AdBlocker's own AP-mode bootstrap) ──────────────────────────────
  * Reborn is Ethernet-first, so most boots never need this: plug in a cable,
@@ -766,7 +888,8 @@ static const char *scan_state_name(ScanState s)
 
 static void wifi_init_sta(void)
 {
-    wifi_creds_init_nvs();
+    /* Creds already loaded by wifi_enabled_init_nvs(), called before this
+     * from app_main regardless of whether Wi-Fi ends up enabled. */
     s_scan_mutex = xSemaphoreCreateMutex();   /* guards the scan result cache (#62) */
     if (!s_scan_mutex) ESP_LOGE(TAG, "scan mutex alloc failed — scanning disabled");
     ESP_LOGI(TAG, "Wi-Fi STA: connecting to SSID \"%s\"", s_wifi_ssid);
@@ -978,7 +1101,14 @@ extern "C" bool dns_sink_wifi_set_creds(const char *ssid, const char *pass)
         nvs_close(h);
     }
 
-    xTaskCreate(wifi_apply_reconfigure_task, "wifi_recfg", 3072, nullptr, 3, nullptr);
+    if (s_wifi_enabled) {
+        xTaskCreate(wifi_apply_reconfigure_task, "wifi_recfg", 3072, nullptr, 3, nullptr);
+    } else {
+        /* Radio was never started this boot (dns_sink_wifi_set_enabled is
+         * off) — nothing to disconnect/reconnect. Creds are saved; they take
+         * effect once Wi-Fi is enabled and the board reboots. */
+        ESP_LOGI(TAG, "Wi-Fi creds saved — enable Wi-Fi and reboot to connect");
+    }
     return true;
 }
 
@@ -1859,42 +1989,75 @@ extern "C" void app_main(void)
 #endif
 
 #if CONFIG_ADBLOCK_NET_WIFI
-    /* Wi-Fi STA bring-up alongside Ethernet (#53: dual-WAN). No L2 fast-path
-     * here — Wi-Fi queries take the normal lwIP socket path. */
-    wifi_init_sta();
+    /* Load the runtime enable flag (NVS-seeded from Kconfig on first boot —
+     * see wifi_enabled_init_nvs) before deciding whether to touch the radio
+     * at all. Also loads creds, so the web UI's SSID field is accurate even
+     * when Wi-Fi ends up disabled below. */
+    wifi_enabled_init_nvs();
+    if (s_wifi_enabled) {
+        /* Wi-Fi STA bring-up alongside Ethernet (#53: dual-WAN). No L2
+         * fast-path here — Wi-Fi queries take the normal lwIP socket path. */
+        wifi_init_sta();
 
-    /* Wait for EITHER interface, not both — the Ethernet cable may not be
-     * plugged in at all (Wi-Fi-only operation is a supported mode, not just
-     * a transient boot state), so blocking on both would hang forever with
-     * no cable connected. Whichever interface comes up later still fires its
-     * own IP_EVENT and joins in (apply_upstream_iface() re-runs each time).
-     *
-     * Bounded, not portMAX_DELAY (#1): a board with no Ethernet cable AND no
-     * working Wi-Fi credentials (blank first boot, or a changed home network)
-     * would otherwise hang HERE forever — nothing past this line ever runs,
-     * including web_ui_start(), so the only recovery was the USB serial
-     * console. On timeout, bring up the setup AP (start_setup_ap) so the
-     * device is reachable over Wi-Fi with zero prior config — mirrors
-     * upstream ESP32_AdBlocker's own AP-mode bootstrap — then give it one
-     * more bounded window before continuing regardless: booting with no
-     * upstream reachable yet is already a supported state (see Wi-Fi-only,
-     * no-cable above), just newly reachable via the AP instead of USB. */
-    ESP_LOGI(TAG, "Waiting for Ethernet or Wi-Fi link and DHCP...");
-    EventBits_t link_bits = xEventGroupWaitBits(s_eth_eg, ETH_GOT_IP_BIT | WIFI_GOT_IP_BIT,
-                        pdFALSE, pdFALSE, pdMS_TO_TICKS(WIFI_SETUP_AP_TIMEOUT_MS));
-    if (!(link_bits & (ETH_GOT_IP_BIT | WIFI_GOT_IP_BIT))) {
-        start_setup_ap();
-        xEventGroupWaitBits(s_eth_eg, ETH_GOT_IP_BIT | WIFI_GOT_IP_BIT,
+        /* Wait for EITHER interface, not both — the Ethernet cable may not be
+         * plugged in at all (Wi-Fi-only operation is a supported mode, not just
+         * a transient boot state), so blocking on both would hang forever with
+         * no cable connected. Whichever interface comes up later still fires its
+         * own IP_EVENT and joins in (apply_upstream_iface() re-runs each time).
+         *
+         * Bounded, not portMAX_DELAY (#1): a board with no Ethernet cable AND no
+         * working Wi-Fi credentials (blank first boot, or a changed home network)
+         * would otherwise hang HERE forever — nothing past this line ever runs,
+         * including web_ui_start(), so the only recovery was the USB serial
+         * console. On timeout, bring up the setup AP (start_setup_ap) so the
+         * device is reachable over Wi-Fi with zero prior config — mirrors
+         * upstream ESP32_AdBlocker's own AP-mode bootstrap — then give it one
+         * more bounded window before continuing regardless: booting with no
+         * upstream reachable yet is already a supported state (see Wi-Fi-only,
+         * no-cable above), just newly reachable via the AP instead of USB. */
+        ESP_LOGI(TAG, "Waiting for Ethernet or Wi-Fi link and DHCP...");
+        EventBits_t link_bits = xEventGroupWaitBits(s_eth_eg, ETH_GOT_IP_BIT | WIFI_GOT_IP_BIT,
                             pdFALSE, pdFALSE, pdMS_TO_TICKS(WIFI_SETUP_AP_TIMEOUT_MS));
+        if (!(link_bits & (ETH_GOT_IP_BIT | WIFI_GOT_IP_BIT))) {
+            start_setup_ap();
+            xEventGroupWaitBits(s_eth_eg, ETH_GOT_IP_BIT | WIFI_GOT_IP_BIT,
+                                pdFALSE, pdFALSE, pdMS_TO_TICKS(WIFI_SETUP_AP_TIMEOUT_MS));
+        }
+        ESP_LOGI(TAG, "Network ready — Ethernet: %s  Wi-Fi: %s",
+                 s_ip[0] ? s_ip : "(down)", s_wifi_ip[0] ? s_wifi_ip : "(down)");
+    } else {
+        /* Wi-Fi compiled in but disabled at runtime — no radio brought up at
+         * all (esp_wifi_init/start never called), so no setup AP is possible
+         * either. Bounded, not portMAX_DELAY (#1 again, one level up): before
+         * this was runtime-toggleable, every image with Wi-Fi compiled out
+         * was also one nobody actually deployed with Ethernet unplugged, so
+         * an infinite wait here never bit anyone. A web UI checkbox makes
+         * "Ethernet-only, cable out" reachable for the first time — and
+         * console_start() below is the ONLY recovery a Wi-Fi-disabled board
+         * has, so it must be reached even with no link. A cable plugged in
+         * later still completes the normal way via eth_event_handler. */
+        /* Bounded, not portMAX_DELAY — see the branch comment above. */
+        ESP_LOGI(TAG, "Wi-Fi disabled (Network tab) — waiting for Ethernet link and DHCP...");
+        EventBits_t got = xEventGroupWaitBits(s_eth_eg, ETH_CONNECTED_BIT | ETH_GOT_IP_BIT,
+                            pdFALSE, pdTRUE, pdMS_TO_TICKS(WIFI_SETUP_AP_TIMEOUT_MS));
+        if ((got & (ETH_CONNECTED_BIT | ETH_GOT_IP_BIT)) != (ETH_CONNECTED_BIT | ETH_GOT_IP_BIT))
+            ESP_LOGW(TAG, "No Ethernet link yet — continuing anyway so the USB console "
+                          "(wifi-on) stays reachable; a cable plugged in later still comes up");
+        ESP_LOGI(TAG, "Network ready — IP: %s", s_ip[0] ? s_ip : "(down)");
     }
-    ESP_LOGI(TAG, "Network ready — Ethernet: %s  Wi-Fi: %s",
-             s_ip[0] ? s_ip : "(down)", s_wifi_ip[0] ? s_wifi_ip : "(down)");
 #else
-    /* Wait for link + DHCP lease */
+    /* Wait for link + DHCP lease. Bounded — see the runtime-disabled branch's
+     * comment above; this build has no Wi-Fi at all, so the USB console is
+     * the ONLY recovery when no cable is plugged in, and it must be reached. */
+    /* Bounded, not portMAX_DELAY — see the runtime-disabled branch's comment
+     * above for why. */
     ESP_LOGI(TAG, "Waiting for Ethernet link and DHCP...");
-    xEventGroupWaitBits(s_eth_eg, ETH_CONNECTED_BIT | ETH_GOT_IP_BIT,
-                        pdFALSE, pdTRUE, portMAX_DELAY);
-    ESP_LOGI(TAG, "Network ready — IP: %s", s_ip);
+    EventBits_t got = xEventGroupWaitBits(s_eth_eg, ETH_CONNECTED_BIT | ETH_GOT_IP_BIT,
+                        pdFALSE, pdTRUE, pdMS_TO_TICKS(WIFI_SETUP_AP_TIMEOUT_MS));
+    if ((got & (ETH_CONNECTED_BIT | ETH_GOT_IP_BIT)) != (ETH_CONNECTED_BIT | ETH_GOT_IP_BIT))
+        ESP_LOGW(TAG, "No Ethernet link yet — continuing anyway so the USB console "
+                      "stays reachable; a cable plugged in later still comes up");
+    ESP_LOGI(TAG, "Network ready — IP: %s", s_ip[0] ? s_ip : "(down)");
 #endif
 
     upstream_iface_init_nvs();
@@ -2039,7 +2202,7 @@ extern "C" void app_main(void)
              "(not built)",
 #endif
 #if CONFIG_ADBLOCK_NET_WIFI
-             s_wifi_ip[0] ? s_wifi_ip : "(down)");
+             !s_wifi_enabled ? "(disabled)" : (s_wifi_ip[0] ? s_wifi_ip : "(down)"));
 #else
              "(not built)");
 #endif

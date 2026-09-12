@@ -83,6 +83,10 @@
 #define NVSK_UPSTREAM_IF    "up_if"         /* str: "eth" | "wifi" */
 #define NVSK_WIFI_SSID      "wifi_ssid"     /* str */
 #define NVSK_WIFI_PASS      "wifi_pass"     /* str */
+#define NVSK_WIFI_EN        "wifi_en"       /* u8:  bring up Wi-Fi STA at boot (was
+                                             * build-time-only ADBLOCK_NET_WIFI;
+                                             * Kconfig now only seeds this on first
+                                             * boot — see wifi_enabled_init_nvs()) */
 #define NVSK_SETUP_PSK      "setup_psk"     /* str: first-boot setup secret */
 /* Per-interface static IP config. The "%s" is the interface name, validated
  * against "eth"/"wifi" before any of these are built — see
@@ -132,6 +136,7 @@ NVSK_ASSERT_FITS(NVSK_HTTP_PW_HASH);
 NVSK_ASSERT_FITS(NVSK_UPSTREAM_IF);
 NVSK_ASSERT_FITS(NVSK_WIFI_SSID);
 NVSK_ASSERT_FITS(NVSK_WIFI_PASS);
+NVSK_ASSERT_FITS(NVSK_WIFI_EN);
 NVSK_ASSERT_FITS(NVSK_SETUP_PSK);
 NVSK_ASSERT_FITS(NVSK_NET_IF_WIDEST "_mode");
 NVSK_ASSERT_FITS(NVSK_NET_IF_WIDEST "_dns");

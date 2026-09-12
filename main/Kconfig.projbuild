@@ -40,21 +40,33 @@ menu "ESP32 AdBlocker Reborn"
             hook and the SD mount in dns_sink.cpp.
 
     config ADBLOCK_NET_WIFI
-        bool "Also bring up Wi-Fi STA alongside W5500 Ethernet (dual-WAN)" if ADBLOCK_NET_ETH
+        bool "Compile in Wi-Fi STA support alongside W5500 Ethernet (dual-WAN)" if ADBLOCK_NET_ETH
         default n
         help
-            Join a Wi-Fi network in addition to the W5500 Ethernet link, so
-            both are up at once — e.g. answer LAN DNS queries on Ethernet
-            while egressing upstream resolver queries out Wi-Fi (or vice
-            versa), useful when the two links sit behind different ISPs/NAT.
-            Which interface egresses upstream is chosen at runtime from the
-            web UI (persisted in NVS); SSID/password below are compile-time
-            since Wi-Fi bring-up itself isn't configurable from the UI yet.
+            Whether Wi-Fi STA support is compiled into this image at all —
+            NOT whether it's actually brought up at boot. Join a Wi-Fi network
+            in addition to the W5500 Ethernet link, so both are up at once —
+            e.g. answer LAN DNS queries on Ethernet while egressing upstream
+            resolver queries out Wi-Fi (or vice versa), useful when the two
+            links sit behind different ISPs/NAT. Which interface egresses
+            upstream is chosen at runtime from the web UI (persisted in NVS).
             SD card, blocklist, DNS server, and web UI are unchanged. The L2
             fast-path RX hook is Ethernet-only; Wi-Fi-egressed queries take
             the normal lwIP socket path.
 
-            Forced on (and the only link) for the generic Wi-Fi-only board.
+            Whether it's actually enabled is now a runtime NVS flag, toggled
+            from the web UI's Network tab (reboot to apply) — no reflash
+            needed to switch between single- and dual-WAN once a build has
+            this compiled in. On first boot (no NVS value yet) it's seeded
+            enabled — the only state this code can seed, since it only exists
+            when this option is y — so upgrading an existing dual-WAN board
+            doesn't silently drop Wi-Fi. SSID/
+            password below are still compile-time only as a first-boot seed —
+            set from the web UI (or the USB console's `wifi` command)
+            afterwards, same as before.
+
+            Forced on (and the only link, not user-toggleable) for the
+            generic Wi-Fi-only board.
 
     config ADBLOCK_WIFI_SSID
         string "Wi-Fi SSID"

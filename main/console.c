@@ -17,6 +17,10 @@ static const char *TAG = "console";
 /* dns_sink.cpp (extern "C") */
 bool dns_sink_wifi_set_creds(const char *ssid, const char *pass);
 void dns_sink_wifi_get_ssid(char *out, size_t cap);
+bool dns_sink_wifi_built(void);
+bool dns_sink_wifi_enabled(void);          /* live — this boot */
+bool dns_sink_wifi_enabled_pending(void);  /* saved — next boot */
+bool dns_sink_wifi_set_enabled(bool on);
 bool dns_sink_setup_ap_active(void);
 void dns_sink_setup_ap_passphrase(char *out, size_t cap);
 const char *dns_sink_hostname(void);
@@ -29,6 +33,13 @@ const char *dns_sink_hostname(void);
  * Commands:
  *   wifi <ssid> <password>     switch Wi-Fi STA credentials and reconnect;
  *                              quote an SSID containing spaces: wifi "a b" pw
+ *   wifi-on / wifi-off         enable/disable Wi-Fi STA at boot (was the
+ *                              build-time-only ADBLOCK_NET_WIFI option, now
+ *                              an NVS flag — same "saved, reboot to apply"
+ *                              as the web UI's checkbox). The recovery path
+ *                              this exists for: an Ethernet board with
+ *                              Wi-Fi disabled and no cable plugged in has no
+ *                              other way to reach the web UI's toggle.
  *   status                     one-line liveness print
  *   heap                       internal / PSRAM free, largest block, low-water
  *   admin-reset                erase the web UI admin account; the browser
@@ -85,14 +96,30 @@ static void handle_line(char *line)
         if (dns_sink_wifi_set_creds(ssid, pass))
             ESP_LOGI(TAG, "Wi-Fi credentials set — reconnecting to \"%s\"", ssid);
         else
-            ESP_LOGW(TAG, "wifi: rejected (bad ssid/password length, or Wi-Fi disabled)");
+            ESP_LOGW(TAG, "wifi: rejected (bad ssid/password length, or Wi-Fi not built in)");
+    } else if (strcmp(line, "wifi-on") == 0 || strcmp(line, "wifi-off") == 0) {
+        bool on = (strcmp(line, "wifi-on") == 0);
+        if (!dns_sink_wifi_built())
+            ESP_LOGW(TAG, "wifi-%s: Wi-Fi not built into this image", on ? "on" : "off");
+        else if (!dns_sink_wifi_set_enabled(on))
+            ESP_LOGW(TAG, "wifi-off: rejected — this board has no Ethernet to fall back to");
+        else
+            ESP_LOGI(TAG, "Wi-Fi will be %s on next reboot (currently %s) — reboot to apply",
+                     on ? "enabled" : "disabled", dns_sink_wifi_enabled() ? "on" : "off");
     } else if (strcmp(line, "status") == 0) {
         char ssid[33];
         dns_sink_wifi_get_ssid(ssid, sizeof(ssid));
         char user[WEB_AUTH_USER_MAX + 1];
         web_auth_get_user(user, sizeof(user));
-        ESP_LOGI(TAG, "alive, uptime %llus, wifi ssid \"%s\", web admin %s, setup AP %s",
-                 (unsigned long long)(esp_log_timestamp() / 1000u), ssid,
+        char wifi_state[40] = "not built";
+        if (dns_sink_wifi_built()) {
+            bool en = dns_sink_wifi_enabled(), pend = dns_sink_wifi_enabled_pending();
+            if (en == pend) snprintf(wifi_state, sizeof(wifi_state), "%s", en ? "on" : "off");
+            else snprintf(wifi_state, sizeof(wifi_state), "%s (pending %s)",
+                          en ? "on" : "off", pend ? "on" : "off");
+        }
+        ESP_LOGI(TAG, "alive, uptime %llus, wifi %s ssid \"%s\", web admin %s, setup AP %s",
+                 (unsigned long long)(esp_log_timestamp() / 1000u), wifi_state, ssid,
                  web_auth_setup_needed() ? "NOT SET (setup mode)" : user,
                  dns_sink_setup_ap_active() ? "active" : "off");
     } else if (strcmp(line, "admin-reset") == 0) {
@@ -152,8 +179,8 @@ static void handle_line(char *line)
         }
         console_pause_list();
     } else {
-        ESP_LOGW(TAG, "unknown command (have: wifi, status, heap, admin-reset, cert-reset, "
-                      "cert, setup-psk, pause, resume)");
+        ESP_LOGW(TAG, "unknown command (have: wifi, wifi-on, wifi-off, status, heap, "
+                      "admin-reset, cert-reset, cert, setup-psk, pause, resume)");
     }
 }
 
@@ -170,7 +197,7 @@ static void console_task(void *arg)
         return;
     }
     ESP_LOGI(TAG, "USB recovery console ready "
-                  "(wifi/status/heap/admin-reset/cert-reset/cert/setup-psk/pause/resume)");
+                  "(wifi/wifi-on/wifi-off/status/heap/admin-reset/cert-reset/cert/setup-psk/pause/resume)");
     static char line[160];
     size_t have = 0;
     for (;;) {

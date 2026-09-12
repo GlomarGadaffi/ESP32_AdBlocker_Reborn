@@ -41,6 +41,9 @@ static DnsSinkServer  *s_dns      = nullptr;
 
 extern "C" void dns_sink_trigger_reload(void);
 extern "C" bool dns_sink_wifi_built(void);
+extern "C" bool dns_sink_wifi_enabled(void); /* live: is Wi-Fi actually up right now */
+extern "C" bool dns_sink_wifi_enabled_pending(void); /* saved-for-next-boot value */
+extern "C" bool dns_sink_wifi_set_enabled(bool on);
 extern "C" bool dns_sink_eth_built(void);    /* (#49) false on the Wi-Fi-only board */
 extern "C" void dns_sink_net_status(char *iface, size_t iface_cap,
                                      char *eth_ip, size_t eth_cap,
@@ -1310,6 +1313,7 @@ static esp_err_t handle_status(httpd_req_t *r)
     if (dns_sink_wifi_built() && dns_sink_eth_built()) {
         char iface[8]="", eth_ip[16]="", wifi_ip[16]="";
         dns_sink_net_status(iface, sizeof(iface), eth_ip, sizeof(eth_ip), wifi_ip, sizeof(wifi_ip));
+        bool wifi_en = dns_sink_wifi_enabled();
         pb.appendf(
             "<h3>Network Interfaces</h3>"
             "<p>Ethernet: %s &nbsp; Wi-Fi: %s</p>"
@@ -1317,11 +1321,12 @@ static esp_err_t handle_status(httpd_req_t *r)
             "upstream resolver queries; LAN clients can query either IP either way.</small></p>"
             "<form method=post action=/net/upstream>"
             "<label><input type=radio name=iface value=eth%s> Ethernet</label> "
-            "<label><input type=radio name=iface value=wifi%s> Wi-Fi</label> "
+            "<label><input type=radio name=iface value=wifi%s%s> Wi-Fi</label> "
             "<button>Set upstream interface</button></form>",
-            eth_ip[0] ? eth_ip : "(down)", wifi_ip[0] ? wifi_ip : "(down)",
+            eth_ip[0] ? eth_ip : "(down)", wifi_en ? (wifi_ip[0] ? wifi_ip : "(down)") : "(disabled — see Wi-Fi below)",
             strcmp(iface, "eth") == 0 ? " checked" : "",
-            strcmp(iface, "wifi") == 0 ? " checked" : "");
+            strcmp(iface, "wifi") == 0 ? " checked" : "",
+            wifi_en ? "" : " disabled");
     }
 
     /* DHCP vs static IP, per interface (#55). Saved to NVS; takes effect on
@@ -1392,12 +1397,35 @@ static esp_err_t handle_status(httpd_req_t *r)
             running ? running->label : "?");
     }
 
-    /* Wi-Fi scan + reconfigure (#54) */
+    /* Wi-Fi scan + reconfigure (#54), enable/disable toggle (was build-time
+     * ADBLOCK_NET_WIFI, now a runtime NVS flag — see dns_sink_wifi_set_enabled) */
     if (dns_sink_wifi_built()) {
+        bool wifi_en      = dns_sink_wifi_enabled();          /* live — this boot */
+        bool wifi_pending = dns_sink_wifi_enabled_pending();  /* saved — next boot */
+        pb.appendf("<h3>Wi-Fi</h3>");
+        if (dns_sink_eth_built()) {
+            /* Wi-Fi-only boards have no Ethernet to fall back to and force
+             * this on — nothing to toggle there. Checkbox reflects the saved
+             * (pending) value, not the live one — they can disagree right up
+             * until the next reboot, same as the static-IP forms above. */
+            pb.appendf(
+                "<form method=post action=/net/wifi/enable>"
+                "<label><input type=checkbox name=enabled value=1%s> Bring up Wi-Fi STA "
+                "alongside Ethernet (dual-WAN)</label> "
+                "<button>Save</button><small> — requires reboot to take effect%s</small></form>",
+                wifi_pending ? " checked" : "",
+                wifi_pending != wifi_en ? " (pending reboot — currently different)" : "");
+        }
+        if (!wifi_en) {
+            pb.appendf(
+                "<p><small>Wi-Fi is currently disabled — SSID/password below are saved "
+                "to NVS but won't connect until the board reboots%s.</small></p>",
+                wifi_pending ? " (already queued — checkbox above is ticked)"
+                             : " with the checkbox above enabled");
+        }
         char ssid[33] = ""; dns_sink_wifi_get_ssid(ssid, sizeof(ssid));
         char safe_ssid[80]; html_escape(safe_ssid, sizeof(safe_ssid), ssid);
         pb.appendf(
-            "<h3>Wi-Fi</h3>"
             "<p>Currently configured SSID: <b>%s</b></p>"
             "<button type=button onclick=\"wifiScan()\">Scan for networks</button>"
             "<span id=wifi-scan-status></span>"
@@ -2053,6 +2081,19 @@ static esp_err_t handle_net_static_set(httpd_req_t *r, const char *iface)
 }
 static esp_err_t handle_net_eth_set(httpd_req_t *r)  { return handle_net_static_set(r, "eth"); }
 static esp_err_t handle_net_wifi_set(httpd_req_t *r) { return handle_net_static_set(r, "wifi"); }
+
+/* ── POST /net/wifi/enable — runtime dual-WAN toggle ─────────────────
+ * Was build-time-only ADBLOCK_NET_WIFI; now persists to NVS and takes effect
+ * on the next reboot (dns_sink_wifi_set_enabled — same "save, then reboot"
+ * contract as /net/{eth,wifi}/set above, not a live esp_wifi_init/deinit). */
+static esp_err_t handle_net_wifi_enable(httpd_req_t *r)
+{
+    if (!csrf_ok(r)) { httpd_resp_send_err(r, HTTPD_403_FORBIDDEN, "CSRF"); return ESP_FAIL; }
+    char body[32] = {}; httpd_req_recv(r, body, sizeof(body) - 1);
+    bool on = (strstr(body, "enabled=1") != nullptr);
+    dns_sink_wifi_set_enabled(on);
+    httpd_resp_set_status(r, "303 See Other"); httpd_resp_set_hdr(r, "Location", "/#network"); httpd_resp_send(r,nullptr,0); return ESP_OK;
+}
 
 /* ── POST /reboot — apply a saved static-IP change (#55) ─────────── */
 static esp_err_t handle_reboot(httpd_req_t *r)
@@ -2774,6 +2815,7 @@ bool web_ui_start(DnsSinkServer *dns)
         { "/wifi/connect",        HTTP_POST, H(handle_wifi_connect)  },
         { "/net/eth/set",         HTTP_POST, H(handle_net_eth_set)   },
         { "/net/wifi/set",        HTTP_POST, H(handle_net_wifi_set)  },
+        { "/net/wifi/enable",     HTTP_POST, H(handle_net_wifi_enable) },
         { "/reboot",              HTTP_POST, H(handle_reboot)        },
         { "/ota/update",          HTTP_POST, H(handle_ota_update)    },
     };
