@@ -533,6 +533,10 @@ static void apply_static_ip(esp_netif_t *netif, const NetStaticCfg &cfg)
     }
 }
 
+#if CONFIG_ADBLOCK_NET_WIFI
+static void stop_setup_ap_if_active(void);   /* defined below wifi_creds_init_nvs (#1) */
+#endif
+
 /* Publish a statically-configured interface's address — deferred to the
  * link-up event rather than done at config time (#56). A static netif never
  * fires IP_EVENT_*_GOT_IP, so the "got IP" bit has to be raised by hand; doing
@@ -553,6 +557,9 @@ static void publish_static_eth(void)
     s_eth_ip_nbo.store(inet_addr(s_eth_static.ip), std::memory_order_relaxed);
     xEventGroupSetBits(s_eth_eg, ETH_GOT_IP_BIT);
     apply_upstream_iface();
+#if CONFIG_ADBLOCK_NET_WIFI
+    stop_setup_ap_if_active();
+#endif
 }
 
 #endif
@@ -622,10 +629,6 @@ static void fetch_dhcp_dns(esp_netif_t *netif, char *out, size_t cap,
     fetch_dhcp_dns_one(netif, ESP_NETIF_DNS_MAIN,   out,  cap);
     fetch_dhcp_dns_one(netif, ESP_NETIF_DNS_BACKUP, out2, cap2);
 }
-
-#if CONFIG_ADBLOCK_NET_WIFI
-static void stop_setup_ap_if_active(void);   /* defined below wifi_creds_init_nvs (#1) */
-#endif
 
 static void ip_event_handler(void *, esp_event_base_t, int32_t event_id, void *event_data)
 {
@@ -822,6 +825,7 @@ static void publish_static_wifi(void)
              s_wifi_dns[0] ? s_wifi_dns : "(none)");
     xEventGroupSetBits(s_eth_eg, WIFI_GOT_IP_BIT);
     apply_upstream_iface();
+    stop_setup_ap_if_active();
 }
 
 /* Suppresses the STA_DISCONNECTED auto-retry across a deliberate reconfigure
@@ -895,6 +899,11 @@ static void wifi_init_sta(void)
     ESP_LOGI(TAG, "Wi-Fi STA: connecting to SSID \"%s\"", s_wifi_ssid);
 
     esp_netif_t *wifi_netif = esp_netif_create_default_wifi_sta();
+    /* DHCP option 12 (hostname) — otherwise this reports as the IDF-wide
+     * "espressif" default in the router's client list, same name for every
+     * ESP32 on the LAN. Matches the mDNS hostname (dns_sink_hostname()) so
+     * there's one name to look for either way. */
+    esp_netif_set_hostname(wifi_netif, MDNS_HOSTNAME);
 
     wifi_init_config_t init_cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&init_cfg));
@@ -1971,6 +1980,8 @@ extern "C" void app_main(void)
     esp_eth_handle_t eth_handle = eth_init_w5500();
     esp_netif_config_t netif_cfg = ESP_NETIF_DEFAULT_ETH();
     esp_netif_t *eth_netif = esp_netif_new(&netif_cfg);
+    /* DHCP option 12 — see wifi_init_sta()'s matching call for why. */
+    esp_netif_set_hostname(eth_netif, MDNS_HOSTNAME);
     esp_netif_attach(eth_netif, esp_eth_new_netif_glue(eth_handle));
     /* Override the glue's input with our L2 fast-path hook (passthrough for now) */
     ESP_ERROR_CHECK(esp_eth_update_input_path_info(eth_handle, l2_input_cb, eth_netif));
@@ -2011,18 +2022,23 @@ extern "C" void app_main(void)
          * including web_ui_start(), so the only recovery was the USB serial
          * console. On timeout, bring up the setup AP (start_setup_ap) so the
          * device is reachable over Wi-Fi with zero prior config — mirrors
-         * upstream ESP32_AdBlocker's own AP-mode bootstrap — then give it one
-         * more bounded window before continuing regardless: booting with no
-         * upstream reachable yet is already a supported state (see Wi-Fi-only,
-         * no-cable above), just newly reachable via the AP instead of USB. */
+         * upstream ESP32_AdBlocker's own AP-mode bootstrap — then continue
+         * straight on to web_ui_start() etc. below: booting with no upstream
+         * reachable yet is already a supported state (see Wi-Fi-only, no-cable
+         * above), just newly reachable via the AP instead of USB. There used
+         * to be a second bounded wait here "for credentials to arrive," but
+         * none can — the httpd that would receive them doesn't exist until
+         * web_ui_start() runs, further down past this whole block. That wait
+         * was pure dead time: the AP came up, then sat unreachable for up to
+         * another WIFI_SETUP_AP_TIMEOUT_MS before the web UI it exists to
+         * serve ever started. A cable plugged in during that window doesn't
+         * need app_main blocked to notice it either — eth_event_handler runs
+         * from the system event task regardless. */
         ESP_LOGI(TAG, "Waiting for Ethernet or Wi-Fi link and DHCP...");
         EventBits_t link_bits = xEventGroupWaitBits(s_eth_eg, ETH_GOT_IP_BIT | WIFI_GOT_IP_BIT,
                             pdFALSE, pdFALSE, pdMS_TO_TICKS(WIFI_SETUP_AP_TIMEOUT_MS));
-        if (!(link_bits & (ETH_GOT_IP_BIT | WIFI_GOT_IP_BIT))) {
+        if (!(link_bits & (ETH_GOT_IP_BIT | WIFI_GOT_IP_BIT)))
             start_setup_ap();
-            xEventGroupWaitBits(s_eth_eg, ETH_GOT_IP_BIT | WIFI_GOT_IP_BIT,
-                                pdFALSE, pdFALSE, pdMS_TO_TICKS(WIFI_SETUP_AP_TIMEOUT_MS));
-        }
         ESP_LOGI(TAG, "Network ready — Ethernet: %s  Wi-Fi: %s",
                  s_ip[0] ? s_ip : "(down)", s_wifi_ip[0] ? s_wifi_ip : "(down)");
     } else {

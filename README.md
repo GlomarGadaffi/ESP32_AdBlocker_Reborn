@@ -44,9 +44,10 @@ You don't need to compile any code or install development tools to get started.
 ---
 
 ### 4. First-Boot Security Wizard
-1. Open your browser and navigate to **`https://esp32adblock.local`** (or your board's DHCP IP).
+1. Open your browser and navigate to **`https://esp32adblock.local`** (or your board's DHCP IP, or `https://192.168.4.1` if you joined the temporary setup Wi-Fi network above).
 2. **Accept the Certificate Warning:** The device generates its own secure, unique ECDSA P-256 TLS certificate on first boot. Compare the SHA-256 fingerprint shown on the screen with your device console if desired, then proceed.
 3. **Create Admin Credentials:** Enter an admin username and password. This protects your network configuration, Wi-Fi credentials, and DNS query history.
+4. **Connect It to Your Network:** You're dropped straight into a network setup step — Ethernet-capable boards can review or set a static IP here (DHCP is the default and usually all you need); Wi-Fi-capable boards can scan for and join a network. This is the same form the dashboard's Network tab uses later, so nothing here is a one-time-only setting — revisit it from the dashboard any time. "Skip" heads straight to the dashboard if you don't need either right now.
 
 ---
 

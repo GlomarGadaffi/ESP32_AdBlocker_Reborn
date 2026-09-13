@@ -42,7 +42,8 @@ metrics fields from `dns_server_metrics_json()` in `dns_server.cpp`.
 | method | path | purpose |
 | --- | --- | --- |
 | GET | `/setup` | First-boot wizard: certificate fingerprint + admin account form. Only while no account exists. |
-| POST | `/setup` | Create the admin account (`user`, `pass`, `pass2`); opens a session. |
+| POST | `/setup` | Create the admin account (`user`, `pass`, `pass2`); opens a session, then redirects to `/setup/network`. |
+| GET | `/setup/network` | Onboarding step 2: Ethernet DHCP/Static and/or Wi-Fi scan/connect, whichever this board has. A normal logged-in page (not setup-only) — same backend endpoints as the dashboard's Network tab, just a focused view onto them. |
 | GET | `/login` | Sign-in form. |
 | POST | `/login` | Verify `user`/`pass`; sets the `sid` cookie. 5 failures → 60 s lockout. |
 | POST | `/logout` | Destroy the current session and clear the cookie. |
@@ -80,9 +81,10 @@ metrics fields from `dns_server_metrics_json()` in `dns_server.cpp`.
 | POST | `/net/upstream` | Choose which interface egresses upstream queries. Applied live. |
 | POST | `/wifi/scan` | Start a Wi-Fi scan on a worker task. |
 | GET | `/wifi/scan` | Fetch the results of the last scan. |
-| POST | `/wifi/connect` | Join a Wi-Fi network (credentials stored in NVS). |
+| POST | `/wifi/connect` | Join a Wi-Fi network (credentials stored in NVS). Normally 303s to `/#network`; if the setup AP is active, instead returns a 200 HTML interstitial telling the client to rejoin its own network, since the setup AP — and the response's own connection — drops out from under it the moment the new network associates. |
 | POST | `/net/eth/set` | Ethernet DHCP/static IP config. Takes effect on reboot. |
 | POST | `/net/wifi/set` | Wi-Fi DHCP/static IP config. Takes effect on reboot. |
+| POST | `/net/wifi/enable` | Toggle whether Wi-Fi STA is brought up at boot (dual-WAN alongside Ethernet). NVS-only — takes effect on reboot, does not touch the running radio. Rejected on the Wi-Fi-only board, which has no Ethernet to fall back to. |
 | POST | `/reboot` | Reboot the device. |
 | POST | `/ota/update` | Upload a merged firmware `.bin` as the raw request body. |
 

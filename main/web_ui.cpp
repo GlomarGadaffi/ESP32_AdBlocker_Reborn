@@ -274,6 +274,7 @@ static void redirect_to(httpd_req_t *r, const char *where)
 typedef esp_err_t (*raw_handler_t)(httpd_req_t *);
 static esp_err_t handle_setup_get(httpd_req_t *r);
 static esp_err_t handle_setup_post(httpd_req_t *r);
+static esp_err_t handle_setup_network_get(httpd_req_t *r);
 static esp_err_t handle_login_get(httpd_req_t *r);
 static esp_err_t handle_login_post(httpd_req_t *r);
 
@@ -564,7 +565,130 @@ static esp_err_t handle_setup_post(httpd_req_t *r)
 
     char sid[WEB_AUTH_TOKEN_HEX + 1];
     if (web_auth_session_create(sid, sizeof(sid))) set_session_cookie(r, sid);
-    redirect_to(r, "/");
+    redirect_to(r, "/setup/network");
+    return ESP_OK;
+}
+
+/* ── GET /setup/network — onboarding step 2: get it on the LAN ──────
+ * Reached right after account creation (only from there — nothing else
+ * links here — but it's a normal logged-in page, not setup-wizard-only, so
+ * revisiting it later works too). Ethernet-capable boards show the same
+ * DHCP/Static form as the dashboard's Network tab; Wi-Fi-capable boards show
+ * the same scan/connect widget. Deliberately the SAME backend endpoints
+ * (/net/eth/set, /wifi/connect, /wifi/scan) as the dashboard — this page is
+ * just a focused, single-purpose view onto them, not a separate config
+ * surface, so there's nothing here that can drift out of sync with it.
+ *
+ * The Wi-Fi enable/disable checkbox from the dashboard's Wi-Fi section is
+ * deliberately not repeated here: reaching this page via the setup AP only
+ * happens when Wi-Fi is already live (start_setup_ap() only ever runs from
+ * inside app_main's "Wi-Fi enabled" branch — see dns_sink.cpp), so the
+ * common path never needs it. It's not the ONLY path here, though — this is
+ * a normal logged-in page, so an Ethernet board reached the ordinary way
+ * (browse straight to its DHCP address) with Wi-Fi runtime-disabled can land
+ * here too; see the dns_sink_wifi_enabled() check below for that case. */
+static esp_err_t handle_setup_network_get(httpd_req_t *r)
+{
+    /* Self-contained page like the pause-confirm page above (no dashboard tab
+     * script here to auto-append it), so every form's csrf rides on its own
+     * action — same pattern as /pause/timed's confirmation page. */
+    char csrf[33] = ""; web_auth_session_csrf(s_req_sid, csrf, sizeof(csrf));
+    static EXT_RAM_BSS_ATTR char page[8192];
+    int n = 0;
+    page_appendf(page, sizeof(page), &n, AUTH_PAGE_HEAD);
+    page_appendf(page, sizeof(page), &n, "<h2>Connect this device to your network</h2>");
+
+    if (dns_sink_eth_built()) {
+        page_appendf(page, sizeof(page), &n,
+            "<p><small>Plugging in an Ethernet cable is usually all this needs — it "
+            "DHCPs an address automatically. Set a static IP here only if your "
+            "network needs one.</small></p>");
+        bool dhcp = true; char ip[16]="", nm[16]="", gw[16]="", dns_ip[16]="";
+        dns_sink_net_get_static("eth", &dhcp, ip, sizeof(ip), nm, sizeof(nm),
+                                 gw, sizeof(gw), dns_ip, sizeof(dns_ip));
+        if (dhcp)
+            dns_sink_net_get_current("eth", ip, sizeof(ip), nm, sizeof(nm),
+                                      gw, sizeof(gw), dns_ip, sizeof(dns_ip));
+        page_appendf(page, sizeof(page), &n,
+            "<h3>Ethernet: DHCP / Static IP</h3>"
+            "<form method=post action='/net/eth/set?csrf=%s'>"
+            "<label><input type=radio name=mode value=dhcp%s> DHCP</label> "
+            "<label><input type=radio name=mode value=static%s> Static</label><br>"
+            "IP: <input name=ip value=\"%s\" placeholder='192.168.1.50' size=16> "
+            "Netmask: <input name=nm value=\"%s\" placeholder='255.255.255.0' size=16><br>"
+            "Gateway: <input name=gw value=\"%s\" placeholder='192.168.1.1' size=16> "
+            "DNS: <input name=dns value=\"%s\" placeholder='192.168.1.1' size=16><br>"
+            "<button>Save</button>"
+            "<small> — requires reboot to take effect</small></form>",
+            csrf, dhcp ? " checked" : "", dhcp ? "" : " checked", ip, nm, gw, dns_ip);
+    }
+
+    if (dns_sink_wifi_built() && !dns_sink_wifi_enabled()) {
+        /* Reached over Ethernet (not the setup AP, which can't exist while
+         * Wi-Fi is disabled) with the runtime flag off — connecting here
+         * would just save NVS with no live radio to apply it to, and this
+         * page has no room for the pending/live distinction the dashboard's
+         * Wi-Fi section shows. Point there instead of half-rendering it. */
+        page_appendf(page, sizeof(page), &n,
+            "<h3>Wi-Fi</h3>"
+            "<p><small>Wi-Fi is currently disabled on this board. Enable it from "
+            "the <a href=/#network>dashboard's Network tab</a> and reboot, then "
+            "come back here to pick a network.</small></p>");
+    } else if (dns_sink_wifi_built()) {
+        page_appendf(page, sizeof(page), &n,
+            "<p><small>%s</small></p>",
+            dns_sink_eth_built()
+                ? "Or join a Wi-Fi network as well — both stay up together (dual-WAN)."
+                : "This board has no Ethernet port — Wi-Fi is how it reaches your network.");
+        char ssid[33] = ""; dns_sink_wifi_get_ssid(ssid, sizeof(ssid));
+        char safe_ssid[80]; html_escape(safe_ssid, sizeof(safe_ssid), ssid);
+        page_appendf(page, sizeof(page), &n,
+            "<h3>Wi-Fi</h3>"
+            "<p>Currently configured SSID: <b>%s</b></p>"
+            "<button type=button onclick=\"wifiScan()\">Scan for networks</button>"
+            "<span id=wifi-scan-status></span>"
+            "<ul id=wifi-results></ul>"
+            "<form method=post action='/wifi/connect?csrf=%s'>"
+            "<input id=wifi-ssid name=ssid placeholder='SSID' size=24> "
+            "<input id=wifi-pass name=password placeholder='Password' size=24 type=password> "
+            "<button>Connect</button></form>"
+            "<script>"
+            "var CSRF='%s';"
+            "function wifiStat(t){document.getElementById('wifi-scan-status').textContent=t;}"
+            "function wifiScan(){wifiStat(' starting\xe2\x80\xa6');"
+            "fetch('/wifi/scan',{method:'POST',headers:{'X-CSRF':CSRF}}).then(function(r){return r.json()})"
+            ".then(function(d){if(d.state=='error'){wifiStat(' '+(d.err||'scan failed'));return;}"
+            "setTimeout(wifiPoll,600);})"
+            ".catch(function(){wifiStat(' scan failed');});}"
+            "function wifiPoll(){"
+            "fetch('/wifi/scan').then(function(r){return r.json()}).then(function(d){"
+            "if(d.state=='scanning'){wifiStat(' scanning\xe2\x80\xa6');setTimeout(wifiPoll,800);return;}"
+            "if(d.state=='error'){wifiStat(' '+(d.err||'scan failed'));return;}"
+            "wifiRender(d);})"
+            ".catch(function(){wifiStat(' scan failed');});}"
+            "function wifiRender(d){"
+            "var ul=document.getElementById('wifi-results');ul.innerHTML='';"
+            "if(d.state!='done'){wifiStat('');return;}"
+            "wifiStat(' '+d.aps.length+' found'+(d.age_s>=0?' ('+d.age_s+'s ago)':''));"
+            "d.aps.forEach(function(ap){"
+            "var li=document.createElement('li');"
+            "var btn=document.createElement('button');btn.type='button';"
+            "btn.textContent=ap.ssid+' ('+ap.rssi+' dBm)'+(ap.auth==0?' [open]':'');"
+            "btn.onclick=function(){document.getElementById('wifi-ssid').value=ap.ssid;"
+            "document.getElementById('wifi-pass').focus();};"
+            "li.appendChild(btn);ul.appendChild(li);});}"
+            "wifiPoll();"
+            "</script>",
+            safe_ssid, csrf, csrf);
+    }
+
+    page_appendf(page, sizeof(page), &n,
+        "<form method=post action='/reboot?csrf=%s' style='margin-top:1em'>"
+        "<button>Reboot now</button></form>"
+        "<p><a href=/>Skip &mdash; go to the dashboard &rarr;</a></p>"
+        "</body></html>",
+        csrf);
+    send_html(r, page);
     return ESP_OK;
 }
 
@@ -2216,9 +2340,36 @@ static esp_err_t handle_wifi_connect(httpd_req_t *r)
     char ssid[33] = "", pass[65] = "";
     form_field(body, "ssid", ssid, sizeof(ssid));
     form_field(body, "password", pass, sizeof(pass));
+    bool via_setup_ap = dns_sink_setup_ap_active();
     if (!dns_sink_wifi_set_creds(ssid, pass)) {
         httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST, "SSID must be 1-32 characters");
         return ESP_FAIL;
+    }
+    if (via_setup_ap) {
+        char safe_ssid[80]; html_escape(safe_ssid, sizeof(safe_ssid), ssid);
+        /* Bare name for the router's device list — set as this board's DHCP
+         * hostname (option 12) in wifi_init_sta()/app_main, so it's also the
+         * name to look for there, not just the .local mDNS one. */
+        char dhcp_name[32]; snprintf(dhcp_name, sizeof(dhcp_name), "%s", dns_sink_hostname());
+        char *dot = strchr(dhcp_name, '.'); if (dot) *dot = '\0';
+        static EXT_RAM_BSS_ATTR char page[1024];
+        int n = snprintf(page, sizeof(page),
+            "<!DOCTYPE html><html><head><meta charset=utf-8><title>Connecting</title>"
+            "<style>body{font-family:monospace;max-width:520px;margin:3em auto;padding:0 1em}</style>"
+            "</head><body><h2>Connecting to \"%s\"&hellip;</h2>"
+            "<p>If that succeeds, this device's temporary setup network switches off "
+            "within a few seconds and this page stops loading &mdash; that's expected, "
+            "not a failure. Rejoin your own Wi-Fi, then browse to <b>https://%s</b> "
+            "(or look for <b>%s</b> in your router's device list, if that name doesn't "
+            "resolve) to finish setup.</p>"
+            "<p>If the password was wrong or it's out of range, nothing joins and this "
+            "setup network stays up exactly as it was &mdash; reconnect to it here and "
+            "try again.</p>"
+            "</body></html>",
+            safe_ssid, dns_sink_hostname(), dhcp_name);
+        httpd_resp_set_type(r, "text/html");
+        httpd_resp_send(r, page, n);
+        return ESP_OK;
     }
     httpd_resp_set_status(r, "303 See Other"); httpd_resp_set_hdr(r, "Location", "/#network"); httpd_resp_send(r,nullptr,0); return ESP_OK;
 }
@@ -2775,6 +2926,7 @@ bool web_ui_start(DnsSinkServer *dns)
     static const httpd_uri_t uris[] = {
         { "/setup",               HTTP_GET,  H(handle_setup_get)     },
         { "/setup",               HTTP_POST, H(handle_setup_post)    },
+        { "/setup/network",       HTTP_GET,  H(handle_setup_network_get) },
         { "/login",               HTTP_GET,  H(handle_login_get)     },
         { "/login",               HTTP_POST, H(handle_login_post)    },
         { "/logout",              HTTP_POST, H(handle_logout)        },
