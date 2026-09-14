@@ -18,6 +18,7 @@ idf_component_register(
         "http_fetch.c"
         "murmur3.c"
         "domain.c"
+        "dns_wire.c"
         "console.c"
         "web_tls.c"
         "web_auth.c"

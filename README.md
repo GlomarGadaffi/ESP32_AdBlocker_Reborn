@@ -124,6 +124,8 @@ Upgrades do not require a USB cable or toolchain:
 4. The board flashes the new image into its second partition and reboots.
 5. **Failsafe Rollback:** If a bad image fails to boot or start the network, the hardware bootloader automatically rolls back to the previous working firmware.
 
+> **Signed images (from 1.5.0):** every release `.bin` carries an RSA-3072 signature and the running firmware refuses an OTA upload that is not signed with the project key — so an admin session alone can no longer put arbitrary code on the board. The first signed build installs over an unsigned 1.4.x normally (it is the *running* image that checks); after that, only signed images are accepted over OTA. Serial flashing (esptool / the web flasher) is unaffected — this is app signing, not hardware Secure Boot, and protects against network access, not physical access.
+
 > **Upgrading to 1.3.0:** the SD snapshot format changed, so the first boot on 1.3.0 rejects any pre-1.3.0 snapshot by design and re-downloads the whole blocklist (measured at 459 s on a four-feed configuration). The device fails open and forwards unfiltered for that window. Every boot after that is warm again (~21 s).
 
 ### Emergency USB Recovery Console

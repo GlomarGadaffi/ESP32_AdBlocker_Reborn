@@ -3,6 +3,40 @@
 All notable changes to ESP32_AdBlocker_Reborn. Versions follow SemVer; the
 firmware's `esp_app_desc` version string comes from `version.txt`.
 
+## [Unreleased]
+
+### Security
+
+- **OTA images are now signed, and the firmware refuses unsigned ones.**
+  `/ota/update` used to accept any image that passed ESP-IDF's structural
+  check, so anyone holding an admin session (or a phished login) could put
+  arbitrary firmware on the box that answers every DNS query on the LAN.
+  Builds now carry an RSA-3072 signature block ("signed apps without Secure
+  Boot": `CONFIG_SECURE_SIGNED_APPS_NO_SECURE_BOOT`) and `esp_ota_end`
+  verifies it. Rollout: the first signed image installs over 1.4.x normally;
+  from then on every pre-1.5 release asset is refused over OTA. Serial
+  flashing is unaffected. The signing key is `secure_boot_signing_key.pem`
+  in the project root, gitignored — back it up; without it deployed boards
+  can only be updated over serial.
+- **Out-of-bounds read in the upstream-reply TTL parser.** For an NXDOMAIN
+  reply whose SOA record declared an rdlen running past the end of the
+  packet, `dns_resp_min_ttl` read the SOA "minimum" field from up to 20
+  bytes beyond the received data (bounded only by the untrusted rdlen). The
+  effect was a stale-memory TTL clamped to [10, 3600] s, not code execution,
+  but any upstream — or anyone who can spoof one — could trigger it. Found
+  by the new fuzz target within seconds of its first run.
+
+### Added
+
+- **Fuzz targets** (`tests/fuzz/`): libFuzzer harnesses for the blocklist
+  rule grammar and the DNS wire helpers, with seed corpora and a build script
+  that follows the OSS-Fuzz / ClusterFuzzLite contract. The DNS helpers
+  (`skip_name`, `dns_resp_min_ttl`, `rewrite_answer_ttls`,
+  `decompress_name`) moved from `dns_server.cpp` into a dependency-free
+  `main/dns_wire.c` so they compile on the host — same reason #109 moved
+  `dns_extract_qname` into `domain.c`. `tests/dns_wire_test.c` pins the
+  SOA case above.
+
 ## [1.4.0] — 2026-09-10
 
 ### Behaviour changes

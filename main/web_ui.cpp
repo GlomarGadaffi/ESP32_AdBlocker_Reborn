@@ -2281,7 +2281,7 @@ static esp_err_t handle_ota_update(httpd_req_t *r)
     if (end_err != ESP_OK) {
         httpd_resp_send_err(r, HTTPD_500_INTERNAL_SERVER_ERROR,
             end_err == ESP_ERR_OTA_VALIDATE_FAILED
-                ? "image validation failed (bad file?) — old firmware still running"
+                ? "image validation failed (not a firmware image, or not signed with this project's key) — old firmware still running"
                 : "esp_ota_end failed — old firmware still running");
         return ESP_FAIL;
     }
