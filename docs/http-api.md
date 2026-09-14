@@ -86,7 +86,7 @@ metrics fields from `dns_server_metrics_json()` in `dns_server.cpp`.
 | POST | `/net/wifi/set` | Wi-Fi DHCP/static IP config. Takes effect on reboot. |
 | POST | `/net/wifi/enable` | Toggle whether Wi-Fi STA is brought up at boot (dual-WAN alongside Ethernet). NVS-only — takes effect on reboot, does not touch the running radio. Rejected on the Wi-Fi-only board, which has no Ethernet to fall back to. |
 | POST | `/reboot` | Reboot the device. |
-| POST | `/ota/update` | Upload an app firmware `.bin` as the raw request body. The image must carry a valid RSA-3072 signature from the project key (`CONFIG_SECURE_SIGNED_ON_UPDATE_NO_SECURE_BOOT`); an unsigned or foreign-signed image is rejected at `esp_ota_end` with a 500 and the running firmware is untouched. |
+| POST | `/ota/update` | Upload a merged firmware `.bin` as the raw request body. The image must carry a valid RSA-3072 signature from the project key (`CONFIG_SECURE_SIGNED_ON_UPDATE_NO_SECURE_BOOT`); an unsigned or foreign-signed image is rejected at `esp_ota_end` with a 500 and the running firmware is untouched. |
 
 `/wifi/scan` is registered twice on purpose: `POST` has the radio side effect
 (it starts a scan), `GET` only reads the result, so the side-effecting half
