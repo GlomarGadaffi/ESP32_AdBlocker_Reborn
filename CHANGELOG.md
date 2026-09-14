@@ -26,10 +26,18 @@ firmware's `esp_app_desc` version string comes from `version.txt`.
   but any upstream — or anyone who can spoof one — could trigger it. Found
   by the new fuzz target within seconds of its first run.
 
+- **Session cookie parser accepted an over-long `sid` value.** `sid=<64 hex>junk`
+  was read as the 64-hex prefix instead of being rejected: no exposure, since
+  the prefix still had to match a live session, but not the "exactly" the
+  code promised. Now strict. Found by the new web-parser fuzz target.
+
 ### Added
 
 - **Fuzz targets** (`tests/fuzz/`): libFuzzer harnesses for the blocklist
-  rule grammar and the DNS wire helpers, with seed corpora and a build script
+  rule grammar, the DNS wire helpers, and the web UI's pre-authentication
+  request parsers (`web_form_field`, `web_url_decode`, `web_cookie_sid`,
+  `web_origin_host_matches`, `web_html_escape` — moved from `web_ui.cpp`
+  into dependency-free `main/web_parse.c`, with `tests/web_parse_test.c`), with seed corpora and a build script
   that follows the OSS-Fuzz / ClusterFuzzLite contract. The DNS helpers
   (`skip_name`, `dns_resp_min_ttl`, `rewrite_answer_ttls`,
   `decompress_name`) moved from `dns_server.cpp` into a dependency-free

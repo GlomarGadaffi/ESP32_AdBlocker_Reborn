@@ -39,12 +39,15 @@ $CC $CFLAGS $common "$here/fuzz_rule_parse.c" \
 $CC $CFLAGS $common "$here/fuzz_dns_wire.c" \
     "$SRC/main/dns_wire.c" "$SRC/main/domain.c" "$SRC/main/murmur3.c" \
     $engine -o "$OUT/fuzz_dns_wire"
+# shellcheck disable=SC2086
+$CC $CFLAGS $common "$here/fuzz_web_parse.c" "$SRC/main/web_parse.c" \
+    $engine -o "$OUT/fuzz_web_parse"
 
 # Seed corpora ship zipped for OSS-Fuzz-style runners; locally the plain dirs
 # under corpus/ are used directly.
 if command -v zip >/dev/null 2>&1; then
-    for t in rule_parse dns_wire; do
+    for t in rule_parse dns_wire web_parse; do
         (cd "$here/corpus/$t" && zip -q -r "$OUT/fuzz_${t}_seed_corpus.zip" .) || true
     done
 fi
-echo "built: $OUT/fuzz_rule_parse $OUT/fuzz_dns_wire"
+echo "built: $OUT/fuzz_rule_parse $OUT/fuzz_dns_wire $OUT/fuzz_web_parse"

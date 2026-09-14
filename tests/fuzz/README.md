@@ -7,6 +7,7 @@ device does not control:
 | --- | --- | --- |
 | `fuzz_rule_parse` | `main/domain.c` — `rule_parse_next`, `rule_apply_feed_policy`, `domain_normalize`, `domain_extract_token` | every line of every third-party blocklist feed, and the custom-rules textarea |
 | `fuzz_dns_wire` | `main/dns_wire.c` + `dns_extract_qname` — `dns_skip_name`, `dns_resp_min_ttl`, `dns_rewrite_answer_ttls`, `dns_decompress_name` | every client query and every upstream reply (or anything spoofing one) |
+| `fuzz_web_parse` | `main/web_parse.c` — `web_form_field`, `web_url_decode`, `web_cookie_sid`, `web_origin_host_matches`, `web_html_escape` | the `/setup` and `/login` bodies and the Cookie/Origin/Referer/Host headers of every request — all parsed **before** any login check — plus every client-chosen string the dashboard renders |
 
 Both harnesses copy the input into an exact-size heap buffer, so a one-byte
 over-read that the firmware's 512/1500-byte buffers would silently absorb is
@@ -25,7 +26,12 @@ export PATH=$HOME/llvm/bin:$PATH
 sh tests/fuzz/build.sh                      # -> tests/fuzz/out/fuzz_*
 tests/fuzz/out/fuzz_dns_wire  tests/fuzz/corpus/dns_wire  -max_len=1500 -jobs=4 -workers=4
 tests/fuzz/out/fuzz_rule_parse tests/fuzz/corpus/rule_parse -max_len=512 -jobs=4 -workers=4
+tests/fuzz/out/fuzz_web_parse  tests/fuzz/corpus/web_parse  -max_len=512 -jobs=4 -workers=4
 ```
+
+`fuzz_web_parse` reads its input as `[cap byte][A]\0[B]`: the first byte picks
+the output buffer size (1..96), A is the body / URL / Cookie header, B the
+form key / Host header — see the seeds for the shape.
 
 Crash inputs land in the working directory as `crash-<sha1>`. To reproduce
 one without libFuzzer (plain gcc + sanitizers):

@@ -112,6 +112,31 @@ def rule_seeds():
     return {"rule_%02d" % i: s.encode() for i, s in enumerate(lines)}
 
 
+def web_seeds():
+    """fuzz_web_parse input: [cap byte][A]\\0[B]. A = body / url / cookie,
+    B = key / host."""
+    def mk(cap, a, b=b""):
+        return bytes([cap]) + a + b"\x00" + b
+    s = {}
+    s["login_body"] = mk(64, b"user=admin&pass=I+like+tacos%21&csrf=abc", b"pass")
+    s["setup_body"] = mk(64, b"user=admin&pass=glopiglopi&pass2=glopiglopi", b"pass2")
+    s["body_key_prefix"] = mk(32, b"xpass=nope&pass=yes", b"pass")
+    s["body_key_last"] = mk(32, b"a=1&b=2&pass", b"pass")
+    s["body_pct_edge"] = mk(32, b"v=%4&w=%zz&x=%41%", b"x")
+    s["body_crlf"] = mk(32, b"v=abc\r\ndef&w=1", b"v")
+    s["origin_ok"] = mk(40, b"https://192.168.12.195/login", b"192.168.12.195")
+    s["origin_port"] = mk(40, b"https://esp32adblock.local:443/", b"esp32adblock.local:443")
+    s["origin_evil"] = mk(40, b"https://192.168.12.195.evil.com/", b"192.168.12.195")
+    s["origin_case"] = mk(40, b"HTTPS://ESP32ADBLOCK.LOCAL", b"esp32adblock.local")
+    s["origin_null"] = mk(40, b"null", b"esp32adblock.local")
+    s["cookie_one"] = mk(64, b"sid=" + b"ab" * 32)
+    s["cookie_multi"] = mk(64, b"theme=dark; xsid=zzz; sid=" + b"0123456789abcdef" * 4 + b"; other=1")
+    s["cookie_short"] = mk(64, b"sid=abc; sid=" + b"f" * 64)
+    s["html"] = mk(96, b"<script>alert('x')</script>&amp;\"q\"")
+    s["html_tight"] = mk(6, b"<<<<<<<<<<")
+    return s
+
+
 def write(sub, seeds):
     d = os.path.join(HERE, "corpus", sub)
     os.makedirs(d, exist_ok=True)
@@ -124,3 +149,4 @@ def write(sub, seeds):
 if __name__ == "__main__":
     write("dns_wire", dns_seeds())
     write("rule_parse", rule_seeds())
+    write("web_parse", web_seeds())

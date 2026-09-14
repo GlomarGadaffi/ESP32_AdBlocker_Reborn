@@ -19,6 +19,7 @@ idf_component_register(
         "murmur3.c"
         "domain.c"
         "dns_wire.c"
+        "web_parse.c"
         "console.c"
         "web_tls.c"
         "web_auth.c"
