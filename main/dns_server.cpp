@@ -873,6 +873,25 @@ static inline void randomize_qname_case(uint8_t *pkt, int qend)
     }
 }
 
+/* (#72) Fold the qname back to a fixed case (lowercase) before a reply ever
+ * leaves this box — for the live requester(s) AND for the bytes handed to
+ * cache_store_resp, so every later replay is clean too. The 0x20 pattern's
+ * job ends the instant query_case_hash() has compared it against what we
+ * sent; nothing downstream of that check needs the client to ever see it.
+ * This also keeps the pattern itself off the client-facing wire: something
+ * fuzzing or observing the box from the LAN side only ever sees canonical
+ * case, so it can't recover the per-query randomization used against the
+ * upstream leg. Same flat scan as randomize_qname_case(), unconditional
+ * instead of coin-flipped. */
+static inline void normalize_qname_case(uint8_t *pkt, int qend)
+{
+    for (int i = (int)sizeof(DnsHeader); i < qend - 4; i++) {
+        uint8_t c = pkt[i];
+        if ((c | 0x20) < 'a' || (c | 0x20) > 'z') continue;   /* label-length byte or the null label */
+        pkt[i] = c | 0x20;
+    }
+}
+
 /* (#72) Case-SENSITIVE hash of the raw wire question (qname+qtype+qclass),
  * stored at send time and re-checked against the reply in process_reply()'s
  * H2 gate. domain_hash()/ue->qhash stay case-insensitive on purpose (they
@@ -1254,6 +1273,61 @@ static bool cname_chain_is_blocked(const uint8_t *pkt, int len, int qend)
     return false;
 }
 
+/* (#72) normalize_qname_case() above only scrubs the question section —
+ * the one place a compression pointer can't reach, since RFC 1035 §4.1.4
+ * pointers must point strictly backward and the question comes first. An
+ * answer/authority/additional RR whose OWNER name equals the qname (a
+ * plain A/AAAA answer, or an SOA/NS authority record on NXDOMAIN) is free
+ * to either point back to the question — nothing to fix, the pointer just
+ * re-reads bytes we already normalized — or spell the name out raw again,
+ * which would leak our per-query case pattern to the client exactly the
+ * way the question section used to. Walk every RR across all three
+ * sections and lowercase only the raw label bytes actually stored AT that
+ * RR's own owner-name position (never the bytes a pointer jumps to, which
+ * either live in the question, already handled, or in an earlier RR this
+ * same walk already reached — pointers are backward-only, so processing
+ * RRs in wire order means every raw occurrence gets visited exactly once
+ * before anything downstream could point at it).
+ * RDATA-embedded target names (CNAME/NS/MX/SRV/PTR) are independent zone
+ * data that never inherited our qname's case pattern in the first place —
+ * out of scope here on purpose, this only touches each RR's own name
+ * field. A malformed/truncated packet just stops the walk early (fail
+ * toward availability, same posture as cname_chain_is_blocked() above);
+ * whatever got normalized before the bail stays normalized. */
+static void normalize_answer_owner_names(uint8_t *pkt, int len, int qend)
+{
+    if (len < 12) return;
+    int ancount = (pkt[6]  << 8) | pkt[7];
+    int nscount = (pkt[8]  << 8) | pkt[9];
+    int arcount = (pkt[10] << 8) | pkt[11];
+    int off = qend;
+    for (int i = 0; i < ancount + nscount + arcount; i++) {
+        int start = off;
+        char name[256]; size_t nlen = 0;
+        if (!decompress_name(pkt, len, &off, name, sizeof(name), &nlen)) return;
+        /* Walk label by label, never byte-flat: [start, off) ends in a
+         * 2-byte compression pointer whenever the owner name is compressed,
+         * and that pointer's low byte is an offset, not a character — any
+         * target whose low byte falls in 0x41-0x5A reads as 'A'-'Z', and
+         * OR-ing 0x20 into it re-aims the pointer 32 bytes forward. Stop at
+         * the pointer or the root label; only label contents are text. */
+        for (int j = start; j < off; ) {
+            uint8_t b = pkt[j];
+            if (b == 0 || (b & 0xC0)) break;
+            for (int k = j + 1; k <= j + b && k < off; k++) {
+                uint8_t c = pkt[k];
+                if ((c | 0x20) < 'a' || (c | 0x20) > 'z') continue;
+                pkt[k] = c | 0x20;
+            }
+            j += 1 + b;
+        }
+        if (off + 10 > len) return;
+        uint16_t rdlen = ((uint16_t)pkt[off + 8] << 8) | pkt[off + 9];
+        off += 10 + rdlen;
+        if (off > len) return;
+    }
+}
+
 /* ── Main loop ───────────────────────────────────────────────────── */
 DnsSinkServer::DnsSinkServer() : _exitSem(xSemaphoreCreateBinary()) {}
 
@@ -1457,6 +1531,10 @@ void DnsSinkServer::run_loop()
                  * is proven ~0 in the field against the real upstream. */
                 if (query_case_hash(pkt, rqend) != ue->case_hash)
                     s_cnt_case_mismatch++;
+                /* Signature's job is done — scrub the pattern before this
+                 * packet is delivered or cached (#72). */
+                normalize_qname_case(pkt, rqend);
+                normalize_answer_owner_names(pkt, plen, rqend);
             }
 
             /* CNAME-cloaking inspection (#74): a tracker hiding behind a CNAME

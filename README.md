@@ -318,7 +318,8 @@ Set the Wi-Fi credentials afterwards over the USB console (`wifi "<SSID>" <passw
 ├── tests/
 │   ├── bl_table_test.c          # Host tests for the storage core (radix landing buffer,
 │   │                             # near-capacity merge, bucket occupancy, measured FP rate)
-│   └── l2_finish_reply_test.c   # Byte-equivalence check for the L2 fast-path reply builder
+│   ├── l2_finish_reply_test.c   # Byte-equivalence check for the L2 fast-path reply builder
+│   └── qname_case_scrub_test.c  # #72 reply case-scrub: compression pointers survive, cache-safe
 └── tools/
     ├── dnsload/          # DNS load generator: N queries in flight, true percentiles
     └── make-release.ps1  # Collects each board's build artifacts into release/
@@ -333,6 +334,8 @@ gcc -O2 -I main -o bl_table_test tests/bl_table_test.c main/bl_table.c
 ./bl_table_test
 gcc -O2 -o l2_finish_reply_test tests/l2_finish_reply_test.c
 ./l2_finish_reply_test
+gcc -O2 -I main -o qname_case_scrub_test tests/qname_case_scrub_test.c main/domain.c
+./qname_case_scrub_test
 ```
 
 ---
