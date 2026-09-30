@@ -1,6 +1,7 @@
 #include "dns_server.h"
 #include "blocklist.h"
 #include "domain.h"
+#include "dns_wire.h"
 #include "rewrite.h"
 #include "acl.h"
 #include "pause.h"
@@ -328,32 +329,6 @@ static CacheEntry *cache_lookup_stale(uint32_t h, uint16_t qtype, uint64_t now_m
     return nullptr;
 }
 
-static bool skip_name(const uint8_t *pkt, int len, int *off);   /* defined below */
-
-/* Rewrite every RR TTL in a response to ttl_s (RFC 8767: serve stale data
- * with a short TTL so clients re-ask soon). Walks an+ns+ar like
- * dns_resp_min_ttl; on any malformed step it stops, leaving later TTLs
- * untouched — harmless, the response was already served as-is before. */
-static void rewrite_answer_ttls(uint8_t *pkt, int len, uint32_t ttl_s)
-{
-    if (len < 12) return;
-    int rrs = ((pkt[6] << 8) | pkt[7]) + ((pkt[8] << 8) | pkt[9]) +
-              ((pkt[10] << 8) | pkt[11]);
-    int off = 12;
-    if (!skip_name(pkt, len, &off)) return;
-    off += 4;                                   /* qtype + qclass */
-    for (int i = 0; i < rrs; i++) {
-        if (off > len || !skip_name(pkt, len, &off)) return;
-        if (off + 10 > len) return;
-        pkt[off + 4] = (uint8_t)(ttl_s >> 24);
-        pkt[off + 5] = (uint8_t)(ttl_s >> 16);
-        pkt[off + 6] = (uint8_t)(ttl_s >> 8);
-        pkt[off + 7] = (uint8_t)(ttl_s);
-        uint16_t rdlen = ((uint16_t)pkt[off + 8] << 8) | pkt[off + 9];
-        off += 10 + rdlen;
-    }
-}
-
 /* L2 fast-path cache read (called from the eth-RX task). Seqlock-protected.
  * Copies the cached ALLOWED response for (qhash,qtype) into out (caller patches
  * the txid + builds the frame). Returns the DNS length, or -1 on miss / expired /
@@ -570,86 +545,6 @@ extern "C" void dns_server_cache_save(void)
         return;
     }
     ESP_LOGI(TAG, "cache saved: %" PRIu32 " responses to SD", saved);
-}
-
-/* Skip a DNS name (label walk + compression pointer) at *off; advance *off past it.
- * Returns false if the packet is malformed. */
-static bool skip_name(const uint8_t *pkt, int len, int *off)
-{
-    while (*off < len) {
-        uint8_t b = pkt[*off];
-        if (b == 0)          { (*off)++;        return true; }
-        /* (#113) A compression pointer is 2 bytes; at len-1 only its first
-         * byte exists. Advancing by 2 anyway pushed *off one past len — the
-         * caller's own `off > len` guards catch that on the next name, but a
-         * bare call site (dns_resp_min_ttl above) doesn't, so refuse here. */
-        if ((b & 0xC0) == 0xC0) {
-            if (*off + 1 >= len) return false;
-            (*off) += 2; return true;
-        }
-        if ((b & 0xC0) != 0) return false;     /* reserved label length */
-        *off += 1 + b;
-    }
-    return false;
-}
-
-/* Parse the minimum TTL for caching:
- * - NOERROR with answers: min TTL across all answer RRs.
- * - NXDOMAIN (ancount=0): SOA minimum from authority section (RFC 2308 §5). */
-static uint32_t dns_resp_min_ttl(const uint8_t *pkt, int len, uint32_t deflt)
-{
-    if (len < 12) return deflt;
-    int ancount = (pkt[6] << 8) | pkt[7];
-    int nscount = (pkt[8] << 8) | pkt[9];
-
-    /* Skip question section */
-    int off = 12;
-    if (!skip_name(pkt, len, &off)) return deflt;
-    if (off + 4 > len) return deflt;
-    off += 4;  /* qtype + qclass */
-
-    uint32_t minttl = 0xFFFFFFFFu;
-
-    if (ancount > 0) {
-        /* NOERROR: collect min TTL across answer RRs */
-        for (int i = 0; i < ancount; i++) {
-            if (!skip_name(pkt, len, &off)) break;
-            if (off + 10 > len) break;
-            uint32_t ttl = ((uint32_t)pkt[off+4] << 24) | ((uint32_t)pkt[off+5] << 16)
-                         | ((uint32_t)pkt[off+6] << 8)  |  (uint32_t)pkt[off+7];
-            uint16_t rdlen = ((uint16_t)pkt[off+8] << 8) | pkt[off+9];
-            if (ttl < minttl) minttl = ttl;
-            off += 10 + rdlen;
-        }
-    } else if (nscount > 0) {
-        /* NXDOMAIN: look for SOA in authority section (RFC 2308 §5) */
-        for (int i = 0; i < nscount; i++) {
-            if (!skip_name(pkt, len, &off)) break;
-            if (off + 10 > len) break;
-            uint16_t rtype = ((uint16_t)pkt[off+0] << 8) | pkt[off+1];
-            uint32_t rttl  = ((uint32_t)pkt[off+4] << 24) | ((uint32_t)pkt[off+5] << 16)
-                           | ((uint32_t)pkt[off+6] << 8)  |  (uint32_t)pkt[off+7];
-            uint16_t rdlen = ((uint16_t)pkt[off+8] << 8) | pkt[off+9];
-            off += 10;
-            if (rtype == 6 && rdlen >= 20) {  /* SOA: skip MNAME+RNAME then read minimum */
-                int roff = off;
-                if (skip_name(pkt, len, &roff) && skip_name(pkt, len, &roff) &&
-                    roff + 20 <= off + rdlen) {
-                    /* SOA RDATA: serial(4) refresh(4) retry(4) expire(4) minimum(4) */
-                    uint32_t soa_min = ((uint32_t)pkt[roff+16] << 24) | ((uint32_t)pkt[roff+17] << 16)
-                                     | ((uint32_t)pkt[roff+18] << 8)  |  (uint32_t)pkt[roff+19];
-                    uint32_t neg_ttl = rttl < soa_min ? rttl : soa_min;
-                    if (neg_ttl < minttl) minttl = neg_ttl;
-                }
-            }
-            off += rdlen;
-        }
-    }
-
-    if (minttl == 0xFFFFFFFFu) return deflt;
-    if (minttl < FWD_TTL_MIN_S) minttl = FWD_TTL_MIN_S;
-    if (minttl > FWD_TTL_MAX_S) minttl = FWD_TTL_MAX_S;
-    return minttl;
 }
 
 /* ── Upstream concurrent query table ─────────────────────────────── */
@@ -1180,52 +1075,6 @@ static int append_bare_edns_opt(uint8_t *dst, const uint8_t *q, int mlen, int ca
     return mlen + 11;
 }
 
-/* Decompress a name that may use RFC 1035 §4.1.4 message compression —
- * unlike dns_extract_qname (which REJECTS compression in the question
- * section by design), answer-section owner/RDATA names commonly use it. *off is
- * advanced exactly like skip_name() would (stopping at the first
- * terminator or the first compression pointer at the ORIGINAL position,
- * +1 or +2 respectively) regardless of how many pointers are followed
- * internally to decode the actual name — a caller walking subsequent RRs
- * must not be dragged into wherever a jump landed.
- * Jump targets must point strictly backward (target < the offset of the
- * pointer that named it) and are capped at 20 hops — both guard against a
- * malformed or hostile pointer cycle. */
-static bool decompress_name(const uint8_t *pkt, int len, int *off,
-                            char *name_out, size_t name_cap, size_t *nlen_out)
-{
-    char raw[256]; size_t rl = 0;
-    int read_off = *off;
-    bool advanced = false;
-    int jumps = 0;
-    while (read_off < len) {
-        uint8_t b = pkt[read_off];
-        if (b == 0) {
-            if (!advanced) *off = read_off + 1;
-            size_t nl = domain_normalize(name_out, name_cap, raw, rl);
-            if (!nl) return false;
-            *nlen_out = nl;
-            return true;
-        }
-        if ((b & 0xC0) == 0xC0) {
-            if (read_off + 1 >= len) return false;
-            if (!advanced) { *off = read_off + 2; advanced = true; }
-            int target = ((b & 0x3F) << 8) | pkt[read_off + 1];
-            if (target >= read_off || ++jumps > 20) return false;
-            read_off = target;
-            continue;
-        }
-        if (b & 0xC0) return false;                       /* reserved label length */
-        if (read_off + 1 + b > len) return false;
-        if (rl + (size_t)b + 1 >= sizeof(raw)) return false;
-        if (rl) raw[rl++] = '.';
-        memcpy(raw + rl, pkt + read_off + 1, b);
-        rl += b;
-        read_off += 1 + b;
-    }
-    return false;
-}
-
 static inline bool name_is_blocked_any(const char *name, size_t len)
 {
     /* (#117) blocklist_is_blocked() is now a thin wrapper over the shared
@@ -1252,7 +1101,7 @@ static bool cname_chain_is_blocked(const uint8_t *pkt, int len, int qend)
     int off = qend;
     for (int i = 0; i < ancount; i++) {
         char name[256]; size_t nlen = 0;
-        if (!decompress_name(pkt, len, &off, name, sizeof(name), &nlen)) return false;
+        if (!dns_decompress_name(pkt, len, &off, name, sizeof(name), &nlen)) return false;
         if (off + 10 > len) return false;
         uint16_t rtype = ((uint16_t)pkt[off] << 8) | pkt[off + 1];
         uint16_t rdlen = ((uint16_t)pkt[off + 8] << 8) | pkt[off + 9];
@@ -1265,7 +1114,7 @@ static bool cname_chain_is_blocked(const uint8_t *pkt, int len, int qend)
         if (rtype == 5 /* CNAME */) {
             char target[256]; size_t tlen = 0;
             int roff = rdata_off;
-            if (decompress_name(pkt, len, &roff, target, sizeof(target), &tlen) &&
+            if (dns_decompress_name(pkt, len, &roff, target, sizeof(target), &tlen) &&
                 name_is_blocked_any(target, tlen))
                 return true;
         }
@@ -1304,7 +1153,7 @@ static void normalize_answer_owner_names(uint8_t *pkt, int len, int qend)
     for (int i = 0; i < ancount + nscount + arcount; i++) {
         int start = off;
         char name[256]; size_t nlen = 0;
-        if (!decompress_name(pkt, len, &off, name, sizeof(name), &nlen)) return;
+        if (!dns_decompress_name(pkt, len, &off, name, sizeof(name), &nlen)) return;
         /* Walk label by label, never byte-flat: [start, off) ends in a
          * 2-byte compression pointer whenever the owner name is compressed,
          * and that pointer's low byte is an offset, not a character — any
@@ -1656,7 +1505,7 @@ void DnsSinkServer::run_loop()
                 uint8_t rcode = pkt[3] & 0x0F;
                 if (!truncated && (rcode == 0 || rcode == 3))
                     cache_store_resp(ue->qhash, ue->qtype, pkt, plen,
-                                     dns_resp_min_ttl(pkt, plen, 30), now_ms_, ue->load_gen);
+                                     dns_resp_min_ttl(pkt, plen, 30, FWD_TTL_MIN_S, FWD_TTL_MAX_S), now_ms_, ue->load_gen);
             }
             if (ue->hedged) s_cnt_hedged_done++;   /* (#69) see the counter's caveat */
             ue->in_use = false;
@@ -2075,7 +1924,7 @@ void DnsSinkServer::run_loop()
                     if (se && se->resp_len <= (int)sizeof(tx)) {
                         memcpy(tx, se->resp, se->resp_len);
                         tx[0] = rx[0]; tx[1] = rx[1];
-                        rewrite_answer_ttls(tx, se->resp_len, STALE_TTL_S);
+                        dns_rewrite_answer_ttls(tx, se->resp_len, STALE_TTL_S);
                         sendto(csock, tx, se->resp_len, 0, (sockaddr *)&client_addr, clen);
                         s_cnt_stale++;
                         hist_record(&s_h_cached, esp_timer_get_time() - t_recv);

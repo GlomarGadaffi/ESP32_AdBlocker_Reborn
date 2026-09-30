@@ -24,6 +24,7 @@
 #include "nvs.h"
 #include "web_tls.h"
 #include "web_auth.h"
+#include "web_parse.h"   /* host-fuzzed request parsers (tests/fuzz/fuzz_web_parse.c) */
 #include <cstring>
 #include <strings.h>
 #include <cstdio>
@@ -73,32 +74,6 @@ extern "C" const char *dns_sink_lan_ip(void);
 
 /* ── helpers ─────────────────────────────────────────────────────── */
 
-/* Escape HTML special chars: <>&"' → entities. Safe for both text and attrs. */
-static void html_escape(char *dst, size_t cap, const char *src)
-{
-    size_t d = 0;
-    for (size_t i = 0; src[i] && d + 1 < cap; i++) {
-        const char *ent = nullptr;
-        switch (src[i]) {
-            case '<':  ent = "&lt;";   break;
-            case '>':  ent = "&gt;";   break;
-            case '&':  ent = "&amp;";  break;
-            case '"':  ent = "&quot;"; break;
-            case '\'': ent = "&#39;";  break;
-            default:   break;
-        }
-        if (ent) {
-            size_t elen = strlen(ent);
-            if (d + elen >= cap) break;
-            memcpy(dst + d, ent, elen);
-            d += elen;
-        } else {
-            dst[d++] = src[i];
-        }
-    }
-    dst[d] = '\0';
-}
-
 /* Wraps a non-null error message in <p class=err>...</p>; empty string if err
  * is null. err is always a static or snprintf'd server-generated message
  * (setup_page/login_page never echo request input through it), so this
@@ -107,41 +82,6 @@ static void err_html(char *dst, size_t cap, const char *err)
 {
     if (err) snprintf(dst, cap, "<p class=err>%s</p>", err);
     else     dst[0] = '\0';
-}
-
-/* URL-decode a form-encoded value (%-hex and + as space). dst is NUL-terminated. */
-static void url_decode(char *dst, size_t cap, const char *src, size_t src_len)
-{
-    size_t d = 0;
-    for (size_t i = 0; i < src_len && d + 1 < cap; i++) {
-        if (src[i] == '%' && i + 2 < src_len) {
-            char hex[3] = { src[i+1], src[i+2], '\0' };
-            char *end; unsigned long v = strtoul(hex, &end, 16);
-            if (end == hex + 2) { dst[d++] = (char)v; i += 2; continue; }
-        }
-        dst[d++] = (src[i] == '+') ? ' ' : src[i];
-    }
-    dst[d] = '\0';
-}
-
-/* Compare the host component of an Origin/Referer URL against our Host header.
- * Matches scheme://<host>[:port][/...] — the host must appear immediately after
- * "://" and be terminated by ':', '/', or end-of-string. A plain substring test
- * (the old behavior) accepts http://<host>.evil.com because <host> is a prefix
- * substring; this rejects it (L1). */
-static bool origin_host_matches(const char *url, const char *host)
-{
-    if (host[0] == '\0') return false;
-    const char *p = strstr(url, "://");
-    if (!p) return false;
-    p += 3;
-    /* Host may carry an explicit port (":443"); compare host names only,
-     * case-insensitively — DNS names are, and browsers are inconsistent about
-     * the case they echo back in Origin vs Host. */
-    size_t hl = strcspn(host, ":");
-    if (strncasecmp(p, host, hl) != 0) return false;
-    char after = p[hl];
-    return after == '\0' || after == '/' || after == ':';
 }
 
 /* Pre-session POSTs (/setup, /login) have no CSRF token yet, so they lean on
@@ -154,8 +94,8 @@ static bool presession_origin_ok(httpd_req_t *r)
     httpd_req_get_hdr_value_str(r, "Host",    host,    sizeof(host));
     httpd_req_get_hdr_value_str(r, "Origin",  origin,  sizeof(origin));
     httpd_req_get_hdr_value_str(r, "Referer", referer, sizeof(referer));
-    if (origin[0] && strcmp(origin, "null") != 0) return origin_host_matches(origin, host);
-    if (referer[0]) return origin_host_matches(referer, host);
+    if (origin[0] && strcmp(origin, "null") != 0) return web_origin_host_matches(origin, host);
+    if (referer[0]) return web_origin_host_matches(referer, host);
     /* (#96) Neither identifies the device -> refuse. /setup creates the admin
      * account, and a cross-site auto-submitting form under referrer-policy
      * no-referrer arrives exactly as "Origin: null" + no Referer. Our own
@@ -175,18 +115,7 @@ static void cookie_get_sid(httpd_req_t *r)
     s_req_sid[0] = '\0';
     char ck[256] = {};
     if (httpd_req_get_hdr_value_str(r, "Cookie", ck, sizeof(ck)) != ESP_OK) return;
-    const char *p = ck;
-    while ((p = strstr(p, "sid=")) != nullptr) {
-        /* must be at start or after "; " so `xsid=` can't match */
-        if (p == ck || p[-1] == ' ' || p[-1] == ';') {
-            p += 4;
-            size_t l = 0;
-            while (p[l] && p[l] != ';' && l < WEB_AUTH_TOKEN_HEX) l++;
-            if (l == WEB_AUTH_TOKEN_HEX) { memcpy(s_req_sid, p, l); s_req_sid[l] = '\0'; }
-            return;
-        }
-        p += 4;
-    }
+    web_cookie_sid(ck, s_req_sid, WEB_AUTH_TOKEN_HEX);
 }
 
 /* Cookie attributes: HttpOnly keeps scripts away from it, Secure keeps it off
@@ -215,8 +144,8 @@ static bool csrf_ok(httpd_req_t *r)
     httpd_req_get_hdr_value_str(r, "Host",    host,    sizeof(host));
     httpd_req_get_hdr_value_str(r, "Origin",  origin,  sizeof(origin));
     httpd_req_get_hdr_value_str(r, "Referer", referer, sizeof(referer));
-    if (origin[0]  != '\0' && !origin_host_matches(origin,  host)) return false;
-    if (referer[0] != '\0' && !origin_host_matches(referer, host)) return false;
+    if (origin[0]  != '\0' && !web_origin_host_matches(origin,  host)) return false;
+    if (referer[0] != '\0' && !web_origin_host_matches(referer, host)) return false;
 
     char want[33];
     if (!web_auth_session_csrf(s_req_sid, want, sizeof(want))) return false;
@@ -435,34 +364,12 @@ static const char AUTH_PAGE_HEAD[] =
     "button{font:inherit;padding:.5em 1.2em}.err{color:#b00020}.fp{word-break:break-all;background:#f4f4f4;"
     "border:1px solid #ccc;padding:.6em;font-size:.85em}small{color:#555}</style></head><body>";
 
-/* Read a form body field into dst (URL-decoded). Body is the raw
- * application/x-www-form-urlencoded request. Returns false if the key is
- * absent, so a caller can tell "field missing" from "field submitted
- * empty" — dst is set to "" either way. */
-static bool form_field(const char *body, const char *key, char *dst, size_t cap)
-{
-    dst[0] = '\0';
-    size_t kl = strlen(key);
-    const char *p = body;
-    while ((p = strstr(p, key)) != nullptr) {
-        if ((p == body || p[-1] == '&') && p[kl] == '=') {
-            p += kl + 1;
-            size_t l = 0;
-            while (p[l] && p[l] != '&' && p[l] != '\r' && p[l] != '\n') l++;
-            url_decode(dst, cap, p, l);
-            return true;
-        }
-        p += kl;
-    }
-    return false;
-}
-
 /* Read a form body field as a bounded integer. Leaves *out unchanged and
  * returns false if the field is missing, unparseable, or outside [lo, hi]. */
 static bool form_int(const char *body, const char *key, int *out, int lo, int hi)
 {
     char buf[12];
-    form_field(body, key, buf, sizeof(buf));
+    web_form_field(body, key, buf, sizeof(buf));
     if (buf[0] == '\0') return false;
     char *end; long v = strtol(buf, &end, 10);
     if (end == buf || v < lo || v > hi) return false;
@@ -552,9 +459,9 @@ static esp_err_t handle_setup_post(httpd_req_t *r)
     int got = httpd_req_recv(r, body, sizeof(body) - 1);
     if (got <= 0) { httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST, ""); return ESP_FAIL; }
     char user[WEB_AUTH_USER_MAX + 2], pass[WEB_AUTH_PASS_MAX + 2], pass2[WEB_AUTH_PASS_MAX + 2];
-    form_field(body, "user",  user,  sizeof(user));
-    form_field(body, "pass",  pass,  sizeof(pass));
-    form_field(body, "pass2", pass2, sizeof(pass2));
+    web_form_field(body, "user",  user,  sizeof(user));
+    web_form_field(body, "pass",  pass,  sizeof(pass));
+    web_form_field(body, "pass2", pass2, sizeof(pass2));
     memset(body, 0, sizeof(body));
 
     const char *err = nullptr;
@@ -641,7 +548,7 @@ static esp_err_t handle_setup_network_get(httpd_req_t *r)
                 ? "Or join a Wi-Fi network as well — both stay up together (dual-WAN)."
                 : "This board has no Ethernet port — Wi-Fi is how it reaches your network.");
         char ssid[33] = ""; dns_sink_wifi_get_ssid(ssid, sizeof(ssid));
-        char safe_ssid[80]; html_escape(safe_ssid, sizeof(safe_ssid), ssid);
+        char safe_ssid[80]; web_html_escape(safe_ssid, sizeof(safe_ssid), ssid);
         page_appendf(page, sizeof(page), &n,
             "<h3>Wi-Fi</h3>"
             "<p>Currently configured SSID: <b>%s</b></p>"
@@ -728,8 +635,8 @@ static esp_err_t handle_login_post(httpd_req_t *r)
     int got = httpd_req_recv(r, body, sizeof(body) - 1);
     if (got <= 0) { httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST, ""); return ESP_FAIL; }
     char user[WEB_AUTH_USER_MAX + 2], pass[WEB_AUTH_PASS_MAX + 2];
-    form_field(body, "user", user, sizeof(user));
-    form_field(body, "pass", pass, sizeof(pass));
+    web_form_field(body, "user", user, sizeof(user));
+    web_form_field(body, "pass", pass, sizeof(pass));
     memset(body, 0, sizeof(body));
 
     int retry = 0;
@@ -1148,7 +1055,7 @@ static esp_err_t handle_status(httpd_req_t *r)
                 break;
             }
             char safe_text[384];
-            html_escape(safe_text, sizeof(safe_text), wl[i]);
+            web_html_escape(safe_text, sizeof(safe_text), wl[i]);
             pb.appendf(
                 "<tr><td>%s</td><td>"
                 "<form method=post action=/whitelist/remove>"
@@ -1164,7 +1071,7 @@ static esp_err_t handle_status(httpd_req_t *r)
         static EXT_RAM_BSS_ATTR char crules[CUSTOM_RULES_CAP + 8];
         static EXT_RAM_BSS_ATTR char safe_cr[CUSTOM_RULES_CAP * 2 + 8];
         size_t clen = blocklist_custom_get(crules, sizeof(crules));
-        html_escape(safe_cr, sizeof(safe_cr), crules);
+        web_html_escape(safe_cr, sizeof(safe_cr), crules);
         pb.appendf(
             "<h3>Custom Block Rules</h3>"
             "<form method=post action=/custom/rules>"
@@ -1196,7 +1103,7 @@ static esp_err_t handle_status(httpd_req_t *r)
                     pb.mark_truncated();
                     break;
                 }
-                char safe_d[128]; html_escape(safe_d, sizeof(safe_d), rw_domains[i]);
+                char safe_d[128]; web_html_escape(safe_d, sizeof(safe_d), rw_domains[i]);
                 uint32_t ip = rw_ips[i];
                 pb.appendf(
                     "<tr><td>%s</td><td>%u.%u.%u.%u</td><td>"
@@ -1226,7 +1133,7 @@ static esp_err_t handle_status(httpd_req_t *r)
         }
         char url[BLOCKLIST_URL_CAP]; blocklist_extra_url_get(i, url, sizeof(url));
         if (url[0]) {
-            char safe_url[BLOCKLIST_URL_CAP * 2]; html_escape(safe_url, sizeof(safe_url), url);
+            char safe_url[BLOCKLIST_URL_CAP * 2]; web_html_escape(safe_url, sizeof(safe_url), url);
             bool en = blocklist_extra_enabled_get(i);
             pb.appendf(
                 "<tr><td>%d</td><td>%s</td><td class='%s'>%s</td><td>"
@@ -1364,7 +1271,7 @@ static esp_err_t handle_status(httpd_req_t *r)
                 pb.mark_truncated();
                 break;
             }
-                char safe_ip[48]; html_escape(safe_ip, sizeof(safe_ip), acl_ips[i]);
+                char safe_ip[48]; web_html_escape(safe_ip, sizeof(safe_ip), acl_ips[i]);
                 pb.appendf(
                     "<tr><td>%s</td><td>"
                     "<form method=post action=/acl/remove>"
@@ -1397,7 +1304,7 @@ static esp_err_t handle_status(httpd_req_t *r)
                 pb.mark_truncated();
                 break;
             }
-                char safe_ip[48]; html_escape(safe_ip, sizeof(safe_ip), byp_ips[i]);
+                char safe_ip[48]; web_html_escape(safe_ip, sizeof(safe_ip), byp_ips[i]);
                 pb.appendf(
                     "<tr><td>%s</td><td>"
                     "<form method=post action=/bypass/remove>"
@@ -1414,7 +1321,7 @@ static esp_err_t handle_status(httpd_req_t *r)
     /* Admin account (#89) — always on; changing it signs every session out. */
     {
         char user[WEB_AUTH_USER_MAX + 1]; web_auth_get_user(user, sizeof(user));
-        char safe_user[80]; html_escape(safe_user, sizeof(safe_user), user);
+        char safe_user[80]; web_html_escape(safe_user, sizeof(safe_user), user);
         char fp[96]; web_tls_fingerprint(fp, sizeof(fp));
         pb.appendf(
             "<h3>Admin account</h3>"
@@ -1548,7 +1455,7 @@ static esp_err_t handle_status(httpd_req_t *r)
                              : " with the checkbox above enabled");
         }
         char ssid[33] = ""; dns_sink_wifi_get_ssid(ssid, sizeof(ssid));
-        char safe_ssid[80]; html_escape(safe_ssid, sizeof(safe_ssid), ssid);
+        char safe_ssid[80]; web_html_escape(safe_ssid, sizeof(safe_ssid), ssid);
         pb.appendf(
             "<p>Currently configured SSID: <b>%s</b></p>"
             "<button type=button onclick=\"wifiScan()\">Scan for networks</button>"
@@ -1601,8 +1508,8 @@ static esp_err_t handle_status(httpd_req_t *r)
          * interpolated raw into value="..." — a stored XSS that fired on every
          * later view of this tab. Escaped like every other value rendered here. */
         char safe_srv[sizeof(dot_srv) * 6], safe_sni[sizeof(dot_sni) * 6];
-        html_escape(safe_srv, sizeof(safe_srv), dot_srv);
-        html_escape(safe_sni, sizeof(safe_sni), dot_sni);
+        web_html_escape(safe_srv, sizeof(safe_srv), dot_srv);
+        web_html_escape(safe_sni, sizeof(safe_sni), dot_sni);
         pb.appendf(
             "<h3>Upstream DNS (DoT)</h3>"
             "<form method=post action=/dot/set>"
@@ -1615,7 +1522,7 @@ static esp_err_t handle_status(httpd_req_t *r)
 
         /* Split-horizon zones: names the router answers, never sent over DoT. */
         char zones[LOCALZONE_LIST_CAP]; localzone_get(zones, sizeof(zones));
-        char safe_zones[LOCALZONE_LIST_CAP * 2]; html_escape(safe_zones, sizeof(safe_zones), zones);
+        char safe_zones[LOCALZONE_LIST_CAP * 2]; web_html_escape(safe_zones, sizeof(safe_zones), zones);
         pb.appendf(
             "<h3>Local zones</h3>"
             "<p><small>Names in these zones &mdash; and any name with no dot at all &mdash; are "
@@ -1893,10 +1800,10 @@ static esp_err_t handle_pause(httpd_req_t *r)
     }
     /* #97: was a fixed 16-byte body window read with a raw strstr("on=1") —
      * any other field sent ahead of "on=" (or padding past 15 bytes) pushed
-     * it out of the window and silently un-paused. form_field() is anchored
+     * it out of the window and silently un-paused. web_form_field() is anchored
      * and url-decodes, so field order and extra fields no longer matter. */
     char body[64] = {}; httpd_req_recv(r, body, sizeof(body) - 1);
-    char onv[4]; form_field(body, "on", onv, sizeof(onv));
+    char onv[4]; web_form_field(body, "on", onv, sizeof(onv));
     blocklist_set_paused(strcmp(onv, "1") == 0);
     httpd_resp_set_status(r, "303 See Other");
     httpd_resp_set_hdr(r, "Location", "/");
@@ -1917,10 +1824,10 @@ static esp_err_t handle_pause_timed(httpd_req_t *r)
     }
     char body[128] = {}; httpd_req_recv(r, body, sizeof(body) - 1);
     char minv[12], scope[8], ipv[24], conf[4];
-    form_field(body, "min",     minv,  sizeof(minv));
-    form_field(body, "scope",   scope, sizeof(scope));
-    form_field(body, "ip",      ipv,   sizeof(ipv));
-    form_field(body, "confirm", conf,  sizeof(conf));
+    web_form_field(body, "min",     minv,  sizeof(minv));
+    web_form_field(body, "scope",   scope, sizeof(scope));
+    web_form_field(body, "ip",      ipv,   sizeof(ipv));
+    web_form_field(body, "confirm", conf,  sizeof(conf));
 
     char *end = nullptr;
     long minutes = strtol(minv, &end, 10);
@@ -1990,7 +1897,7 @@ static esp_err_t handle_pause_resume(httpd_req_t *r)
         httpd_resp_send_err(r, HTTPD_403_FORBIDDEN, "CSRF"); return ESP_FAIL;
     }
     char body[64] = {}; httpd_req_recv(r, body, sizeof(body) - 1);
-    char ipv[24]; form_field(body, "ip", ipv, sizeof(ipv));
+    char ipv[24]; web_form_field(body, "ip", ipv, sizeof(ipv));
     if (strcmp(ipv, "every") == 0)      pause_clear_all();
     else if (strcmp(ipv, "all") == 0)   pause_clear(PAUSE_IP_ALL);
     else {
@@ -2014,9 +1921,9 @@ static esp_err_t handle_auth_set(httpd_req_t *r)
     }
     char body[512] = {}; httpd_req_recv(r, body, sizeof(body) - 1);   /* 3 x 63 chars, worst-case %XX encoded, fits */
     char cur[WEB_AUTH_PASS_MAX + 2], user[WEB_AUTH_USER_MAX + 2], pass[WEB_AUTH_PASS_MAX + 2];
-    form_field(body, "cur",  cur,  sizeof(cur));
-    form_field(body, "user", user, sizeof(user));
-    form_field(body, "pass", pass, sizeof(pass));
+    web_form_field(body, "cur",  cur,  sizeof(cur));
+    web_form_field(body, "user", user, sizeof(user));
+    web_form_field(body, "pass", pass, sizeof(pass));
     memset(body, 0, sizeof(body));
 
     char cur_user[WEB_AUTH_USER_MAX + 1]; web_auth_get_user(cur_user, sizeof(cur_user));
@@ -2049,7 +1956,7 @@ static esp_err_t handle_check(httpd_req_t *r)
     if (got <= 0) { httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST, ""); return ESP_FAIL; }
 
     /* parse domain=xxx from form body */
-    char decoded[256]; form_field(body, "domain", decoded, sizeof(decoded));
+    char decoded[256]; web_form_field(body, "domain", decoded, sizeof(decoded));
     char norm[256]; size_t nlen = domain_normalize(norm, sizeof(norm), decoded, strlen(decoded));
 
     /* (#103, #117) Match the real verdict path exactly, in the same order:
@@ -2083,7 +1990,7 @@ static esp_err_t handle_check(httpd_req_t *r)
         }
     }
 
-    char safe[384]; html_escape(safe, sizeof(safe), norm);
+    char safe[384]; web_html_escape(safe, sizeof(safe), norm);
     char page[768];
     snprintf(page, sizeof(page),
         "<!DOCTYPE html><html><body><h2>Check result</h2>"
@@ -2101,7 +2008,7 @@ static esp_err_t handle_wl_add(httpd_req_t *r)
         httpd_resp_send_err(r, HTTPD_403_FORBIDDEN, "CSRF"); return ESP_FAIL;
     }
     char body[256] = {}; httpd_req_recv(r, body, sizeof(body) - 1);
-    char decoded[256]; form_field(body, "domain", decoded, sizeof(decoded));
+    char decoded[256]; web_form_field(body, "domain", decoded, sizeof(decoded));
     char norm[256]; size_t nlen = domain_normalize(norm, sizeof(norm), decoded, strlen(decoded));
     if (nlen == 0) { httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST, "bad domain"); return ESP_FAIL; }
     if (!blocklist_whitelist_add(norm)) {
@@ -2122,7 +2029,7 @@ static esp_err_t handle_wl_remove(httpd_req_t *r)
         httpd_resp_send_err(r, HTTPD_403_FORBIDDEN, "CSRF"); return ESP_FAIL;
     }
     char body[256] = {}; httpd_req_recv(r, body, sizeof(body) - 1);
-    char decoded[256]; form_field(body, "domain", decoded, sizeof(decoded));
+    char decoded[256]; web_form_field(body, "domain", decoded, sizeof(decoded));
     char norm[256]; size_t nlen = domain_normalize(norm, sizeof(norm), decoded, strlen(decoded));
     if (nlen > 0) blocklist_whitelist_remove(norm);
     httpd_resp_set_status(r, "303 See Other");
@@ -2138,9 +2045,9 @@ static esp_err_t handle_dot_set(httpd_req_t *r)
     char body[256] = {}; httpd_req_recv(r, body, sizeof(body) - 1);
     bool enabled = (strstr(body, "enabled=1") != nullptr);
     char server[64] = "1.1.1.1", sni[64] = "one.one.one.one";
-    char sv[64]; form_field(body, "server", sv, sizeof(sv));
+    char sv[64]; web_form_field(body, "server", sv, sizeof(sv));
     if (sv[0]) snprintf(server, sizeof(server), "%s", sv);
-    char sn[64]; form_field(body, "sni", sn, sizeof(sn));
+    char sn[64]; web_form_field(body, "sni", sn, sizeof(sn));
     if (sn[0]) snprintf(sni, sizeof(sni), "%s", sn);
     /* (#94) Defence in depth behind the escaping: neither field can legitimately
      * hold anything but a dotted quad and a hostname, so reject the rest at the
@@ -2164,7 +2071,7 @@ static esp_err_t handle_dot_zones(httpd_req_t *r)
 {
     if (!csrf_ok(r)) { httpd_resp_send_err(r, HTTPD_403_FORBIDDEN, "CSRF"); return ESP_FAIL; }
     char body[LOCALZONE_LIST_CAP * 3 + 16] = {}; httpd_req_recv(r, body, sizeof(body) - 1);
-    char zones[LOCALZONE_LIST_CAP]; form_field(body, "zones", zones, sizeof(zones));
+    char zones[LOCALZONE_LIST_CAP]; web_form_field(body, "zones", zones, sizeof(zones));
     if (!localzone_set(zones)) {
         httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST, "Up to 16 suffixes, letters/digits/dots, comma-separated");
         return ESP_FAIL;
@@ -2196,7 +2103,7 @@ static esp_err_t handle_net_static_set(httpd_req_t *r, const char *iface)
         {"ip", ip, sizeof(ip)}, {"nm", nm, sizeof(nm)},
         {"gw", gw, sizeof(gw)}, {"dns", dns_ip, sizeof(dns_ip)},
     };
-    for (auto &f : fields) form_field(body, f.key, f.out, f.cap);
+    for (auto &f : fields) web_form_field(body, f.key, f.out, f.cap);
     if (!dns_sink_net_set_static(iface, dhcp, ip, nm, gw, dns_ip)) {
         httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST, "Invalid IP/netmask/gateway/DNS");
         return ESP_FAIL;
@@ -2281,7 +2188,7 @@ static esp_err_t handle_ota_update(httpd_req_t *r)
     if (end_err != ESP_OK) {
         httpd_resp_send_err(r, HTTPD_500_INTERNAL_SERVER_ERROR,
             end_err == ESP_ERR_OTA_VALIDATE_FAILED
-                ? "image validation failed (bad file?) — old firmware still running"
+                ? "image validation failed (not a firmware image, or not signed with this project's key) — old firmware still running"
                 : "esp_ota_end failed — old firmware still running");
         return ESP_FAIL;
     }
@@ -2338,15 +2245,15 @@ static esp_err_t handle_wifi_connect(httpd_req_t *r)
     if (!csrf_ok(r)) { httpd_resp_send_err(r, HTTPD_403_FORBIDDEN, "CSRF"); return ESP_FAIL; }
     char body[512] = {}; httpd_req_recv(r, body, sizeof(body) - 1);
     char ssid[33] = "", pass[65] = "";
-    form_field(body, "ssid", ssid, sizeof(ssid));
-    form_field(body, "password", pass, sizeof(pass));
+    web_form_field(body, "ssid", ssid, sizeof(ssid));
+    web_form_field(body, "password", pass, sizeof(pass));
     bool via_setup_ap = dns_sink_setup_ap_active();
     if (!dns_sink_wifi_set_creds(ssid, pass)) {
         httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST, "SSID must be 1-32 characters");
         return ESP_FAIL;
     }
     if (via_setup_ap) {
-        char safe_ssid[80]; html_escape(safe_ssid, sizeof(safe_ssid), ssid);
+        char safe_ssid[80]; web_html_escape(safe_ssid, sizeof(safe_ssid), ssid);
         /* Bare name for the router's device list — set as this board's DHCP
          * hostname (option 12) in wifi_init_sta()/app_main, so it's also the
          * name to look for there, not just the .local mDNS one. */
@@ -2379,7 +2286,7 @@ static esp_err_t handle_acl_add(httpd_req_t *r)
 {
     if (!csrf_ok(r)) { httpd_resp_send_err(r, HTTPD_403_FORBIDDEN, "CSRF"); return ESP_FAIL; }
     char body[64] = {}; httpd_req_recv(r, body, sizeof(body) - 1);
-    char ip[24]; form_field(body, "ip", ip, sizeof(ip));
+    char ip[24]; web_form_field(body, "ip", ip, sizeof(ip));
     if (!acl_add(ip)) {
         httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST, "ACL is full (max 8), or the IP is unparsable");
         return ESP_FAIL;
@@ -2392,7 +2299,7 @@ static esp_err_t handle_acl_remove(httpd_req_t *r)
 {
     if (!csrf_ok(r)) { httpd_resp_send_err(r, HTTPD_403_FORBIDDEN, "CSRF"); return ESP_FAIL; }
     char body[64] = {}; httpd_req_recv(r, body, sizeof(body) - 1);
-    char ip[24]; form_field(body, "ip", ip, sizeof(ip)); acl_remove(ip);
+    char ip[24]; web_form_field(body, "ip", ip, sizeof(ip)); acl_remove(ip);
     httpd_resp_set_status(r, "303 See Other"); httpd_resp_set_hdr(r, "Location", "/"); httpd_resp_send(r,nullptr,0); return ESP_OK;
 }
 
@@ -2410,7 +2317,7 @@ static esp_err_t handle_bypass_add(httpd_req_t *r)
 {
     if (!csrf_ok(r)) { httpd_resp_send_err(r, HTTPD_403_FORBIDDEN, "CSRF"); return ESP_FAIL; }
     char body[64] = {}; httpd_req_recv(r, body, sizeof(body) - 1);
-    char ip[24]; form_field(body, "ip", ip, sizeof(ip)); bypass_add(ip);
+    char ip[24]; web_form_field(body, "ip", ip, sizeof(ip)); bypass_add(ip);
     httpd_resp_set_status(r, "303 See Other"); httpd_resp_set_hdr(r, "Location", "/"); httpd_resp_send(r,nullptr,0); return ESP_OK;
 }
 
@@ -2419,7 +2326,7 @@ static esp_err_t handle_bypass_remove(httpd_req_t *r)
 {
     if (!csrf_ok(r)) { httpd_resp_send_err(r, HTTPD_403_FORBIDDEN, "CSRF"); return ESP_FAIL; }
     char body[64] = {}; httpd_req_recv(r, body, sizeof(body) - 1);
-    char ip[24]; form_field(body, "ip", ip, sizeof(ip)); bypass_remove(ip);
+    char ip[24]; web_form_field(body, "ip", ip, sizeof(ip)); bypass_remove(ip);
     httpd_resp_set_status(r, "303 See Other"); httpd_resp_set_hdr(r, "Location", "/"); httpd_resp_send(r,nullptr,0); return ESP_OK;
 }
 
@@ -2461,7 +2368,7 @@ static esp_err_t handle_custom_rules(httpd_req_t *r)
      * matching body's wire-worst-case bound here is the only way to guarantee
      * this can't itself truncate a submission that already fit in body. */
     static EXT_RAM_BSS_ATTR char decoded[CUSTOM_RULES_CAP * 3 + 64];
-    if (!form_field(body, "rules", decoded, sizeof(decoded))) {
+    if (!web_form_field(body, "rules", decoded, sizeof(decoded))) {
         httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST, ""); return ESP_FAIL;
     }
     if (strlen(decoded) >= CUSTOM_RULES_CAP) {
@@ -2502,7 +2409,7 @@ static esp_err_t handle_log(httpd_req_t *r)
         "<th>Type</th><th>Result</th></tr>");
     for (uint32_t i = 0; i < n && pg < (int)sizeof(page) - 256; i++) {
         QLogEntry *e = &entries[i];
-        char safe[128]; html_escape(safe, sizeof(safe), e->domain);
+        char safe[128]; web_html_escape(safe, sizeof(safe), e->domain);
         const char *res  = e->blocked ? "BLOCKED" : (e->rewritten ? "REWRITE" : "ALLOWED");
         const char *cls  = e->blocked ? "blk"     : (e->rewritten ? "rw"      : "ok");
         const char *type = e->qtype == 1 ? "A" : (e->qtype == 28 ? "AAAA" :
@@ -2571,7 +2478,7 @@ static esp_err_t handle_census(httpd_req_t *r)
     uint32_t shown = 0;
     for (uint32_t i = 0; i < n && pg < (int)sizeof(page) - 256; i++, shown++) {
         CensusClient *c = &entries[i];
-        char host[64]; html_escape(host, sizeof(host), c->hostname[0] ? c->hostname : "-");
+        char host[64]; web_html_escape(host, sizeof(host), c->hostname[0] ? c->hostname : "-");
         uint32_t age_s = now_s - c->first_seen_s;
         bool bypass = (c->arp_count || c->dhcp_count) && !c->query_count &&
                       age_s >= CENSUS_GRACE_S;
@@ -2646,7 +2553,7 @@ static esp_err_t handle_top(httpd_req_t *r)
         "<h3>Top Queried Domains</h3>"
         "<table><tr><th>Domain</th><th>Total</th><th>Blocked</th></tr>");
     for (uint32_t i = 0; i < nd && top_d[i].total > 0 && pg < (int)sizeof(page) - 256; i++) {
-        char safe[128]; html_escape(safe, sizeof(safe), top_d[i].key);
+        char safe[128]; web_html_escape(safe, sizeof(safe), top_d[i].key);
         page_appendf(page, sizeof(page), &pg,
             "<tr><td>%s</td><td>%lu</td><td>%lu</td></tr>",
             safe, (unsigned long)top_d[i].total, (unsigned long)top_d[i].blocked);
@@ -2655,7 +2562,7 @@ static esp_err_t handle_top(httpd_req_t *r)
         "</table><h3>Top Clients</h3>"
         "<table><tr><th>Client IP</th><th>Total</th><th>Blocked</th></tr>");
     for (uint32_t i = 0; i < nc && top_c[i].total > 0 && pg < (int)sizeof(page) - 256; i++) {
-        char safe[64]; html_escape(safe, sizeof(safe), top_c[i].key);
+        char safe[64]; web_html_escape(safe, sizeof(safe), top_c[i].key);
         page_appendf(page, sizeof(page), &pg,
             "<tr><td>%s</td><td>%lu</td><td>%lu</td></tr>",
             safe, (unsigned long)top_c[i].total, (unsigned long)top_c[i].blocked);
@@ -2673,11 +2580,11 @@ static esp_err_t handle_rw_set(httpd_req_t *r)
     }
     char body[256] = {}; httpd_req_recv(r, body, sizeof(body) - 1);
     /* parse: domain=foo.local&ip=192.168.1.5 */
-    char decoded_d[64]; form_field(body, "domain", decoded_d, sizeof(decoded_d));
+    char decoded_d[64]; web_form_field(body, "domain", decoded_d, sizeof(decoded_d));
     char norm[64]; size_t nlen = domain_normalize(norm, sizeof(norm), decoded_d, strlen(decoded_d));
     if (nlen == 0) { httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST, "bad domain"); return ESP_FAIL; }
     /* extract IP value — require all four octets to parse and be in range */
-    char ipv[24]; form_field(body, "ip", ipv, sizeof(ipv));
+    char ipv[24]; web_form_field(body, "ip", ipv, sizeof(ipv));
     unsigned b0=0,b1=0,b2=0,b3=0;
     if (sscanf(ipv, "%u.%u.%u.%u", &b0, &b1, &b2, &b3) != 4 ||
         b0 > 255 || b1 > 255 || b2 > 255 || b3 > 255) {
@@ -2702,7 +2609,7 @@ static esp_err_t handle_rw_clear(httpd_req_t *r)
         httpd_resp_send_err(r, HTTPD_403_FORBIDDEN, "CSRF"); return ESP_FAIL;
     }
     char body[128] = {}; httpd_req_recv(r, body, sizeof(body) - 1);
-    char decoded[64]; form_field(body, "domain", decoded, sizeof(decoded));
+    char decoded[64]; web_form_field(body, "domain", decoded, sizeof(decoded));
     char norm[64]; size_t nlen = domain_normalize(norm, sizeof(norm), decoded, strlen(decoded));
     if (nlen > 0) rewrite_set(norm, 0);
     httpd_resp_set_status(r, "303 See Other");
@@ -2723,7 +2630,7 @@ static esp_err_t handle_bl_url_set(httpd_req_t *r)
     if (!form_int(body, "idx", &idx, 0, BLOCKLIST_EXTRA_MAX - 1)) {
         httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST, "bad idx"); return ESP_FAIL;
     }
-    char decoded[BLOCKLIST_URL_CAP]; form_field(body, "url", decoded, sizeof(decoded));
+    char decoded[BLOCKLIST_URL_CAP]; web_form_field(body, "url", decoded, sizeof(decoded));
     /* F10: the preset <select>'s placeholder option has value=''. A stale page
      * (render-time free_slot baked into the form's hidden idx) submitted with
      * the placeholder still selected posts idx=N&url= — which used to call

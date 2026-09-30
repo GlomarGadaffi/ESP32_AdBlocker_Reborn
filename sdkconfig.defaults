@@ -91,6 +91,30 @@ CONFIG_ESP_INT_WDT_TIMEOUT_MS=800
 # both confirmed running; anything short of that self-reverts on next boot.
 CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
 
+# ── Signed OTA images ──────────────────────────────────────────────
+# "Signed apps without Secure Boot": every app image carries an RSA-3072
+# signature block and esp_ota_end() refuses an image that is not signed by
+# THIS project's key. That closes the gap where anyone holding an admin
+# session (or a phished login) could POST arbitrary firmware to /ota/update
+# and own the box that answers every DNS query on the LAN. It does NOT
+# protect against physical access: no eFuses are burned, the bootloader is
+# not verified, and serial flashing (esptool / the web flasher) still
+# accepts anything — that would be hardware Secure Boot + flash encryption,
+# which is irreversible and deliberately not enabled here.
+#
+# The private key lives at secure_boot_signing_key.pem in the project root
+# (gitignored). Generate once, back it up, never commit it:
+#   idf.py secure-generate-signing-key --version 2 --scheme rsa3072 secure_boot_signing_key.pem
+# Losing the key means every deployed board can only ever be updated over
+# serial again. Rollout: the first signed image installs from an unsigned
+# 1.4.x over OTA (the running firmware is what checks); from then on
+# unsigned images — including every pre-1.5 release asset — are refused.
+CONFIG_SECURE_SIGNED_APPS_NO_SECURE_BOOT=y
+CONFIG_SECURE_SIGNED_APPS_RSA_SCHEME=y
+CONFIG_SECURE_SIGNED_ON_UPDATE_NO_SECURE_BOOT=y
+CONFIG_SECURE_BOOT_BUILD_SIGNED_BINARIES=y
+CONFIG_SECURE_BOOT_SIGNING_KEY="secure_boot_signing_key.pem"
+
 # ── Release performance + size ───────────────────────────────────────
 # Ship a real release build, not the IDF default -Og debug build.
 # -O2 for speed; assertions off (defines NDEBUG) drops all the assert strings

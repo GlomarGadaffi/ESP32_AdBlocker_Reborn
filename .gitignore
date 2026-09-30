@@ -16,6 +16,14 @@
 # IDF Component Manager output (regenerated from main/idf_component.yml + dependencies.lock)
 /managed_components/
 
+# OTA signing key — private, never commit (see sdkconfig.defaults "Signed OTA images")
+/secure_boot_signing_key.pem
+*.pem
+
+# Fuzz build output + crash reproducers live next to the harness
+/tests/fuzz/out/
+/tests/fuzz/crashes/
+
 # Editor / OS cruft
 *.swp
 .DS_Store

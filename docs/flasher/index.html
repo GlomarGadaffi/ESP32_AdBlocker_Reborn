@@ -324,7 +324,7 @@ footer { color: var(--text-dim); font-size: .86rem; text-align: center; margin-t
       <label class="mode">
         <input type="radio" name="mode" value="app">
         <span class="mname">App only</span>
-        <div class="mdesc">OTA data and the app image &mdash; the same regions the over-the-air updater touches, and the fastest option. Fine for upgrading firmware that's already running on this board. Once it's running you can do the same thing without a cable, from <strong>Firmware Update</strong> in the web UI.</div>
+        <div class="mdesc">OTA data and the app image &mdash; the same regions the over-the-air updater touches, and the fastest option. Fine for upgrading firmware that's already running on this board. Once it's running you can do the same thing without a cable, from <strong>Firmware Update</strong> in the web UI &mdash; with one limit: firmware from 1.5.0 on only accepts <em>signed</em> images over the air, so a release older than 1.5.0 (or a build of your own without the project key) can still go on over this cable, but not through the web UI.</div>
       </label>
     </div>
 

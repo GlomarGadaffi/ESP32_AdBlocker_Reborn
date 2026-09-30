@@ -124,6 +124,8 @@ Upgrades do not require a USB cable or toolchain:
 4. The board flashes the new image into its second partition and reboots.
 5. **Failsafe Rollback:** If a bad image fails to boot or start the network, the hardware bootloader automatically rolls back to the previous working firmware.
 
+> **Signed images (from 1.5.0):** every release `.bin` carries an RSA-3072 signature and the running firmware refuses an OTA upload that is not signed with the project key — so an admin session alone can no longer put arbitrary code on the board. The first signed build installs over an unsigned 1.4.x normally (it is the *running* image that checks); after that, only signed images are accepted over OTA. Serial flashing (esptool / the web flasher) is unaffected — this is app signing, not hardware Secure Boot, and protects against network access, not physical access.
+
 > **Upgrading to 1.3.0:** the SD snapshot format changed, so the first boot on 1.3.0 rejects any pre-1.3.0 snapshot by design and re-downloads the whole blocklist (measured at 459 s on a four-feed configuration). The device fails open and forwards unfiltered for that window. Every boot after that is warm again (~21 s).
 
 ### Emergency USB Recovery Console
@@ -316,10 +318,13 @@ Set the Wi-Fi credentials afterwards over the USB console (`wifi "<SSID>" <passw
 │   ├── flasher/                     # Web Serial browser flasher implementation
 │   └── firmware/                    # Same-origin release binaries + manifest the flasher fetches
 ├── tests/
-│   ├── bl_table_test.c          # Host tests for the storage core (radix landing buffer,
-│   │                             # near-capacity merge, bucket occupancy, measured FP rate)
-│   ├── l2_finish_reply_test.c   # Byte-equivalence check for the L2 fast-path reply builder
-│   └── qname_case_scrub_test.c  # #72 reply case-scrub: compression pointers survive, cache-safe
+│   ├── bl_table_test.c          # Host tests for storage core (radix buffer, bucket occupancy, FP rate)
+│   ├── dns_wire_test.c          # DNS wire helpers, TTL extraction (SOA bounds), decompress
+│   ├── l2_finish_reply_test.c   # Byte-equivalence check for L2 fast-path reply builder
+│   ├── qname_case_scrub_test.c  # #72 reply case-scrub: compression pointers survive, cache-safe
+│   ├── rule_parse_test.c        # Blocklist rule grammar & filter parsing
+│   ├── web_parse_test.c         # Web UI pre-auth request parsers (cookie, forms, origins)
+│   └── fuzz/                    # libFuzzer targets + seed corpora for wire, rules, web
 └── tools/
     ├── dnsload/          # DNS load generator: N queries in flight, true percentiles
     └── make-release.ps1  # Collects each board's build artifacts into release/
@@ -330,12 +335,12 @@ Build and run the host tests — no ESP-IDF required, just a C compiler (on
 Windows, run these from WSL or MSYS2):
 
 ```bash
-gcc -O2 -I main -o bl_table_test tests/bl_table_test.c main/bl_table.c
-./bl_table_test
-gcc -O2 -o l2_finish_reply_test tests/l2_finish_reply_test.c
-./l2_finish_reply_test
-gcc -O2 -I main -o qname_case_scrub_test tests/qname_case_scrub_test.c main/domain.c
-./qname_case_scrub_test
+gcc -O2 -I main -o bl_table_test tests/bl_table_test.c main/bl_table.c && ./bl_table_test
+gcc -O2 -I main -o dns_wire_test tests/dns_wire_test.c main/dns_wire.c main/domain.c main/murmur3.c && ./dns_wire_test
+gcc -O2 -o l2_finish_reply_test tests/l2_finish_reply_test.c && ./l2_finish_reply_test
+gcc -O2 -I main -o qname_case_scrub_test tests/qname_case_scrub_test.c main/domain.c && ./qname_case_scrub_test
+gcc -O2 -I main -o rule_parse_test tests/rule_parse_test.c main/domain.c && ./rule_parse_test
+gcc -O2 -I main -o web_parse_test tests/web_parse_test.c main/web_parse.c && ./web_parse_test
 ```
 
 ---
