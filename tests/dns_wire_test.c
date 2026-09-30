@@ -117,11 +117,65 @@ static void test_skip_and_decompress(void)
     free(p);
 }
 
+/* Forward-cache name key: the (hash, qtype) key only selects a cache set; a
+ * hit also has to be this exact QNAME, so two names whose 32-bit hashes
+ * collide can never answer for each other. */
+static void test_qname_wire_key(void)
+{
+    printf("qname_wire_len / qname_wire_eq\n");
+    uint8_t q[] = {
+        0,0,0,0, 0,0,0,0, 0,0,0,0,
+        3,'w','w','w', 7,'E','x','a','M','p','l','e', 3,'c','o','m', 0,   /* 12..28 */
+        0,1, 0,1,
+    };
+    uint8_t *p = dup(q, sizeof q);
+    char name[256]; size_t nl = 0;
+    int qend = dns_extract_qname(p, sizeof q, 12, name, sizeof name, &nl);
+    int wl = dns_qname_wire_len(p, sizeof q, 12);
+    CHECK(qend == 33 && wl == 17, "wire len 17 == qend-16, got qend %d wl %d", qend, wl);
+
+    static const uint8_t lower[] = { 3,'w','w','w', 7,'e','x','a','m','p','l','e', 3,'c','o','m', 0 };
+    static const uint8_t other[] = { 3,'w','w','w', 7,'e','x','a','m','p','l','e', 3,'n','e','t', 0 };
+    /* same bytes, different label split: www.exampl.ecom */
+    static const uint8_t split[] = { 3,'w','w','w', 6,'e','x','a','m','p','l', 4,'e','c','o','m', 0 };
+    CHECK(dns_qname_wire_eq(p + 12, lower, 17), "case-insensitive match");
+    CHECK(!dns_qname_wire_eq(p + 12, other, 17), "different TLD rejected");
+    CHECK(!dns_qname_wire_eq(p + 12, split, 17), "different label split rejected");
+    /* only A-Z fold: '[' (0x5B) and '{' (0x7B) differ by 0x20 but are not letters */
+    static const uint8_t b1[] = { 1,'[', 0 }, b2[] = { 1,'{', 0 };
+    CHECK(!dns_qname_wire_eq(b1, b2, 3), "non-letters never fold");
+
+    /* rejects exactly what dns_extract_qname rejects */
+    p[12] = 0xC0; p[13] = 0x0C;
+    CHECK(dns_qname_wire_len(p, sizeof q, 12) < 0, "compression pointer rejected");
+    p[12] = 3; p[13] = 'w';
+    CHECK(dns_qname_wire_len(p, 20, 12) < 0, "truncated name rejected");
+    uint8_t root[] = { 0,0,0,0, 0,0,0,0, 0,0,0,0, 0, 0,1,0,1 };
+    CHECK(dns_qname_wire_len(root, sizeof root, 12) < 0, "root name rejected (never cached)");
+
+    /* longest name dns_extract_qname accepts: 4 x 63-byte labels = 255 dotted
+     * chars = 257 wire bytes. The two parsers must agree on it exactly. */
+    uint8_t big[12 + 4 * 64 + 2 + 1 + 4]; memset(big, 'a', sizeof big);
+    int o = 12;
+    for (int i = 0; i < 4; i++) { big[o] = 63; o += 64; }
+    big[o] = 0;
+    int bl = dns_qname_wire_len(big, o + 5, 12);
+    int be = dns_extract_qname(big, o + 5, 12, name, sizeof name, &nl);
+    CHECK(bl == DNS_QNAME_WIRE_MAX && be == o + 5 && be - 12 - 4 == bl,
+          "max-length name agrees with extractor: wl %d qend %d", bl, be);
+    big[o] = 1; big[o + 2] = 0;   /* a fifth 1-byte label: both must reject */
+    CHECK(dns_qname_wire_len(big, o + 7, 12) < 0 &&
+          dns_extract_qname(big, o + 7, 12, name, sizeof name, &nl) < 0,
+          "over-long name rejected by both");
+    free(p);
+}
+
 int main(void)
 {
     test_soa_min_ttl();
     test_answer_min_ttl_and_rewrite();
     test_skip_and_decompress();
+    test_qname_wire_key();
     if (g_fail) { printf("%d FAILURE(S)\n", g_fail); return 1; }
     printf("all dns_wire tests passed\n");
     return 0;

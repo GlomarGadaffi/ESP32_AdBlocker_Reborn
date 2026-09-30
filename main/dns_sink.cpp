@@ -1853,6 +1853,7 @@ static esp_err_t IRAM_ATTR l2_input_cb(esp_eth_handle_t h, uint8_t *buf, uint32_
          * hook's verdict-first order was what shielded Ethernet clients from
          * exactly those entries. */
         int clen = dns_cache_l2_get(domain_hash(name, nlen), qtype,
+                                    buf + dns + 12, qend - 4 - 12,   /* exact wire qname */
                                     tx + dns, (int)sizeof(tx) - dns);
         if (clen > 0) {
             memcpy(tx, buf, dns);                         /* eth+ip+udp headers */

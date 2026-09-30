@@ -185,6 +185,13 @@ struct CacheEntry {
     bool       blocked;
     uint16_t   qtype;
     uint16_t   resp_len;              /* allowed: cached raw response length (0 = blocked) */
+    uint16_t   qn_len;                /* wire length of the question name at resp[12..].
+                                         key_hash only picks the set: a hit also has to be
+                                         this exact name (dns_qname_wire_eq), or two names
+                                         with colliding 32-bit hashes would answer for each
+                                         other. Allowed entries have it in their stored reply
+                                         already; blocked ones (resp_len 0) store just the
+                                         name there. */
     uint64_t   refresh_after_ms;      /* stale-refresh rate gate; dns_task only, not
                                          read by the L2 path so no seqlock needed */
     uint32_t   load_gen;              /* blocklist_generation() as of the VERDICT that
@@ -242,13 +249,23 @@ static inline CacheEntry *cache_set(uint32_t h, uint16_t qtype)
 {
     return &s_cache[((h ^ ((uint32_t)qtype << 1)) & (CACHE_SETS - 1)) * CACHE_WAYS];
 }
-static CacheEntry *cache_lookup(uint32_t h, uint16_t qtype, uint64_t now_ms)
+/* The full cache key: (hash, qtype) plus the exact question name. qn/qn_len
+ * are the query's own wire QNAME (pkt + 12, dns_extract_qname's qend - 16);
+ * case is ignored, as it is by domain_hash. IRAM: dns_cache_l2_get uses it. */
+static inline IRAM_ATTR bool cache_key_eq(const CacheEntry *e, uint32_t h, uint16_t qtype,
+                                          const uint8_t *qn, int qn_len)
+{
+    return e->key_hash == h && e->qtype == qtype && e->qn_len == qn_len &&
+           dns_qname_wire_eq(e->resp + sizeof(DnsHeader), qn, qn_len);
+}
+static CacheEntry *cache_lookup(uint32_t h, uint16_t qtype, const uint8_t *qn, int qn_len,
+                                uint64_t now_ms)
 {
     CacheEntry *set = cache_set(h, qtype);
     uint32_t gen = blocklist_generation();  /* (#85) one load, reused across all WAYS */
     for (int w = 0; w < CACHE_WAYS; w++) {
         CacheEntry *e = &set[w];
-        if (e->valid && e->key_hash == h && e->qtype == qtype && e->ttl_deadline_ms > now_ms
+        if (e->valid && cache_key_eq(e, h, qtype, qn, qn_len) && e->ttl_deadline_ms > now_ms
             && e->load_gen == gen)
             return e;
     }
@@ -264,14 +281,17 @@ static CacheEntry *cache_lookup(uint32_t h, uint16_t qtype, uint64_t now_ms)
  * entries compare at their deadline and allowed ones at deadline + STALE_MAX_S.
  * Evicting a still-useful entry bumps s_cnt_cache_evict — the gauge that says
  * whether WAYS×SETS is actually big enough for the traffic. */
-static CacheEntry *cache_victim(uint32_t h, uint16_t qtype, uint64_t now_ms)
+static CacheEntry *cache_victim(uint32_t h, uint16_t qtype, const uint8_t *qn, int qn_len,
+                                uint64_t now_ms)
 {
     CacheEntry *set = cache_set(h, qtype);
     CacheEntry *victim = &set[0];
     uint64_t victim_end = UINT64_MAX;
     for (int w = 0; w < CACHE_WAYS; w++) {
         CacheEntry *e = &set[w];
-        if (e->valid && e->key_hash == h && e->qtype == qtype)
+        /* Own way = same name, not merely same hash: a colliding name gets a
+         * way of its own instead of overwriting this one. */
+        if (e->valid && cache_key_eq(e, h, qtype, qn, qn_len))
             return e;                          /* overwrite in place */
         uint64_t end = !e->valid ? 0
             : e->ttl_deadline_ms + (e->blocked ? 0 : (uint64_t)STALE_MAX_S * 1000u);
@@ -283,13 +303,16 @@ static CacheEntry *cache_victim(uint32_t h, uint16_t qtype, uint64_t now_ms)
 }
 /* load_gen is the generation as of the verdict that authorised this store, passed
  * in by the caller — never re-read here. See CacheEntry::load_gen. */
-static void cache_store_blocked(uint32_t h, uint16_t qtype, uint32_t ttl_s, uint64_t now_ms,
-                                uint32_t load_gen)
+static void cache_store_blocked(uint32_t h, uint16_t qtype, const uint8_t *qn, int qn_len,
+                                uint32_t ttl_s, uint64_t now_ms, uint32_t load_gen)
 {
-    CacheEntry *e = cache_victim(h, qtype, now_ms);
+    if (qn_len <= 0 || qn_len > DNS_QNAME_WIRE_MAX) return;
+    CacheEntry *e = cache_victim(h, qtype, qn, qn_len, now_ms);
     cache_write_begin();
     e->key_hash = h; e->qtype = qtype; e->blocked = true; e->valid = true;
     e->resp_len = 0;
+    memcpy(e->resp + sizeof(DnsHeader), qn, (size_t)qn_len);
+    e->qn_len = (uint16_t)qn_len;
     e->ttl_deadline_ms = now_ms + (uint64_t)ttl_s * 1000u;
     e->load_gen = load_gen;  /* (#85) */
     cache_write_end();
@@ -299,11 +322,14 @@ static void cache_store_resp(uint32_t h, uint16_t qtype, const uint8_t *resp, in
 {
     if (len <= 0) return;
     if (len > FWD_RESP_MAX) { s_cnt_cache_toobig++; return; }
-    CacheEntry *e = cache_victim(h, qtype, now_ms);
+    int qn_len = dns_qname_wire_len(resp, len, sizeof(DnsHeader));
+    if (qn_len < 0) return;
+    CacheEntry *e = cache_victim(h, qtype, resp + sizeof(DnsHeader), qn_len, now_ms);
     cache_write_begin();
     e->key_hash = h; e->qtype = qtype; e->blocked = false; e->valid = true;
     e->resp_len = (uint16_t)len;
     memcpy(e->resp, resp, len);
+    e->qn_len = (uint16_t)qn_len;
     e->ttl_deadline_ms   = now_ms + (uint64_t)ttl_s * 1000u;
     e->refresh_after_ms  = 0;
     e->load_gen          = load_gen;  /* (#85) */
@@ -313,14 +339,15 @@ static void cache_store_resp(uint32_t h, uint16_t qtype, const uint8_t *resp, in
 /* Serve-stale lookup (#68): expired ALLOWED entry within the stale window.
  * Fresh entries are cache_lookup()'s job; expired blocked entries stay misses
  * (re-blocking via the blocklist is microseconds — no staleness needed). */
-static CacheEntry *cache_lookup_stale(uint32_t h, uint16_t qtype, uint64_t now_ms)
+static CacheEntry *cache_lookup_stale(uint32_t h, uint16_t qtype, const uint8_t *qn,
+                                      int qn_len, uint64_t now_ms)
 {
     CacheEntry *set = cache_set(h, qtype);
     uint32_t gen = blocklist_generation();  /* (#85) */
     for (int w = 0; w < CACHE_WAYS; w++) {
         CacheEntry *e = &set[w];
         if (e->valid && !e->blocked && e->resp_len > 0 &&
-            e->key_hash == h && e->qtype == qtype &&
+            cache_key_eq(e, h, qtype, qn, qn_len) &&
             e->ttl_deadline_ms <= now_ms &&
             e->ttl_deadline_ms + (uint64_t)STALE_MAX_S * 1000u > now_ms &&
             e->load_gen == gen)
@@ -330,11 +357,14 @@ static CacheEntry *cache_lookup_stale(uint32_t h, uint16_t qtype, uint64_t now_m
 }
 
 /* L2 fast-path cache read (called from the eth-RX task). Seqlock-protected.
- * Copies the cached ALLOWED response for (qhash,qtype) into out (caller patches
- * the txid + builds the frame). Returns the DNS length, or -1 on miss / expired /
+ * Copies the cached ALLOWED response for (qhash, qtype, exact qname qn) into out
+ * (caller patches the txid + builds the frame). Returns the DNS length, or -1 on
+ * miss / expired /
  * blocked-entry / write-race. Blocked domains are handled by the blocklist check
  * in the L2 hook, so we only replay allowed (forward-cached) responses here. */
-extern "C" int IRAM_ATTR dns_cache_l2_get(uint32_t qhash, uint16_t qtype, uint8_t *out, int out_cap)
+extern "C" int IRAM_ATTR dns_cache_l2_get(uint32_t qhash, uint16_t qtype,
+                                          const uint8_t *qn, int qn_len,
+                                          uint8_t *out, int out_cap)
 {
     if (!s_cache || !out) return -1;
     uint64_t now_ms = (uint64_t)(esp_timer_get_time() / 1000);
@@ -353,7 +383,7 @@ extern "C" int IRAM_ATTR dns_cache_l2_get(uint32_t qhash, uint16_t qtype, uint8_
     int len = -1;
     for (int w = 0; w < CACHE_WAYS; w++) {
         CacheEntry *e = &set[w];
-        if (!e->valid || e->blocked || e->key_hash != qhash || e->qtype != qtype) continue;
+        if (!e->valid || e->blocked || !cache_key_eq(e, qhash, qtype, qn, qn_len)) continue;
         if (e->ttl_deadline_ms <= now_ms) continue;  /* expired */
         if (e->load_gen != gen) continue;            /* (#85) stale verdict */
         int l = e->resp_len;
@@ -448,11 +478,15 @@ static void cache_load_sd(void)
         /* Freshly calloc-ed cache → this lands on an invalid way (a good save
          * has at most CACHE_WAYS records per set; an old direct-mapped one at
          * most 2). Only a corrupt file can force a real eviction here. */
-        CacheEntry *e = cache_victim(h, qtype, now_ms);
-        if (fread(e->resp, 1, resp_len, f) != resp_len) {
-            e->valid = false;      /* partial read - do not leave a torn slot live */
-            break;
-        }
+        /* Read into scratch first: the slot is picked by the stored reply's
+         * own question name, the same full key a live store uses. */
+        static EXT_RAM_BSS_ATTR uint8_t s_ld[FWD_RESP_MAX];   /* boot-only, cold */
+        if (fread(s_ld, 1, resp_len, f) != resp_len) break;         /* truncated */
+        int qn_len = dns_qname_wire_len(s_ld, resp_len, sizeof(DnsHeader));
+        if (qn_len < 0) continue;                                   /* skip, keep going */
+        CacheEntry *e = cache_victim(h, qtype, s_ld + sizeof(DnsHeader), qn_len, now_ms);
+        memcpy(e->resp, s_ld, resp_len);
+        e->qn_len           = (uint16_t)qn_len;
         e->key_hash         = h;
         e->qtype            = qtype;
         e->resp_len         = resp_len;
@@ -578,6 +612,11 @@ struct UpstreamEntry {
     int64_t          recv_us;        /* esp_timer µs when client query received */
     int64_t          upstream_us;    /* esp_timer µs when forwarded upstream */
     uint32_t         qhash;          /* domain hash — to key the forward cache on reply */
+    uint32_t         qkey;           /* qname_key() of the same name: qhash's public, fixed
+                                        seed makes collisions cheap to compute, so every
+                                        match against this table (reply acceptance, joins,
+                                        refresh suppression) also requires this per-boot
+                                        secret-seeded hash to agree */
     uint32_t         case_hash;      /* (#72) 0x20: case-SENSITIVE hash of the exact bytes
                                         sent upstream — qhash stays case-insensitive since
                                         it also keys the forward cache. */
@@ -714,17 +753,19 @@ static UpstreamEntry *upstream_find(uint16_t our_txid)
 /* Is a real query for this question already in flight? Used only by #68's
  * stale-refresh suppression, which asks nothing more than that: any live entry
  * repopulates the cache slot, so the refresh has nothing left to do. The key is
- * (qhash, qtype) — identical to the forward cache's key, so a hash collision
- * mixes answers exactly as it already can there: no new failure class.
+ * (qhash, qkey, qtype): qhash alone is a public-seed 32-bit hash whose
+ * collisions are cheap to compute, and a colliding name must not suppress
+ * (or, for joins, answer) a different one.
  * refresh_only entries stay excluded — refresh-vs-refresh is already
  * rate-limited by the caller's own refresh_after_ms gate. A requester looking
  * for an entry to RIDE wants upstream_find_joinable() below instead: riding
  * carries obligations to the joiner that mere suppression does not. */
-static UpstreamEntry *upstream_find_inflight(uint32_t qhash, uint16_t qtype)
+static UpstreamEntry *upstream_find_inflight(uint32_t qhash, uint32_t qkey, uint16_t qtype)
 {
     for (int i = 0; i < UPSTREAM_TABLE_SIZE; i++)
         if (s_upstream[i].in_use && !s_upstream[i].refresh_only &&
-            s_upstream[i].qhash == qhash && s_upstream[i].qtype == qtype)
+            s_upstream[i].qhash == qhash && s_upstream[i].qkey == qkey &&
+            s_upstream[i].qtype == qtype)
             return &s_upstream[i];
     return nullptr;
 }
@@ -798,6 +839,17 @@ static inline uint32_t query_case_hash(const uint8_t *pkt, int qend)
     return murmur3_32(pkt + sizeof(DnsHeader), (size_t)(qend - (int)sizeof(DnsHeader)),
                        DOMAIN_HASH_SEED);
 }
+
+/* Second, secret-seeded hash of a normalized name for UpstreamEntry::qkey.
+ * domain_hash()'s seed is a public constant (it has to be: the blocklist's
+ * SD snapshot is keyed on it), so a name that collides with any chosen
+ * target is a brute-force away. The seed here is drawn once per boot and
+ * never leaves the box. Set in run_loop(); nonzero once set. */
+static uint32_t s_qkey_seed = 0;
+static inline uint32_t qname_key(const char *name, size_t nlen)
+{
+    return murmur3_32(name, nlen, s_qkey_seed);
+}
 /* The entry a duplicate may actually ride (#76). Three conditions beyond
  * upstream_find_inflight's, all of which matter only to a requester about to
  * attach itself — which is why #68's "is anything already in flight" question
@@ -813,14 +865,14 @@ static inline uint32_t query_case_hash(const uint8_t *pkt, int qend)
  *   - A matching reply-shaping envelope (see query_env_hash).
  * A miss is never a drop: the caller allocates its own slot exactly as it did
  * before the patch. */
-static UpstreamEntry *upstream_find_joinable(uint32_t qhash, uint16_t qtype,
+static UpstreamEntry *upstream_find_joinable(uint32_t qhash, uint32_t qkey, uint16_t qtype,
                                              uint32_t env_hash, uint32_t now_ms)
 {
     for (int i = 0; i < UPSTREAM_TABLE_SIZE; i++)
         if (s_upstream[i].in_use && !s_upstream[i].refresh_only &&
             !s_upstream[i].no_cache &&                       /* (#106) class-blind key */
-            s_upstream[i].qhash == qhash && s_upstream[i].qtype == qtype &&
-            s_upstream[i].env_hash == env_hash &&
+            s_upstream[i].qhash == qhash && s_upstream[i].qkey == qkey &&
+            s_upstream[i].qtype == qtype && s_upstream[i].env_hash == env_hash &&
             s_upstream[i].n_wait < UPSTREAM_WAITERS_MAX &&
             (now_ms - s_upstream[i].sent_ms) < UPSTREAM_JOIN_MAX_AGE_MS)
             return &s_upstream[i];
@@ -1245,6 +1297,9 @@ void DnsSinkServer::dns_task(void *pv) {
 void DnsSinkServer::run_loop()
 {
     s_dns_task_handle = xTaskGetCurrentTaskHandle();
+    /* Once per boot, not per run_loop entry: a task restart must not strand
+     * in-flight entries keyed under the old seed. */
+    if (!s_qkey_seed) s_qkey_seed = esp_random() | 1u;
 
     if (!cache_init()) {
         ESP_LOGE(TAG, "PSRAM result cache alloc failed");
@@ -1363,7 +1418,8 @@ void DnsSinkServer::run_loop()
                                       rname, sizeof(rname), &rnlen);
                 if (rqend < 0) return;
                 uint16_t rqtype = ntohs(*reinterpret_cast<uint16_t *>(pkt + rqend - 4));
-                if (rqtype != ue->qtype || domain_hash(rname, rnlen) != ue->qhash)
+                if (rqtype != ue->qtype || domain_hash(rname, rnlen) != ue->qhash ||
+                    qname_key(rname, rnlen) != ue->qkey)
                     return;
                 /* (#72) 0x20: ideally the reply echoes the exact case pattern
                  * we sent — deliberately NOT a reject gate here, though.
@@ -1500,7 +1556,9 @@ void DnsSinkServer::run_loop()
                  * so storing a CH/HS reply here would hand it to a later IN query
                  * for the same name and type. Deliver it and forget it. */
             } else if (cloaked) {
-                cache_store_blocked(ue->qhash, ue->qtype, BLOCKED_TTL_S, now_ms_, ue->load_gen);
+                cache_store_blocked(ue->qhash, ue->qtype, pkt + sizeof(DnsHeader),
+                                    rqend - 4 - (int)sizeof(DnsHeader),
+                                    BLOCKED_TTL_S, now_ms_, ue->load_gen);
             } else {
                 uint8_t rcode = pkt[3] & 0x0F;
                 if (!truncated && (rcode == 0 || rcode == 3))
@@ -1833,6 +1891,9 @@ void DnsSinkServer::run_loop()
                 bool cls_in = (qclass == 1);
 
                 uint32_t h = domain_hash(name, nlen);
+                /* Wire QNAME as the client sent it — the rest of the cache key. */
+                const uint8_t *qn = rx + sizeof(DnsHeader);
+                int qn_len = qend - 4 - (int)sizeof(DnsHeader);
 
                 /* (#48/#74) Timed/scoped pause, and the standing per-client
                  * bypass list (#74 Part 2) — both are DELIVERY-time overrides,
@@ -1875,7 +1936,7 @@ void DnsSinkServer::run_loop()
                 /* ── cache hit? ─────────────────────────────── */
                 s_cnt_cache_probe++;
                 CacheEntry *ce = (rw_pre || !cls_in) ? nullptr
-                                                     : cache_lookup(h, qtype, now_ms);
+                                                     : cache_lookup(h, qtype, qn, qn_len, now_ms);
                 if (ce) {
                     s_cnt_cache_hit++;
                     if (ce->blocked && (paused_client || bypassed_client)) {
@@ -1920,7 +1981,7 @@ void DnsSinkServer::run_loop()
                  * The L2 path stays fresh-only: its miss falls through to
                  * here at ~1.8 ms, still invisible. */
                 if (cls_in && !rw_pre) {
-                    CacheEntry *se = cache_lookup_stale(h, qtype, now_ms);
+                    CacheEntry *se = cache_lookup_stale(h, qtype, qn, qn_len, now_ms);
                     if (se && se->resp_len <= (int)sizeof(tx)) {
                         memcpy(tx, se->resp, se->resp_len);
                         tx[0] = rx[0]; tx[1] = rx[1];
@@ -1938,7 +1999,7 @@ void DnsSinkServer::run_loop()
                              * unlike the table-full case below there is nothing
                              * to retry. A refresh has no deliveree, so it never
                              * becomes a waiter either. */
-                            if (upstream_find_inflight(h, qtype)) {
+                            if (upstream_find_inflight(h, qname_key(name, nlen), qtype)) {
                                 s_cnt_coalesced++;
                                 continue;
                             }
@@ -1949,6 +2010,7 @@ void DnsSinkServer::run_loop()
                                 ue->sent_ms      = (uint32_t)now_ms;
                                 ue->recv_us      = t_recv;
                                 ue->qhash        = h;
+                                ue->qkey         = qname_key(name, nlen);
                                 ue->qtype        = qtype;
                                 ue->refresh_only = true;
                                 /* (#85) A refresh consults no verdict of its own —
@@ -2024,7 +2086,8 @@ void DnsSinkServer::run_loop()
                          * nothing to record — but the query still isolates
                          * below in case the upstream answer CNAME-cloaks to a
                          * blocked target. */
-                        if (is_blk) cache_store_blocked(h, qtype, BLOCKED_TTL_S, now_ms, verdict_gen);
+                        if (is_blk) cache_store_blocked(h, qtype, qn, qn_len,
+                                                        BLOCKED_TTL_S, now_ms, verdict_gen);
                         is_blk = false;
                     }
                     if (is_blk) {
@@ -2035,7 +2098,7 @@ void DnsSinkServer::run_loop()
                             sendto(csock, tx, tlen, 0, (sockaddr *)&client_addr, clen);
                             hist_record(&s_h_sendto, esp_timer_get_time() - t_s0);
                         }
-                        cache_store_blocked(h, qtype, BLOCKED_TTL_S, now_ms, verdict_gen);
+                        cache_store_blocked(h, qtype, qn, qn_len, BLOCKED_TTL_S, now_ms, verdict_gen);
                         hist_record(&s_h_blocked, esp_timer_get_time() - t_recv);
                         query_log_record(name, qtype,
                             ntohl(client_addr.sin_addr.s_addr), true, false);
@@ -2062,7 +2125,8 @@ void DnsSinkServer::run_loop()
                      * flight: that flight's reply goes through the cloaking
                      * check, which is exactly what the pause must skip. */
                     UpstreamEntry *fl = (cls_in && !fwd_no_cache)
-                                               ? upstream_find_joinable(h, qtype, eh,
+                                               ? upstream_find_joinable(h, qname_key(name, nlen),
+                                                                        qtype, eh,
                                                                         (uint32_t)now_ms)
                                                : nullptr;
                     if (fl && upstream_join(fl, ntohs(hdr->id), &client_addr,
@@ -2080,6 +2144,7 @@ void DnsSinkServer::run_loop()
                     ue->sent_ms     = (uint32_t)now_ms;
                     ue->recv_us     = t_recv;
                     ue->qhash       = h;
+                    ue->qkey        = qname_key(name, nlen);
                     ue->qtype       = qtype;
                     ue->env_hash    = eh;
                     ue->no_cache    = !cls_in || fwd_no_cache;   /* (#106) class; (#48) pause */
@@ -2173,6 +2238,8 @@ void DnsSinkServer::run_loop()
                         uint16_t qclass = ntohs(*reinterpret_cast<uint16_t *>(q + qend - 2));
                         bool cls_in = (qclass == 1);              /* (#106), as on UDP */
                         uint32_t h = domain_hash(name, nlen);
+                        const uint8_t *qn = q + sizeof(DnsHeader);   /* rest of the cache key */
+                        int qn_len = qend - 4 - (int)sizeof(DnsHeader);
                         int tlen = 0;    /* >0: answer in tx; 0: forwarded, conn held */
                         /* (#48/#74) Same delivery-time pause + bypass override
                          * as UDP — tcp_no_cache is true for the whole query
@@ -2188,7 +2255,7 @@ void DnsSinkServer::run_loop()
                         uint32_t rw_pre = (cls_in && qtype == 1) ? rewrite_lookup(name) : 0;
                         s_cnt_cache_probe++;
                         CacheEntry *ce = (rw_pre || !cls_in) ? nullptr
-                                                             : cache_lookup(h, qtype, now_ms);
+                                                             : cache_lookup(h, qtype, qn, qn_len, now_ms);
                         /* (#48/#74) A cached BLOCK is skipped for a paused or
                          * bypassed client: the verdict branch below re-derives
                          * it, stores it, and forwards this one delivery. */
@@ -2229,7 +2296,8 @@ void DnsSinkServer::run_loop()
                                  * name, so it must not be trusted to decide
                                  * whether to cache_store_blocked in that case
                                  * either. */
-                                if (is_blk) cache_store_blocked(h, qtype, BLOCKED_TTL_S, now_ms, verdict_gen);
+                                if (is_blk) cache_store_blocked(h, qtype, qn, qn_len,
+                                                                BLOCKED_TTL_S, now_ms, verdict_gen);
                                 is_blk = false;
                             }
                             if (rw_ip) {
@@ -2238,7 +2306,7 @@ void DnsSinkServer::run_loop()
                             } else if (is_blk) {
                                 s_cnt_blocked++;
                                 tlen = build_blocked_any(q, qend, qtype, tx, sizeof(tx));
-                                cache_store_blocked(h, qtype, BLOCKED_TTL_S, now_ms, verdict_gen);
+                                cache_store_blocked(h, qtype, qn, qn_len, BLOCKED_TTL_S, now_ms, verdict_gen);
                                 query_log_record(name, qtype, s_tcp.peer_ip, true, false);
                                 hist_record(&s_h_blocked, esp_timer_get_time() - t_recv);
                             } else {
@@ -2257,7 +2325,8 @@ void DnsSinkServer::run_loop()
                                  * the entry by more than a fraction of it. */
                                 uint32_t eh = query_env_hash(q, mlen, qend);
                                 UpstreamEntry *fl = (cls_in && !tcp_no_cache)  /* (#106); (#48) */
-                                    ? upstream_find_joinable(h, qtype, eh, (uint32_t)now_ms)
+                                    ? upstream_find_joinable(h, qname_key(name, nlen), qtype,
+                                                             eh, (uint32_t)now_ms)
                                     : nullptr;
                                 if (fl && upstream_join(fl, ntohs(qh->id), nullptr,
                                                         t_recv, true, s_tcp.gen)) {
@@ -2279,6 +2348,7 @@ void DnsSinkServer::run_loop()
                                     ue->sent_ms  = (uint32_t)now_ms;
                                     ue->recv_us  = t_recv;
                                     ue->qhash    = h;
+                                    ue->qkey     = qname_key(name, nlen);
                                     ue->qtype    = qtype;
                                     ue->env_hash = eh;
                                     ue->no_cache = !cls_in || tcp_no_cache;   /* (#106); (#48) */

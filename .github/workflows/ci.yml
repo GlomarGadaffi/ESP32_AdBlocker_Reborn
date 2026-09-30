@@ -21,29 +21,33 @@ jobs:
 
       - name: Run Host Unit Tests (ASan + UBSan)
         run: |
-          echo "=== 1/6 bl_table_test ==="
+          echo "=== 1/7 bl_table_test ==="
           gcc -O2 -fsanitize=address,undefined -I main -o bl_table_test tests/bl_table_test.c main/bl_table.c
           ./bl_table_test
 
-          echo "=== 2/6 dns_wire_test ==="
+          echo "=== 2/7 dns_wire_test ==="
           gcc -O2 -fsanitize=address,undefined -I main -o dns_wire_test tests/dns_wire_test.c main/dns_wire.c main/domain.c main/murmur3.c
           ./dns_wire_test
 
-          echo "=== 3/6 l2_finish_reply_test ==="
+          echo "=== 3/7 l2_finish_reply_test ==="
           gcc -O2 -fsanitize=address,undefined -o l2_finish_reply_test tests/l2_finish_reply_test.c
           ./l2_finish_reply_test
 
-          echo "=== 4/6 qname_case_scrub_test ==="
+          echo "=== 4/7 qname_case_scrub_test ==="
           gcc -O2 -fsanitize=address,undefined -I main -o qname_case_scrub_test tests/qname_case_scrub_test.c main/domain.c
           ./qname_case_scrub_test
 
-          echo "=== 5/6 rule_parse_test ==="
+          echo "=== 5/7 rule_parse_test ==="
           gcc -O2 -fsanitize=address,undefined -I main -o rule_parse_test tests/rule_parse_test.c main/domain.c
           ./rule_parse_test
 
-          echo "=== 6/6 web_parse_test ==="
+          echo "=== 6/7 web_parse_test ==="
           gcc -O2 -fsanitize=address,undefined -I main -o web_parse_test tests/web_parse_test.c main/web_parse.c
           ./web_parse_test
+
+          echo "=== 7/7 verdict_test ==="
+          gcc -O2 -fsanitize=address,undefined -I main -o verdict_test tests/verdict_test.c main/bl_rank.c main/domain.c
+          ./verdict_test
 
       - name: Build & Run Standalone Fuzz Replay (ASan + UBSan)
         run: |
@@ -88,7 +92,12 @@ jobs:
       - name: Build Firmware (${{ matrix.board }})
         run: |
           . /opt/esp/entrypoint.sh
+          # Every supported board is ESP32-S3. The board overlays set the target,
+          # but plain sdkconfig.defaults (t-eth-elite) does not, and IDF would
+          # otherwise default to esp32 — whose ECDSA-only signing then chokes on
+          # the RSA-3072 key.
           idf.py -B ${{ matrix.build_dir }} \
+            -DIDF_TARGET=esp32s3 \
             -DSDKCONFIG=${{ matrix.sdkconfig }} \
             "-DSDKCONFIG_DEFAULTS=${{ matrix.sdkconfig_defaults }}" \
             build
@@ -99,10 +108,15 @@ jobs:
           test -s ${{ matrix.build_dir }}/dns-sink.bin
           ls -lh ${{ matrix.build_dir }}/dns-sink.bin
 
+      # Signed with the throwaway key generated above, not the release key. A
+      # board serial-flashed with this image only accepts OTA images signed by
+      # that same (discarded) key, so it can never take an official release
+      # over the air again — hence the name, and the short retention.
       - name: Upload Firmware Binary
         uses: actions/upload-artifact@v4
         with:
-          name: firmware-${{ matrix.board }}
+          name: ci-build-${{ matrix.board }}-throwaway-key-do-not-flash
+          retention-days: 7
           path: |
             ${{ matrix.build_dir }}/dns-sink.bin
             ${{ matrix.build_dir }}/bootloader/bootloader.bin

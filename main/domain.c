@@ -55,6 +55,40 @@ int IRAM_ATTR dns_extract_qname(const uint8_t *pkt, int pkt_len, int offset,
     return offset + 4;
 }
 
+/* Same walk and bounds as dns_extract_qname() above, minus the copy: the
+ * forward cache needs the wire span of a name it already accepted, not the
+ * name itself. raw_len tracks the dotted length the extractor would build,
+ * so the two reject the same over-long names. */
+int dns_qname_wire_len(const uint8_t *pkt, int pkt_len, int offset)
+{
+    int start = offset;
+    size_t raw_len = 0;
+    if (!pkt || offset < 0) return -1;
+    while (offset < pkt_len && pkt[offset] != 0) {
+        uint8_t label_len = pkt[offset];
+        if (label_len & 0xC0) return -1;
+        if (offset + 1 + label_len > pkt_len || raw_len + label_len + 1 >= 256)
+            return -1;
+        if (raw_len > 0) raw_len++;
+        raw_len += label_len;
+        offset  += 1 + label_len;
+    }
+    if (offset >= pkt_len || raw_len == 0) return -1;
+    return offset + 1 - start;
+}
+
+/* IRAM_ATTR: dns_cache_l2_get() calls this from the L2 fast path. */
+bool IRAM_ATTR dns_qname_wire_eq(const uint8_t *a, const uint8_t *b, int n)
+{
+    for (int i = 0; i < n; i++) {
+        uint8_t x = a[i], y = b[i];
+        if ((uint8_t)(x - 'A') < 26) x |= 0x20;
+        if ((uint8_t)(y - 'A') < 26) y |= 0x20;
+        if (x != y) return false;
+    }
+    return true;
+}
+
 /* Any single-label name (no dot) is treated as a bare TLD and never blocked.
  * IRAM_ATTR (#117): reached from the L2 fast path via bl_rank_resolve's
  * per-suffix probe walk — closes the gap CONTRIBUTING.md §4 used to name

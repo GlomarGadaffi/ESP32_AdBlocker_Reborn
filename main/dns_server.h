@@ -41,7 +41,8 @@ extern "C" {
  * it here would give GCC two different generated section names for the
  * same symbol (each IRAM_ATTR expansion mints a fresh one) and fail the
  * build under -Werror=attributes. */
-int dns_cache_l2_get(uint32_t qhash, uint16_t qtype, uint8_t *out, int out_cap);
+int dns_cache_l2_get(uint32_t qhash, uint16_t qtype, const uint8_t *qn, int qn_len,
+                     uint8_t *out, int out_cap);
 
 /* Persist the forward cache to /sdcard/fwdcache.bin so a reboot keeps its
  * learned working set (#79). Blocking SD I/O - call from download_task,
