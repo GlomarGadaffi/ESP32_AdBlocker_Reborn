@@ -1,0 +1,110 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  host-tests:
+    name: Host Tests & Fuzz Replay
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang zip
+
+      - name: Run Host Unit Tests (ASan + UBSan)
+        run: |
+          echo "=== 1/6 bl_table_test ==="
+          gcc -O2 -fsanitize=address,undefined -I main -o bl_table_test tests/bl_table_test.c main/bl_table.c
+          ./bl_table_test
+
+          echo "=== 2/6 dns_wire_test ==="
+          gcc -O2 -fsanitize=address,undefined -I main -o dns_wire_test tests/dns_wire_test.c main/dns_wire.c main/domain.c main/murmur3.c
+          ./dns_wire_test
+
+          echo "=== 3/6 l2_finish_reply_test ==="
+          gcc -O2 -fsanitize=address,undefined -o l2_finish_reply_test tests/l2_finish_reply_test.c
+          ./l2_finish_reply_test
+
+          echo "=== 4/6 qname_case_scrub_test ==="
+          gcc -O2 -fsanitize=address,undefined -I main -o qname_case_scrub_test tests/qname_case_scrub_test.c main/domain.c
+          ./qname_case_scrub_test
+
+          echo "=== 5/6 rule_parse_test ==="
+          gcc -O2 -fsanitize=address,undefined -I main -o rule_parse_test tests/rule_parse_test.c main/domain.c
+          ./rule_parse_test
+
+          echo "=== 6/6 web_parse_test ==="
+          gcc -O2 -fsanitize=address,undefined -I main -o web_parse_test tests/web_parse_test.c main/web_parse.c
+          ./web_parse_test
+
+      - name: Build & Run Standalone Fuzz Replay (ASan + UBSan)
+        run: |
+          FUZZ_STANDALONE=1 sh tests/fuzz/build.sh
+          ./tests/fuzz/out/fuzz_dns_wire tests/fuzz/corpus/dns_wire
+          ./tests/fuzz/out/fuzz_rule_parse tests/fuzz/corpus/rule_parse
+          ./tests/fuzz/out/fuzz_web_parse tests/fuzz/corpus/web_parse
+
+  build-firmware:
+    name: Build Firmware (${{ matrix.board }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - board: t-eth-elite
+            build_dir: build
+            sdkconfig: sdkconfig
+            sdkconfig_defaults: sdkconfig.defaults
+          - board: waveshare-s3-eth
+            build_dir: build-waveshare
+            sdkconfig: sdkconfig.waveshare
+            sdkconfig_defaults: sdkconfig.defaults;sdkconfig.board.waveshare-s3-eth
+          - board: generic-s3-wifi
+            build_dir: build-wifi
+            sdkconfig: sdkconfig.wifi
+            sdkconfig_defaults: sdkconfig.defaults;sdkconfig.board.generic-s3-wifi
+    container:
+      image: espressif/idf:release-v6.0
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Generate CI Signing Key if missing
+        run: |
+          . /opt/esp/entrypoint.sh
+          if [ ! -f secure_boot_signing_key.pem ]; then
+            echo "Generating ephemeral RSA-3072 signing key for CI build..."
+            espsecure.py generate_signing_key --version 2 --scheme rsa3072 secure_boot_signing_key.pem
+          fi
+
+      - name: Build Firmware (${{ matrix.board }})
+        run: |
+          . /opt/esp/entrypoint.sh
+          idf.py -B ${{ matrix.build_dir }} \
+            -DSDKCONFIG=${{ matrix.sdkconfig }} \
+            "-DSDKCONFIG_DEFAULTS=${{ matrix.sdkconfig_defaults }}" \
+            build
+
+      - name: Verify Build Artifacts
+        run: |
+          test -f ${{ matrix.build_dir }}/dns-sink.bin
+          test -s ${{ matrix.build_dir }}/dns-sink.bin
+          ls -lh ${{ matrix.build_dir }}/dns-sink.bin
+
+      - name: Upload Firmware Binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-${{ matrix.board }}
+          path: |
+            ${{ matrix.build_dir }}/dns-sink.bin
+            ${{ matrix.build_dir }}/bootloader/bootloader.bin
+            ${{ matrix.build_dir }}/partition_table/partition-table.bin
+            ${{ matrix.build_dir }}/flash_args

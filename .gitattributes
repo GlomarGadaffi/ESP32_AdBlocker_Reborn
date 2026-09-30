@@ -1,0 +1,22 @@
+# Auto-detect text files and normalize line endings to LF on commit
+* text=auto eol=lf
+
+# Shell scripts and sources must always have LF line endings
+*.sh text eol=lf
+*.py text eol=lf
+*.c text eol=lf
+*.cpp text eol=lf
+*.h text eol=lf
+*.md text eol=lf
+*.json text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.csv text eol=lf
+*.ps1 text eol=lf
+
+# Binary files
+*.bin binary
+*.png binary
+*.jpg binary
+*.ico binary
+*.pem binary

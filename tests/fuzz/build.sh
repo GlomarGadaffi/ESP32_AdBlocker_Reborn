@@ -22,26 +22,25 @@ mkdir -p "$OUT"
 
 if [ "${FUZZ_STANDALONE:-0}" = "1" ]; then
     : "${CFLAGS:=-O1 -g -fsanitize=address,undefined -fno-sanitize-recover=undefined}"
-    engine="$here/standalone_main.c"
+    set -- "$here/standalone_main.c"
 else
     : "${CFLAGS:=-O1 -g -fsanitize=fuzzer,address,undefined -fno-sanitize-recover=undefined}"
     : "${LIB_FUZZING_ENGINE:=-fsanitize=fuzzer}"
-    engine="$LIB_FUZZING_ENGINE"
+    # shellcheck disable=SC2086
+    set -- $LIB_FUZZING_ENGINE
 fi
 
-common="-I$SRC/main -DFUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION"
-
 # shellcheck disable=SC2086
-$CC $CFLAGS $common "$here/fuzz_rule_parse.c" \
+$CC $CFLAGS -I"$SRC/main" -DFUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION "$here/fuzz_rule_parse.c" \
     "$SRC/main/domain.c" "$SRC/main/murmur3.c" \
-    $engine -o "$OUT/fuzz_rule_parse"
+    "$@" -o "$OUT/fuzz_rule_parse"
 # shellcheck disable=SC2086
-$CC $CFLAGS $common "$here/fuzz_dns_wire.c" \
+$CC $CFLAGS -I"$SRC/main" -DFUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION "$here/fuzz_dns_wire.c" \
     "$SRC/main/dns_wire.c" "$SRC/main/domain.c" "$SRC/main/murmur3.c" \
-    $engine -o "$OUT/fuzz_dns_wire"
+    "$@" -o "$OUT/fuzz_dns_wire"
 # shellcheck disable=SC2086
-$CC $CFLAGS $common "$here/fuzz_web_parse.c" "$SRC/main/web_parse.c" \
-    $engine -o "$OUT/fuzz_web_parse"
+$CC $CFLAGS -I"$SRC/main" -DFUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION "$here/fuzz_web_parse.c" "$SRC/main/web_parse.c" \
+    "$@" -o "$OUT/fuzz_web_parse"
 
 # Seed corpora ship zipped for OSS-Fuzz-style runners; locally the plain dirs
 # under corpus/ are used directly.
