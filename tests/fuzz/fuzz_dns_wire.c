@@ -9,6 +9,7 @@
  *   dns_resp_min_ttl        upstream reply -> cache TTL (SOA walk)
  *   dns_rewrite_answer_ttls in-place TTL rewrite on a cached reply (stale)
  *   dns_decompress_name     CNAME-cloaking walk over answer RRs (#74)
+ *   dns_qname_wire_len/_eq  forward-cache name key (collision guard)
  *
  * The packet is copied into an exact-size heap buffer so any read or write
  * one byte past `len` is an ASan report, not silently absorbed by the
@@ -43,6 +44,15 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
         /* a small output buffer must fail or truncate, never overflow */
         char small[16]; size_t sl = 0;
         (void)dns_extract_qname(pkt, len, 12, small, sizeof(small), &sl);
+        /* the forward cache's name key must span exactly the parsed QNAME */
+        int wl = dns_qname_wire_len(pkt, len, 12);
+        assert(wl == qend - 12 - 4 && wl <= DNS_QNAME_WIRE_MAX);
+        assert(dns_qname_wire_eq(pkt + 12, pkt + 12, wl));
+    }
+    /* ...and never read out of bounds on anything, parseable or not */
+    for (int start = 0; start < len; start++) {
+        int wl = dns_qname_wire_len(pkt, len, start);
+        assert(wl < 0 || (wl >= 2 && start + wl <= len && wl <= DNS_QNAME_WIRE_MAX));
     }
 
     /* 2. TTL extraction as done on every upstream reply */

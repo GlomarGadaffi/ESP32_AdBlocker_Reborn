@@ -31,7 +31,28 @@ firmware's `esp_app_desc` version string comes from `version.txt`.
   the prefix still had to match a live session, but not the "exactly" the
   code promised. Now strict. Found by the new web-parser fuzz target.
 
+- **Forward-cache entries could answer for a different name.** The cache
+  (and the upstream single-flight table) matched on a 32-bit murmur3 hash of
+  the name plus qtype, with a fixed public seed and no name check, so a name
+  whose hash collides with another's was served that name's cached answer —
+  or, stored first, displaced it. Colliding names are cheap to compute for
+  that hash, and any page a LAN client loads can trigger lookups, so a
+  chosen domain could be made to fail LAN-wide for up to the cache TTL. A
+  cache hit now also requires the exact question name (compared in wire
+  form, case-insensitively, including on the L2 fast path); in-flight
+  matching (reply acceptance, joins, refresh suppression) additionally
+  requires a second hash under a per-boot secret seed. The SD warm-boot
+  snapshot format is unchanged.
+
 ### Fixed
+
+- **CI: the T-ETH-Elite build never built.** Plain `sdkconfig.defaults` sets
+  no target, so IDF defaulted to `esp32` and tried to sign the RSA-3072 key
+  with the ECDSA-only V1 scheme. CI now passes `-DIDF_TARGET=esp32s3` for
+  every board. Also: `tests/verdict_test.c` now runs in CI, and firmware
+  artifacts (signed with a throwaway per-run key — a board flashed with one
+  cannot take an official release over the air) are named accordingly and
+  kept for 7 days.
 
 - **Scrub 0x20 case pattern from upstream replies without corrupting compression pointers.**
   Replies now fold the question and answer owner names back to lowercase before

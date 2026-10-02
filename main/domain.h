@@ -35,6 +35,28 @@ int dns_extract_qname(const uint8_t *pkt, int pkt_len, int offset,
                       char *name_out, size_t name_cap, size_t *name_len_out);
 
 /*
+ * Wire length (label bytes + the root byte) of the uncompressed QNAME at
+ * pkt[offset], or -1 if malformed. Same label/bounds rules as
+ * dns_extract_qname(); for any name that function accepts, this equals its
+ * return value minus offset minus 4 (QTYPE+QCLASS). Never more than
+ * DNS_QNAME_WIRE_MAX.
+ */
+#define DNS_QNAME_WIRE_MAX 257   /* dns_extract_qname's 255-char dotted ceiling
+                                    (4 x 63-byte labels) + 1 length byte per label
+                                    - 3 dots + the root byte. Looser than RFC 1035's
+                                    255 on purpose: it must agree with the parser. */
+int dns_qname_wire_len(const uint8_t *pkt, int pkt_len, int offset);
+
+/*
+ * Case-insensitive compare of two uncompressed wire QNAMEs of the same
+ * length n (ASCII letters only fold; label-length bytes are <= 0x3F and so
+ * compare exactly). The forward cache's collision guard: the (hash, qtype)
+ * key only picks the set, and a hit additionally has to be this exact name.
+ * IRAM_ATTR on the definition only, like dns_extract_qname (L2 fast path).
+ */
+bool dns_qname_wire_eq(const uint8_t *a, const uint8_t *b, int n);
+
+/*
  * Return true if name is a bare TLD (single label with no dots) that we
  * should not block even if it appears in the blocklist.
  */
