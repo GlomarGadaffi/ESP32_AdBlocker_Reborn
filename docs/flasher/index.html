@@ -6,50 +6,71 @@
 <title>Flash ESP32 AdBlocker Reborn</title>
 <meta name="description" content="Flash the ESP32 AdBlocker Reborn DNS sinkhole firmware to your board straight from the browser over USB.">
 <style>
+/* Switchboard design system for flasher */
 :root {
   color-scheme: light dark;
-
-  --bg: #f6f7f9;
+  --bg: #fefefe;
   --surface: #ffffff;
-  --surface-2: #f0f2f5;
-  --border: #d8dce3;
-  --border-strong: #b9c0cb;
-  --text: #14181f;
-  --text-dim: #5a6472;
-  --accent: #1f6feb;
+  --surface-2: #f4f4f4;
+  --face: #f4f4f4;
+  --face-raised: #f0f0f0;
+  --border: #ddd;
+  --border-strong: #bbb;
+  --text: #454545;
+  --text-dim: #777;
+  --accent: #07a;
   --accent-text: #ffffff;
-  --accent-dim: #e7f0ff;
+  --accent-dim: #eef6fa;
   --ok: #1a7f37;
   --ok-bg: #e6f4ea;
   --warn: #9a6700;
   --warn-bg: #fff8e1;
-  --err: #cf222e;
+  --err: #c0392b;
   --err-bg: #ffebe9;
-  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
-  --radius: 10px;
-  --shadow: 0 1px 2px rgba(16, 22, 30, .06), 0 4px 12px rgba(16, 22, 30, .05);
+  --mono: ui-monospace, "SF Mono", "Cascadia Code", Consolas, "Liberation Mono", monospace;
+  --sans: "Open Sans", Arial, sans-serif;
+  --radius: 3px;
+  --shadow: 0 1px 3px rgba(0, 0, 0, .08);
 }
 
-@media (prefers-color-scheme: dark) {
-  :root:not([data-theme="light"]) {
-    --bg: #0d1117;
-    --surface: #161b22;
-    --surface-2: #1c232c;
-    --border: #2d353f;
-    --border-strong: #3d4650;
-    --text: #e6edf3;
-    --text-dim: #9aa4b2;
-    --accent: #4493f8;
-    --accent-text: #08121f;
-    --accent-dim: #172a45;
-    --ok: #5fd377;
-    --ok-bg: #12261a;
-    --warn: #e3b341;
-    --warn-bg: #2b2312;
-    --err: #ff7b72;
-    --err-bg: #2d1615;
-    --shadow: 0 1px 2px rgba(0, 0, 0, .4), 0 4px 14px rgba(0, 0, 0, .3);
-  }
+html.inverted {
+  --bg: #000000;
+  --surface: #111111;
+  --surface-2: #181818;
+  --face: #111111;
+  --face-raised: #1c1c1c;
+  --border: #333333;
+  --border-strong: #555555;
+  --text: #d9d9d9;
+  --text-dim: #999999;
+  --accent: #00a2e7;
+  --accent-text: #000000;
+  --accent-dim: #0c202a;
+  --ok: #5fd377;
+  --ok-bg: #12261a;
+  --warn: #e3b341;
+  --warn-bg: #2b2312;
+  --err: #d24637;
+  --err-bg: #2d1615;
+  --shadow: 0 1px 4px rgba(0, 0, 0, .6);
+}
+
+html.contrast {
+  --border: #bbb;
+  --border-strong: #888;
+  --text: #050505;
+  --text-dim: #333;
+  --accent: #03f;
+  --accent-text: #fff;
+}
+
+html.inverted.contrast {
+  --border: #666;
+  --border-strong: #aaa;
+  --text: #ffffff;
+  --text-dim: #cccccc;
+  --accent: #44c7ff;
+  --accent-text: #000;
 }
 
 * { box-sizing: border-box; }
@@ -58,18 +79,53 @@ body {
   margin: 0;
   background: var(--bg);
   color: var(--text);
-  font: 16px/1.55 system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  font: 15px/1.55 var(--sans);
   -webkit-text-size-adjust: 100%;
 }
 
 .wrap { max-width: 780px; margin: 0 auto; padding: 24px 16px 72px; }
 
 header { margin-bottom: 24px; }
-h1 { font-size: clamp(1.5rem, 4vw, 2rem); line-height: 1.2; margin: 0 0 6px; letter-spacing: -.02em; }
-.sub { color: var(--text-dim); margin: 0; }
+h1 {
+  font-family: var(--mono);
+  font-weight: 700;
+  font-size: clamp(1.4rem, 3.5vw, 1.85rem);
+  letter-spacing: .12em;
+  text-transform: uppercase;
+  color: var(--text);
+  line-height: 1.2;
+  margin: 0 0 6px;
+}
+h1 .dot { font-style: normal; color: var(--text-dim); }
+.sub { color: var(--text-dim); margin: 0; font-style: italic; }
 
-h2 { font-size: 1.05rem; margin: 0 0 4px; letter-spacing: -.01em; }
-h3 { font-size: .9rem; margin: 0 0 8px; text-transform: uppercase; letter-spacing: .06em; color: var(--text-dim); }
+h2 {
+  font-family: var(--mono);
+  font-weight: 600;
+  font-size: .92rem;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  color: var(--text);
+  margin: 0 0 4px;
+}
+h3 {
+  font-family: var(--mono);
+  font-size: .78rem;
+  margin: 0 0 8px;
+  text-transform: uppercase;
+  letter-spacing: .08em;
+  color: var(--text-dim);
+}
+
+nav.fn {
+  font-family: var(--mono);
+  font-size: .8rem;
+  letter-spacing: .04em;
+  margin-bottom: 1.2em;
+  color: var(--text-dim);
+}
+nav.fn a { color: var(--accent); text-decoration: none; border-bottom: 1px dotted var(--border-strong); }
+nav.fn a:hover { color: var(--text); border-bottom-style: solid; }
 
 .card {
   background: var(--surface);
@@ -85,11 +141,12 @@ h3 { font-size: .9rem; margin: 0 0 8px; text-transform: uppercase; letter-spacin
 .step-num {
   flex: none;
   width: 26px; height: 26px;
-  border-radius: 50%;
+  border-radius: 2px;
   background: var(--surface-2);
   border: 1px solid var(--border);
   color: var(--text-dim);
-  font-size: .82rem; font-weight: 600;
+  font-family: var(--mono);
+  font-size: .82rem; font-weight: 700;
   display: grid; place-items: center;
   align-self: center;
 }
@@ -102,23 +159,24 @@ h3 { font-size: .9rem; margin: 0 0 8px; text-transform: uppercase; letter-spacin
 .card[aria-disabled="true"] button { pointer-events: none; }
 
 p { margin: 0 0 12px; }
-.muted { color: var(--text-dim); font-size: .9rem; }
-code, kbd { font-family: var(--mono); font-size: .875em; background: var(--surface-2); padding: .12em .38em; border-radius: 4px; }
-a { color: var(--accent); }
+.muted { color: var(--text-dim); font-size: .88rem; }
+code, kbd { font-family: var(--mono); font-size: .875em; background: var(--surface-2); padding: .12em .38em; border-radius: 2px; border: 1px solid var(--border); }
+a { color: var(--accent); text-underline-offset: .15em; }
 
 button {
-  font: inherit;
-  font-weight: 550;
-  padding: 9px 16px;
-  border-radius: 8px;
+  font-family: var(--mono);
+  font-size: .82rem;
+  letter-spacing: .06em;
+  text-transform: uppercase;
+  padding: 8px 14px;
+  border-radius: 2px;
   border: 1px solid var(--border-strong);
   background: var(--surface-2);
   color: var(--text);
   cursor: pointer;
-  transition: filter .12s ease;
+  transition: border-color .12s ease;
 }
-button:hover:not(:disabled) { filter: brightness(1.06); }
-button:active:not(:disabled) { filter: brightness(.94); }
+button:hover:not(:disabled) { border-color: var(--text-dim); }
 button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 button:disabled { opacity: .5; cursor: not-allowed; }
 button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-text); }
@@ -127,9 +185,9 @@ button.danger { border-color: var(--err); color: var(--err); }
 .row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
 
 /* Chip / version facts */
-dl.facts { display: grid; grid-template-columns: auto 1fr; gap: 6px 16px; margin: 0; font-size: .92rem; }
-dl.facts dt { color: var(--text-dim); }
-dl.facts dd { margin: 0; font-family: var(--mono); font-size: .86rem; word-break: break-all; }
+dl.facts { display: grid; grid-template-columns: auto 1fr; gap: 6px 16px; margin: 0; font-size: .88rem; }
+dl.facts dt { color: var(--text-dim); font-family: var(--mono); font-size: .8rem; text-transform: uppercase; }
+dl.facts dd { margin: 0; font-family: var(--mono); font-size: .85rem; word-break: break-all; }
 
 /* Board picker */
 .boards { display: grid; gap: 10px; grid-template-columns: 1fr; margin-bottom: 12px; }
@@ -146,16 +204,18 @@ dl.facts dd { margin: 0; font-family: var(--mono); font-size: .86rem; word-break
 .board:has(input:checked) { border-color: var(--accent); background: var(--accent-dim); }
 .board:has(input:focus-visible) { outline: 2px solid var(--accent); outline-offset: 2px; }
 .board input { position: absolute; opacity: 0; pointer-events: none; }
-.board svg { display: block; width: 100%; height: auto; border-radius: 6px; margin-bottom: 10px; }
-.board .bname { font-weight: 600; display: block; }
-.board .bdesc { color: var(--text-dim); font-size: .86rem; }
+.board svg { display: block; width: 100%; height: auto; border-radius: 2px; margin-bottom: 10px; border: 1px solid var(--border); }
+.board .bname { font-family: var(--mono); font-weight: 600; display: block; font-size: .9rem; }
+.board .bdesc { color: var(--text-dim); font-size: .84rem; margin-top: 3px; }
 .badge {
   display: inline-block;
-  font-size: .72rem; font-weight: 600;
-  text-transform: uppercase; letter-spacing: .05em;
-  padding: 2px 7px; border-radius: 20px;
+  font-family: var(--mono);
+  font-size: .7rem; font-weight: 600;
+  text-transform: uppercase; letter-spacing: .06em;
+  padding: 2px 6px; border-radius: 2px;
   background: var(--ok-bg); color: var(--ok);
-  vertical-align: 2px; margin-left: 6px;
+  border: 1px solid var(--ok);
+  vertical-align: 1px; margin-left: 6px;
 }
 
 /* Mode picker */
@@ -171,16 +231,16 @@ dl.facts dd { margin: 0; font-family: var(--mono); font-size: .86rem; word-break
 .mode:has(input:checked) { border-color: var(--accent); background: var(--accent-dim); }
 .mode:has(input:focus-visible) { outline: 2px solid var(--accent); outline-offset: 2px; }
 .mode input { position: absolute; opacity: 0; pointer-events: none; }
-.mode .mname { font-weight: 600; }
-.mode .mdesc { color: var(--text-dim); font-size: .88rem; }
+.mode .mname { font-family: var(--mono); font-weight: 600; font-size: .9rem; }
+.mode .mdesc { color: var(--text-dim); font-size: .85rem; margin-top: 3px; }
 
 /* Progress */
 .parts { display: grid; gap: 8px; margin: 14px 0; }
 .part { font-size: .88rem; }
 .part-top { display: flex; justify-content: space-between; gap: 12px; margin-bottom: 3px; }
 .part-name { font-family: var(--mono); font-size: .82rem; }
-.part-pct { color: var(--text-dim); font-variant-numeric: tabular-nums; }
-.bar { height: 6px; border-radius: 3px; background: var(--surface-2); overflow: hidden; border: 1px solid var(--border); }
+.part-pct { font-family: var(--mono); color: var(--text-dim); font-variant-numeric: tabular-nums; }
+.bar { height: 6px; border-radius: 2px; background: var(--surface-2); overflow: hidden; border: 1px solid var(--border); }
 .bar > i { display: block; height: 100%; width: 0; background: var(--accent); transition: width .15s linear; }
 .part[data-done="1"] .bar > i { background: var(--ok); }
 
@@ -191,7 +251,8 @@ dl.facts dd { margin: 0; font-family: var(--mono); font-size: .86rem; word-break
   line-height: 1.5;
   background: var(--surface-2);
   border: 1px solid var(--border);
-  border-radius: 8px;
+  border-left: 3px solid var(--border-strong);
+  border-radius: 2px;
   padding: 10px 12px;
   max-height: 260px;
   overflow: auto;
@@ -205,7 +266,7 @@ dl.facts dd { margin: 0; font-family: var(--mono); font-size: .86rem; word-break
 .log .k { color: var(--ok); }
 
 /* Notices */
-.notice { border-radius: 8px; padding: 11px 13px; margin-bottom: 12px; font-size: .92rem; border: 1px solid; }
+.notice { border-radius: 2px; padding: 11px 13px; margin-bottom: 12px; font-size: .9rem; border: 1px solid; }
 .notice > :last-child { margin-bottom: 0; }
 .notice.info { background: var(--accent-dim); border-color: var(--accent); }
 .notice.warn { background: var(--warn-bg); border-color: var(--warn); }
@@ -213,13 +274,13 @@ dl.facts dd { margin: 0; font-family: var(--mono); font-size: .86rem; word-break
 .notice.ok   { background: var(--ok-bg);   border-color: var(--ok); }
 
 details { border-top: 1px solid var(--border); padding-top: 12px; margin-top: 14px; }
-details summary { cursor: pointer; font-weight: 550; font-size: .92rem; }
+details summary { cursor: pointer; font-family: var(--mono); font-weight: 600; font-size: .88rem; }
 details[open] summary { margin-bottom: 10px; }
 
-input[type="file"] { font: inherit; font-size: .88rem; max-width: 100%; }
+input[type="file"] { font-family: var(--mono); font-size: .84rem; max-width: 100%; }
 input[type="text"] {
-  font: inherit; font-family: var(--mono); font-size: .88rem;
-  padding: 7px 9px; border-radius: 7px;
+  font-family: var(--mono); font-size: .85rem;
+  padding: 6px 8px; border-radius: 2px;
   border: 1px solid var(--border-strong);
   background: var(--surface); color: var(--text);
   width: 8em;
@@ -229,7 +290,35 @@ input[type="text"] {
 
 .local-part { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-bottom: 10px; }
 
-footer { color: var(--text-dim); font-size: .86rem; text-align: center; margin-top: 32px; }
+footer {
+  font-family: var(--mono);
+  color: var(--text-dim);
+  font-size: .82rem;
+  text-align: center;
+  margin-top: 36px;
+  padding-top: 1em;
+  border-top: 1px solid var(--border);
+}
+
+button.ci {
+  cursor: pointer;
+  position: fixed;
+  right: 10px;
+  font-family: var(--mono);
+  font-size: .7em;
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  color: var(--text);
+  background: var(--face-raised);
+  border: 1px solid var(--border);
+  border-radius: 2px;
+  padding: 4px 8px;
+  z-index: 100;
+}
+button.ci:hover { border-color: var(--text-dim); }
+#contrast { top: 10px; }
+#invmode { top: 40px; }
+@media screen and (max-width:1080px) { button.ci { position: absolute; } }
 
 @media (prefers-reduced-motion: reduce) {
   * { transition: none !important; }
@@ -237,11 +326,15 @@ footer { color: var(--text-dim); font-size: .86rem; text-align: center; margin-t
 </style>
 </head>
 <body>
+<button class="ci" id="contrast" type="button">Contrast</button>
+<button class="ci" id="invmode" type="button">Invert</button>
+
 <div class="wrap">
 
 <header>
-  <h1>Flash ESP32 AdBlocker Reborn</h1>
-  <p class="sub">Install the DNS sinkhole firmware over USB, straight from this page — no toolchain, no downloads.</p>
+  <nav class="fn"><a href="../">&larr; Switchboard Overview</a> &middot; <a href="../#how">How it works</a> &middot; <a href="../#hardware">Hardware</a> &middot; <a href="../#security">Security</a> &middot; <a href="https://github.com/GlomarGadaffi/ESP32_AdBlocker_Reborn">Source</a></nav>
+  <h1>flash esp32<i class="dot">&middot;</i>adblocker<i class="dot">&middot;</i>reborn</h1>
+  <p class="sub">Install the DNS sinkhole firmware onto your board over USB, straight from this page &mdash; no toolchain, no downloads.</p>
 </header>
 
 <!-- Unsupported browser gate -->
@@ -1159,6 +1252,16 @@ if (checkSupport()) {
 
   log("Ready. Connect your board to begin.");
 }
+
+(function(){
+ var h=document.documentElement;
+ function load(k){try{return localStorage.getItem(k)==="1"}catch(e){return false}}
+ function save(k,v){try{localStorage.setItem(k,v?"1":"0")}catch(e){}}
+ [["contrast","pd-contrast"],["inverted","pd-inverted"]].forEach(function(p){if(load(p[1]))h.classList.add(p[0])});
+ var cBtn=document.getElementById("contrast"), iBtn=document.getElementById("invmode");
+ if(cBtn)cBtn.onclick=function(){save("pd-contrast",h.classList.toggle("contrast"))};
+ if(iBtn)iBtn.onclick=function(){save("pd-inverted",h.classList.toggle("inverted"))};
+})();
 </script>
 </body>
 </html>

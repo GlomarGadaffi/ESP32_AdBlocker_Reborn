@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>SIMD Acceleration & Memory Bottleneck Study: ESP32 AdBlocker Reborn</title>
+<link rel="stylesheet" href="doc.css">
+</head>
+<body>
+<button class="ci" id="contrast" type="button">Contrast</button>
+<button class="ci" id="invmode" type="button">Invert</button>
+
+<nav><a href="index.html">&larr; Overview</a> &middot; <a href="flasher/">Flash a board</a> &middot; <a href="http-api.html">HTTP API</a> &middot; <a href="blocklist-format.html">Blocklist Format</a> &middot; <a href="https://github.com/GlomarGadaffi/ESP32_AdBlocker_Reborn">Source</a></nav>
+
+<h1>esp32<i class="dot">&middot;</i>adblocker<i class="dot">&middot;</i>reborn<span>simd &amp; memory study</span></h1>
+<p class="st">Empirical analysis of the Xtensa LX7 vector unit (PIE) vs. Octal PSRAM memory bus constraints.</p>
+
+<h2>Executive Summary</h2>
+<blockquote>
+<p><b>Question asked:</b> Can the ESP32-S3 vector extensions (Xtensa LX7 128-bit SIMD instructions) meaningfully accelerate the DNS blocklist lookup and merge pipeline?</p>
+<p><b>Finding: No.</b> Every kernel touching the large domain arrays is strictly bound by Octal PSRAM bus bandwidth, not ALU execution width. Benchmarks demonstrate that 128-bit SIMD loads from PSRAM measure identically to scalar 32-bit loads. A wider ALU cannot accelerate a kernel stalled on external memory buses.</p>
+</blockquote>
+
+<h2>Benchmark: Throughput by Load Width (OCT PSRAM vs. IRAM)</h2>
+<p>Empirical throughput in MB/s on ESP32-S3 at 240 MHz CPU, 32 KB DCache, tested across memory domains:</p>
+
+<table>
+<thead><tr><th>Load / Copy Method</th><th>IRAM &rarr; IRAM</th><th>PSRAM &rarr; IRAM</th><th>PSRAM &rarr; PSRAM</th></tr></thead>
+<tbody>
+<tr><td>8-bit scalar loop</td><td>45.8 MB/s</td><td>29.4 MB/s</td><td>19.5 MB/s</td></tr>
+<tr><td>32-bit scalar loop</td><td>228.9 MB/s</td><td><b>58.1 MB/s</b></td><td>21.2 MB/s</td></tr>
+<tr><td>64-bit scalar loop</td><td>305.1 MB/s</td><td>56.8 MB/s</td><td>21.2 MB/s</td></tr>
+<tr><td>Standard libc <code>memcpy</code></td><td>366.0 MB/s</td><td>56.8 MB/s</td><td>21.2 MB/s</td></tr>
+<tr><td><b>PIE 128-bit SIMD (16 B/iter)</b></td><td>1,207.6 MB/s</td><td><b>58.1 MB/s</b></td><td>21.1 MB/s</td></tr>
+<tr><td><b>PIE 128-bit SIMD (32 B/iter)</b></td><td><b>1,829.8 MB/s</b></td><td><b>58.1 MB/s</b></td><td>21.1 MB/s</td></tr>
+<tr><td>Espressif <code>dsps_memcpy_aes3</code></td><td>1,444.9 MB/s</td><td>57.6 MB/s</td><td>21.0 MB/s</td></tr>
+</tbody>
+</table>
+
+<p><b>Observation:</b> Inside internal SRAM/IRAM, 128-bit SIMD provides a massive <b>5&times; speedup</b> (366 &rarr; 1,830 MB/s). But when reading from external PSRAM, scalar 32-bit, libc, and 128-bit SIMD all plateau between <b>56.8 and 58.1 MB/s</b>. Quadrupling load width yields zero throughput increase once data resides behind the MSPI cache.</p>
+
+<h2>Memory Cost Model</h2>
+<p>Measurements show that a single 32-byte cache line miss from PSRAM consumes:</p>
+<ul>
+  <li><b>126 CPU cycles</b> per random read miss at 80 MHz Octal DDR (~252 cycles at 40 MHz).</li>
+  <li><b>224 CPU cycles</b> per write-allocate miss (read line + writeback).</li>
+  <li>GDMA (<code>esp_async_memcpy</code>) cannot rescue the bottleneck: hardware arbitration yields lower throughput than CPU loops for PSRAM &rarr; IRAM transfers.</li>
+</ul>
+
+<h2>True Architectural Optimizations</h2>
+<p>Because ALU widening does not address the bus bottleneck, performance was maximized through memory reduction:</p>
+<ol>
+  <li><b>Bucket-Split Indexing:</b> Shrunk entries from 4 bytes to 3 bytes, reducing total PSRAM footprint to fit 800,000+ domains into ~2.6 MB.</li>
+  <li><b>L2 Fast Path:</b> Bypasses lwIP and socket layers entirely, saving ~40 &mu;s of kernel stack overhead.</li>
+  <li><b>Direct Suffix Walks:</b> Early-exit termination on bare TLDs (e.g. <code>.com</code>) eliminating redundant binary search probes.</li>
+</ol>
+
+<footer>
+<p>ESP32 AdBlocker Reborn Documentation &middot; MIT License</p>
+</footer>
+
+<script>
+(function(){
+ var h=document.documentElement;
+ function load(k){try{return localStorage.getItem(k)==="1"}catch(e){return false}}
+ function save(k,v){try{localStorage.setItem(k,v?"1":"0")}catch(e){}}
+ [["contrast","pd-contrast"],["inverted","pd-inverted"]].forEach(function(p){if(load(p[1]))h.classList.add(p[0])});
+ var c=document.getElementById("contrast"), i=document.getElementById("invmode");
+ if(c)c.onclick=function(){save("pd-contrast",h.classList.toggle("contrast"))};
+ if(i)i.onclick=function(){save("pd-inverted",h.classList.toggle("inverted"))};
+})();
+</script>
+</body>
+</html>

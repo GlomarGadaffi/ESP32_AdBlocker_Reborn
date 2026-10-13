@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>HTTP API Reference: ESP32 AdBlocker Reborn</title>
+<link rel="stylesheet" href="doc.css">
+</head>
+<body>
+<button class="ci" id="contrast" type="button">Contrast</button>
+<button class="ci" id="invmode" type="button">Invert</button>
+
+<nav><a href="index.html">&larr; Overview</a> &middot; <a href="flasher/">Flash a board</a> &middot; <a href="blocklist-format.html">Blocklist Format</a> &middot; <a href="simd-acceleration-notes.html">SIMD &amp; Memory Notes</a> &middot; <a href="https://github.com/GlomarGadaffi/ESP32_AdBlocker_Reborn">Source</a></nav>
+
+<h1>esp32<i class="dot">&middot;</i>adblocker<i class="dot">&middot;</i>reborn<span>http api reference</span></h1>
+<p class="st">HTTPS control plane, REST endpoints, real-time telemetry, and JSON metrics schemas.</p>
+
+<h2>Overview &amp; Security Pipeline</h2>
+<p>Every route below is served by the HTTPS server in <code>main/web_ui.cpp</code> on <b>port 443</b> (using an ECDSA P-256 certificate generated at first boot; plain HTTP port 80 only issues 301 redirects to HTTPS). Every request passes through <code>auth_wrap</code>, which enforces:</p>
+<ol>
+  <li><b>Setup gate:</b> While no admin account exists, all GET requests redirect to <code>/setup</code> and all POST requests receive 403 Forbidden (except <code>/setup</code> itself).</li>
+  <li><b>Session gate:</b> Unauthenticated requests without a valid <code>sid</code> cookie receive a 303 redirect to <code>/login</code> on GET, or 401 Unauthorized on POST.</li>
+  <li><b>Security headers:</b> <code>Cache-Control: no-store</code>, <code>X-Content-Type-Options: nosniff</code>, <code>X-Frame-Options: DENY</code>, <code>Referrer-Policy: same-origin</code>, and strict Content-Security-Policy.</li>
+  <li><b>CSRF validation:</b> All mutating POST routes require both a matching Origin/Referer and the session's CSRF token passed either as <code>?csrf=&lt;token&gt;</code> in the query string or via the <code>X-CSRF: &lt;token&gt;</code> request header.</li>
+</ol>
+<p><b>CLI Scripting:</b> Authenticate via curl, grab the CSRF token, and interact with the endpoints:</p>
+<pre><code>curl -k -c cookies.txt -X POST -d 'user=admin&amp;pass=secret' https://esp32adblock.local/login
+TOKEN=$(curl -k -b cookies.txt https://esp32adblock.local/ | grep -o "var CSRF='[^']*'" | cut -d"'" -f2)
+curl -k -b cookies.txt -H "X-CSRF: $TOKEN" -X POST https://esp32adblock.local/reload</code></pre>
+
+<h2>Endpoint Matrix</h2>
+<table>
+<thead><tr><th>Method</th><th>Path</th><th>Description</th></tr></thead>
+<tbody>
+<tr><td><code>GET</code></td><td><code>/setup</code></td><td>First-boot setup wizard: certificate fingerprint and admin credentials creation.</td></tr>
+<tr><td><code>POST</code></td><td><code>/setup</code></td><td>Create the initial admin account (opens session, redirects to <code>/setup/network</code>).</td></tr>
+<tr><td><code>GET</code></td><td><code>/setup/network</code></td><td>First-boot network setup: Ethernet DHCP/Static and Wi-Fi scan/join.</td></tr>
+<tr><td><code>GET</code></td><td><code>/login</code></td><td>Admin authentication sign-in form.</td></tr>
+<tr><td><code>POST</code></td><td><code>/login</code></td><td>Verify credentials and issue <code>sid</code> session cookie. 5 failures trigger a 60s lockout.</td></tr>
+<tr><td><code>POST</code></td><td><code>/logout</code></td><td>Destroy active session and invalidate cookie.</td></tr>
+<tr><td><code>GET</code></td><td><code>/</code></td><td>Main switchboard status dashboard. Polls <code>/metrics</code> every 10s without full page reload.</td></tr>
+<tr><td><code>GET</code></td><td><code>/metrics</code></td><td>Raw JSON telemetry, counter states, and latency histograms.</td></tr>
+<tr><td><code>GET</code></td><td><code>/metrics/view</code></td><td>Rendered HTML dashboard covering all metrics with auto-refresh.</td></tr>
+<tr><td><code>POST</code></td><td><code>/metrics/reset</code></td><td>Reset volatile counters and histograms to zero.</td></tr>
+<tr><td><code>POST</code></td><td><code>/reload</code></td><td>Trigger immediate asynchronous blocklist re-download and index rebuild.</td></tr>
+<tr><td><code>POST</code></td><td><code>/blocklist/stop</code></td><td>Abort in-progress blocklist download; previous list remains active.</td></tr>
+<tr><td><code>POST</code></td><td><code>/pause</code></td><td>Set persistent global sinkhole pause (<code>on=1</code> allows all traffic, <code>on=0</code> resumes).</td></tr>
+<tr><td><code>POST</code></td><td><code>/pause/timed</code></td><td>Suspend blocking for <code>min</code> minutes (1–1440) for <code>scope=me</code>, <code>scope=host</code>, or <code>scope=all</code>.</td></tr>
+<tr><td><code>POST</code></td><td><code>/pause/resume</code></td><td>End an active timed pause early (<code>ip=&lt;IPv4&gt;</code>, <code>ip=all</code>, or <code>ip=every</code>).</td></tr>
+<tr><td><code>POST</code></td><td><code>/check</code></td><td>Test domain against live engine: reports <code>BLOCKED</code>, <code>ALLOWED</code>, or <code>REWRITE &rarr; ip</code>.</td></tr>
+<tr><td><code>POST</code></td><td><code>/whitelist/add</code></td><td>Add a domain to the whitelist (takes effect on the next query).</td></tr>
+<tr><td><code>POST</code></td><td><code>/whitelist/remove</code></td><td>Remove a domain from the whitelist.</td></tr>
+<tr><td><code>POST</code></td><td><code>/rewrite/set</code></td><td>Define local LAN static rewrite (e.g., <code>printer &rarr; 192.168.1.50</code>, up to 48 rules).</td></tr>
+<tr><td><code>POST</code></td><td><code>/rewrite/clear</code></td><td>Remove a specific local LAN rewrite entry.</td></tr>
+<tr><td><code>GET</code></td><td><code>/log</code></td><td>Recent query log buffer (512-entry ring buffer with UTC timestamps).</td></tr>
+<tr><td><code>GET</code></td><td><code>/census</code></td><td>Passive L2 wire census: tracks clients seen via ARP, DHCP, and DNS.</td></tr>
+<tr><td><code>GET</code></td><td><code>/top</code></td><td>Top queried/blocked domains and clients with 60-bucket history bar chart.</td></tr>
+<tr><td><code>POST</code></td><td><code>/acl/add</code></td><td>Add client IPv4 address to Access Control List.</td></tr>
+<tr><td><code>POST</code></td><td><code>/acl/remove</code></td><td>Remove client from ACL.</td></tr>
+<tr><td><code>POST</code></td><td><code>/acl/clear</code></td><td>Clear ACL (empty ACL allows all LAN clients).</td></tr>
+<tr><td><code>POST</code></td><td><code>/bypass/add</code></td><td>Add client IP to standing bypass list (resolves unfiltered, never cached).</td></tr>
+<tr><td><code>POST</code></td><td><code>/dot/set</code></td><td>Configure DNS-over-TLS upstream server address and SNI hostname.</td></tr>
+<tr><td><code>POST</code></td><td><code>/ota/update</code></td><td>Upload binary firmware image. Requires valid RSA-3072 signature.</td></tr>
+<tr><td><code>POST</code></td><td><code>/reboot</code></td><td>Trigger hardware microcontroller reboot.</td></tr>
+</tbody>
+</table>
+
+<h2>JSON Metrics (<code>GET /metrics</code>)</h2>
+<p>Returns a compact JSON telemetry document reflecting internal kernel state:</p>
+<table>
+<thead><tr><th>Field</th><th>Type</th><th>Description</th></tr></thead>
+<tbody>
+<tr><td><code>upstream</code></td><td>string</td><td>IP of currently selected upstream resolver.</td></tr>
+<tr><td><code>uptime_s</code></td><td>int</td><td>System uptime in seconds since boot.</td></tr>
+<tr><td><code>queries_total</code></td><td>int</td><td>Total DNS queries received on standard socket paths.</td></tr>
+<tr><td><code>blocked</code></td><td>int</td><td>Total queries sinkholed on socket path.</td></tr>
+<tr><td><code>forwarded</code></td><td>int</td><td>Total queries forwarded to upstream resolver.</td></tr>
+<tr><td><code>l2_blocked</code></td><td>int</td><td>Queries blocked directly in L2 Ethernet frame hook (~1.8ms path).</td></tr>
+<tr><td><code>l2_cached</code></td><td>int</td><td>Forward-cache hits served directly in L2 Ethernet frame hook.</td></tr>
+<tr><td><code>cache_hit_rate</code></td><td>float</td><td>Cache hit percentage (<code>cache_hits / cache_probes * 100</code>).</td></tr>
+<tr><td><code>blocklist_count</code></td><td>int</td><td>Total unique 40-bit domain hashes loaded in PSRAM.</td></tr>
+<tr><td><code>sd_status</code></td><td>string</td><td>MicroSD snapshot status (<code>loaded</code>, <code>saved</code>, <code>absent</code>, etc.).</td></tr>
+<tr><td><code>heap_free</code></td><td>int</td><td>Available internal SRAM bytes.</td></tr>
+<tr><td><code>psram_free</code></td><td>int</td><td>Available external PSRAM bytes.</td></tr>
+<tr><td><code>latency_us</code></td><td>object</td><td>Microsecond percentiles (p50, p99, max) for <code>blocked</code>, <code>cached</code>, and <code>forwarded</code>.</td></tr>
+</tbody>
+</table>
+
+<h2>Crash Flight Recorder (<code>GET /lastwords</code>)</h2>
+<p>Retrieves the RTC-persisted telemetry buffer recorded immediately before the previous system restart or crash:</p>
+<pre><code>{
+  "available": true,
+  "reset_reason": "sw",
+  "queries_total": 48219,
+  "heap_free_min": 182390,
+  "queries": [
+    { "domain": "ads.example.com", "qtype": 1, "blocked": true, "ts_s": 3812 }
+  ]
+}</code></pre>
+
+<footer>
+<p>ESP32 AdBlocker Reborn Documentation &middot; MIT License</p>
+</footer>
+
+<script>
+(function(){
+ var h=document.documentElement;
+ function load(k){try{return localStorage.getItem(k)==="1"}catch(e){return false}}
+ function save(k,v){try{localStorage.setItem(k,v?"1":"0")}catch(e){}}
+ [["contrast","pd-contrast"],["inverted","pd-inverted"]].forEach(function(p){if(load(p[1]))h.classList.add(p[0])});
+ var c=document.getElementById("contrast"), i=document.getElementById("invmode");
+ if(c)c.onclick=function(){save("pd-contrast",h.classList.toggle("contrast"))};
+ if(i)i.onclick=function(){save("pd-inverted",h.classList.toggle("inverted"))};
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Blocklist Storage Format: ESP32 AdBlocker Reborn</title>
+<link rel="stylesheet" href="doc.css">
+</head>
+<body>
+<button class="ci" id="contrast" type="button">Contrast</button>
+<button class="ci" id="invmode" type="button">Invert</button>
+
+<nav><a href="index.html">&larr; Overview</a> &middot; <a href="flasher/">Flash a board</a> &middot; <a href="http-api.html">HTTP API</a> &middot; <a href="simd-acceleration-notes.html">SIMD &amp; Memory Notes</a> &middot; <a href="https://github.com/GlomarGadaffi/ESP32_AdBlocker_Reborn">Source</a></nav>
+
+<h1>esp32<i class="dot">&middot;</i>adblocker<i class="dot">&middot;</i>reborn<span>blocklist storage format</span></h1>
+<p class="st">Bucket-split 40-bit hash table architecture for 800,000+ wildcard domain storage in PSRAM.</p>
+
+<h2>Why 40-Bit Bucket-Split?</h2>
+<p>To fit nearly a million domains onto an embedded microcontroller, domains are stored as hashes rather than variable-length strings. The challenge with hashing is false-positive collisions where a legitimate domain's hash collides with a blocked entry. By increasing discrimination from 32-bit to 40-bit bucket-split hashing, the false-positive probability is drastically eliminated while reducing RAM footprint:</p>
+
+<table>
+<thead><tr><th>Metric</th><th>32-bit Hash</th><th>40-bit Bucket-Split</th></tr></thead>
+<tbody>
+<tr><td>Per-probe False Positive Rate</td><td>1.8 &times; 10<sup>-4</sup></td><td><b>7.1 &times; 10<sup>-7</sup></b></td></tr>
+<tr><td>Per-query False Positive (4 suffixes)</td><td>~1 in 1,500</td><td><b>~1 in 350,000</b></td></tr>
+<tr><td>Memory per Entry</td><td>4 bytes</td><td><b>3 bytes</b> (+ 256 KB index)</td></tr>
+<tr><td>Probes per Suffix Lookup</td><td>~20 (binary search over n)</td><td><b>~4</b> (search within one bucket)</td></tr>
+</tbody>
+</table>
+
+<p>The bucket index carries the top 16 bits as array position rather than stored data, achieving higher discrimination with 25% fewer bytes per entry.</p>
+
+<h2>In-Memory Data Layout</h2>
+<pre><code>h40    = fmix64(fnv1a64(domain)) >> 24        40 bits total
+bucket = h40 >> 24                            16 bits -> index slot
+rem    = h40 &amp; 0xFFFFFF                       24 bits -> stored remainder (3 bytes BE)</code></pre>
+
+<p>The live in-memory table is stored as a <b>single contiguous allocation</b> in PSRAM, allowing an atomic pointer swap when a reload completes:</p>
+
+<pre><code>+---------------------------+
+| idx[65537] : uint32_t     |  262,148 bytes   idx[b]   = start offset of bucket b
+|                           |                  idx[b+1] = end offset of bucket b
++---------------------------+                  idx[65536] = total entry count
+| entries : 3 bytes each    |  3 * N bytes     big-endian 24-bit remainders,
+|                           |                  sorted ascending within each bucket
++---------------------------+</code></pre>
+
+<h2>Lookup Pipeline</h2>
+<p>When resolving a domain (e.g. <code>sub.ad.tracker.com</code>):</p>
+<ol>
+  <li>Compute 40-bit hash for the exact qname and its parent wildcards (e.g. <code>ad.tracker.com</code>, <code>tracker.com</code>).</li>
+  <li>Extract the 16-bit bucket number and read <code>idx[bucket]</code> and <code>idx[bucket+1]</code>.</li>
+  <li>Binary-search that bucket slice for the 3-byte remainder. Because average bucket occupancy is only ~12 entries, search terminates within ~4 probes, typically fitting within a single CPU cache line.</li>
+</ol>
+
+<h2>Snapshot Persistence</h2>
+<p>On boot, if a FAT32 MicroSD card is present with a valid snapshot, the pre-sorted binary image is streamed directly into PSRAM in <b>~21 seconds</b>, completely bypassing upstream feed downloads and sorting.</p>
+
+<footer>
+<p>ESP32 AdBlocker Reborn Documentation &middot; MIT License</p>
+</footer>
+
+<script>
+(function(){
+ var h=document.documentElement;
+ function load(k){try{return localStorage.getItem(k)==="1"}catch(e){return false}}
+ function save(k,v){try{localStorage.setItem(k,v?"1":"0")}catch(e){}}
+ [["contrast","pd-contrast"],["inverted","pd-inverted"]].forEach(function(p){if(load(p[1]))h.classList.add(p[0])});
+ var c=document.getElementById("contrast"), i=document.getElementById("invmode");
+ if(c)c.onclick=function(){save("pd-contrast",h.classList.toggle("contrast"))};
+ if(i)i.onclick=function(){save("pd-inverted",h.classList.toggle("inverted"))};
+})();
+</script>
+</body>
+</html>
