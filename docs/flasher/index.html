@@ -97,6 +97,15 @@ h1 {
   margin: 0 0 6px;
 }
 h1 .dot { font-style: normal; color: var(--text-dim); }
+h1 span {
+  display: inline-block;
+  font-size: .6em;
+  color: var(--text-dim);
+  font-weight: 400;
+  letter-spacing: .08em;
+  margin-left: 1em;
+  vertical-align: middle;
+}
 .sub { color: var(--text-dim); margin: 0; font-style: italic; }
 
 h2 {
@@ -332,8 +341,8 @@ button.ci:hover { border-color: var(--text-dim); }
 <div class="wrap">
 
 <header>
-  <nav class="fn"><a href="../">&larr; Switchboard Overview</a> &middot; <a href="../#how">How it works</a> &middot; <a href="../#hardware">Hardware</a> &middot; <a href="../#security">Security</a> &middot; <a href="https://github.com/GlomarGadaffi/ESP32_AdBlocker_Reborn">Source</a></nav>
-  <h1>flash esp32<i class="dot">&middot;</i>adblocker<i class="dot">&middot;</i>reborn</h1>
+  <nav class="fn"><a href="../index.html">&larr; Overview</a> &middot; <a href="../index.html#how">How it works</a> &middot; <a href="../index.html#quickstart">Quickstart</a> &middot; <a href="../index.html#features">Features</a> &middot; <a href="../index.html#hardware">Hardware</a> &middot; <a href="../index.html#security">Security</a> &middot; <a href="../http-api.html">HTTP API</a> &middot; <a href="https://github.com/GlomarGadaffi/ESP32_AdBlocker_Reborn">Source</a> &middot; <a href="https://github.com/GlomarGadaffi/ESP32_AdBlocker_Reborn/releases">Releases</a></nav>
+  <h1>flash esp32<i class="dot">&middot;</i>adblocker<i class="dot">&middot;</i>reborn<span>web flasher</span></h1>
   <p class="sub">Install the DNS sinkhole firmware onto your board over USB, straight from this page &mdash; no toolchain, no downloads.</p>
 </header>
 
@@ -342,7 +351,7 @@ button.ci:hover { border-color: var(--text-dim); }
   <p><strong>This browser can't talk to serial devices.</strong></p>
   <p>Flashing needs the <a href="https://developer.mozilla.org/docs/Web/API/Web_Serial_API" rel="noreferrer">Web Serial API</a>, which today only <strong>Chrome, Edge, and Opera on desktop</strong> support — Firefox, Safari, and all mobile browsers do not.</p>
   <p id="unsupported-why" class="muted"></p>
-  <p style="margin-bottom:0">Open this page in Chrome or Edge on a desktop, or flash from the command line with the <a href="https://github.com/GlomarGadaffi/ESP32_AdBlocker_Reborn#build-and-flash">esptool instructions in the README</a>.</p>
+  <p style="margin-bottom:0">Open this page in Chrome or Edge on a desktop, or flash from the command line with the <a href="https://github.com/GlomarGadaffi/ESP32_AdBlocker_Reborn#building-from-source">esptool instructions in the README</a>.</p>
 </div>
 
 <div id="app">
