@@ -9,7 +9,7 @@ on the page — flashing, metrics polling, rule edits, reloads.
 
 Library usage:
     from board_client import BoardClient
-    b = BoardClient("192.168.12.195", user="admin", password="...")
+    b = BoardClient("esp32adblock.local", user="admin", password="...")
     b.metrics()["blocklist_count"]
     b.check("doubleclick.net")
     b.custom_rules("@@||doubleclick.net^")
@@ -17,13 +17,13 @@ Library usage:
     b.flash("build-waveshare/dns-sink.bin", wait=True)
 
 CLI usage:
-    python board_client.py --host 192.168.12.195 metrics
-    python board_client.py --host 192.168.12.195 check doubleclick.net
-    python board_client.py --host 192.168.12.195 reload --wait
-    python board_client.py --host 192.168.12.195 flash build/dns-sink.bin --wait
-    python board_client.py --host 192.168.12.195 custom-rules "@@||doubleclick.net^"
-    python board_client.py --host 192.168.12.195 whitelist-add example.com
-    python board_client.py --host 192.168.12.195 get /log
+    python board_client.py --host esp32adblock.local metrics
+    python board_client.py --host esp32adblock.local check doubleclick.net
+    python board_client.py --host esp32adblock.local reload --wait
+    python board_client.py --host esp32adblock.local flash build/dns-sink.bin --wait
+    python board_client.py --host esp32adblock.local custom-rules "@@||doubleclick.net^"
+    python board_client.py --host esp32adblock.local whitelist-add example.com
+    python board_client.py --host esp32adblock.local get /log
 
 Credentials: --user/--password, or the BOARD_USER/BOARD_PASSWORD env vars.
 Never hardcode a board password in a script that calls this — pass it in.

@@ -18,7 +18,7 @@ static void test_form(void)
 {
     printf("form_field / url_decode\n");
     char v[32];
-    CHECK(web_form_field("user=admin&pass=I+like+tacos%21", "pass", v, sizeof v) && !strcmp(v, "I like tacos!"), "decode + and %%21: '%s'", v);
+    CHECK(web_form_field("user=admin&pass=Hello+world%21", "pass", v, sizeof v) && !strcmp(v, "Hello world!"), "decode + and %%21: '%s'", v);
     CHECK(!web_form_field("xpass=no", "pass", v, sizeof v) && v[0] == '\0', "prefix key must not match");
     CHECK(web_form_field("xpass=no&pass=", "pass", v, sizeof v) && v[0] == '\0', "present-but-empty is found");
     CHECK(!web_form_field("pass", "pass", v, sizeof v), "key without '=' is absent");
@@ -32,12 +32,12 @@ static void test_form(void)
 static void test_origin(void)
 {
     printf("origin_host_matches\n");
-    CHECK(web_origin_host_matches("https://192.168.12.195/login", "192.168.12.195"), "exact with path");
+    CHECK(web_origin_host_matches("https://192.0.2.1/login", "192.0.2.1"), "exact with path");
     CHECK(web_origin_host_matches("https://esp32adblock.local:443", "esp32adblock.local:443"), "port on both");
     CHECK(web_origin_host_matches("HTTPS://ESP32ADBLOCK.LOCAL", "esp32adblock.local"), "case-insensitive");
-    CHECK(!web_origin_host_matches("https://192.168.12.195.evil.com/", "192.168.12.195"), "host as prefix of evil host");
-    CHECK(!web_origin_host_matches("https://evil.com/192.168.12.195", "192.168.12.195"), "host in path");
-    CHECK(!web_origin_host_matches("null", "192.168.12.195"), "Origin: null");
+    CHECK(!web_origin_host_matches("https://192.0.2.1.evil.com/", "192.0.2.1"), "host as prefix of evil host");
+    CHECK(!web_origin_host_matches("https://evil.com/192.0.2.1", "192.0.2.1"), "host in path");
+    CHECK(!web_origin_host_matches("null", "192.0.2.1"), "Origin: null");
     CHECK(!web_origin_host_matches("https://a", ""), "empty Host never matches");
 }
 

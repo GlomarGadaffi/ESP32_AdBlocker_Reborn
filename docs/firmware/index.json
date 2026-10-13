@@ -1,61 +1,61 @@
 {
-  "latest": "1.4.0",
+  "latest": "1.5.0",
   "releases": [
     {
-      "version": "1.4.0",
-      "tag": "v1.4.0",
-      "date": "2026-09-10",
+      "version": "1.5.0",
+      "tag": "v1.5.0",
+      "date": "2026-10-13",
       "files": [
         {
-          "name": "generic-s3-wifi-1.4.0-app.bin",
-          "size": 1154432
+          "name": "generic-s3-wifi-1.5.0-app.bin",
+          "size": 1183744
         },
         {
-          "name": "generic-s3-wifi-1.4.0-bootloader.bin",
-          "size": 19904
+          "name": "generic-s3-wifi-1.5.0-bootloader.bin",
+          "size": 19968
         },
         {
-          "name": "generic-s3-wifi-1.4.0-ota_data_initial.bin",
+          "name": "generic-s3-wifi-1.5.0-ota_data_initial.bin",
           "size": 8192
         },
         {
-          "name": "generic-s3-wifi-1.4.0-partition-table.bin",
+          "name": "generic-s3-wifi-1.5.0-partition-table.bin",
           "size": 3072
         },
         {
           "name": "manifest.json",
-          "size": 2723
+          "size": 2724
         },
         {
-          "name": "t-eth-elite-1.4.0-app.bin",
-          "size": 1277408
+          "name": "t-eth-elite-1.5.0-app.bin",
+          "size": 1314816
         },
         {
-          "name": "t-eth-elite-1.4.0-bootloader.bin",
-          "size": 19904
+          "name": "t-eth-elite-1.5.0-bootloader.bin",
+          "size": 19968
         },
         {
-          "name": "t-eth-elite-1.4.0-ota_data_initial.bin",
+          "name": "t-eth-elite-1.5.0-ota_data_initial.bin",
           "size": 8192
         },
         {
-          "name": "t-eth-elite-1.4.0-partition-table.bin",
+          "name": "t-eth-elite-1.5.0-partition-table.bin",
           "size": 3072
         },
         {
-          "name": "waveshare-s3-eth-1.4.0-app.bin",
-          "size": 1277408
+          "name": "waveshare-s3-eth-1.5.0-app.bin",
+          "size": 1314816
         },
         {
-          "name": "waveshare-s3-eth-1.4.0-bootloader.bin",
-          "size": 19904
+          "name": "waveshare-s3-eth-1.5.0-bootloader.bin",
+          "size": 19968
         },
         {
-          "name": "waveshare-s3-eth-1.4.0-ota_data_initial.bin",
+          "name": "waveshare-s3-eth-1.5.0-ota_data_initial.bin",
           "size": 8192
         },
         {
-          "name": "waveshare-s3-eth-1.4.0-partition-table.bin",
+          "name": "waveshare-s3-eth-1.5.0-partition-table.bin",
           "size": 3072
         }
       ]

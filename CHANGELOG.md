@@ -5,6 +5,8 @@ firmware's `esp_app_desc` version string comes from `version.txt`.
 
 ## [Unreleased]
 
+## [1.5.0] — 2026-10-13
+
 ### Security
 
 - **OTA images are now signed, and the firmware refuses unsigned ones.**

@@ -118,15 +118,15 @@ def web_seeds():
     def mk(cap, a, b=b""):
         return bytes([cap]) + a + b"\x00" + b
     s = {}
-    s["login_body"] = mk(64, b"user=admin&pass=I+like+tacos%21&csrf=abc", b"pass")
-    s["setup_body"] = mk(64, b"user=admin&pass=glopiglopi&pass2=glopiglopi", b"pass2")
+    s["login_body"] = mk(64, b"user=admin&pass=Hello+world%21&csrf=abc", b"pass")
+    s["setup_body"] = mk(64, b"user=admin&pass=samplepass12&pass2=samplepass12", b"pass2")
     s["body_key_prefix"] = mk(32, b"xpass=nope&pass=yes", b"pass")
     s["body_key_last"] = mk(32, b"a=1&b=2&pass", b"pass")
     s["body_pct_edge"] = mk(32, b"v=%4&w=%zz&x=%41%", b"x")
     s["body_crlf"] = mk(32, b"v=abc\r\ndef&w=1", b"v")
-    s["origin_ok"] = mk(40, b"https://192.168.12.195/login", b"192.168.12.195")
+    s["origin_ok"] = mk(40, b"https://192.0.2.1/login", b"192.0.2.1")
     s["origin_port"] = mk(40, b"https://esp32adblock.local:443/", b"esp32adblock.local:443")
-    s["origin_evil"] = mk(40, b"https://192.168.12.195.evil.com/", b"192.168.12.195")
+    s["origin_evil"] = mk(40, b"https://192.0.2.1.evil.com/", b"192.0.2.1")
     s["origin_case"] = mk(40, b"HTTPS://ESP32ADBLOCK.LOCAL", b"esp32adblock.local")
     s["origin_null"] = mk(40, b"null", b"esp32adblock.local")
     s["cookie_one"] = mk(64, b"sid=" + b"ab" * 32)

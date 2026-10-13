@@ -7,13 +7,13 @@ script, and kept hitting browser-automation flakiness for tasks (flashing,
 metrics polling, rule edits) that never needed a human eye on the page.
 
 ```
-python board_client.py --host 192.168.12.195 metrics
-python board_client.py --host 192.168.12.195 check doubleclick.net
-python board_client.py --host 192.168.12.195 custom-rules "@@||doubleclick.net^"
-python board_client.py --host 192.168.12.195 reload --wait
-python board_client.py --host 192.168.12.195 flash build-waveshare/dns-sink.bin
-python board_client.py --host 192.168.12.195 whitelist-add example.com
-python board_client.py --host 192.168.12.195 get /log
+python board_client.py --host esp32adblock.local metrics
+python board_client.py --host esp32adblock.local check doubleclick.net
+python board_client.py --host esp32adblock.local custom-rules "@@||doubleclick.net^"
+python board_client.py --host esp32adblock.local reload --wait
+python board_client.py --host esp32adblock.local flash build-waveshare/dns-sink.bin
+python board_client.py --host esp32adblock.local whitelist-add example.com
+python board_client.py --host esp32adblock.local get /log
 ```
 
 Credentials: `--user`/`--password`, or the `BOARD_USER`/`BOARD_PASSWORD` env
@@ -23,7 +23,7 @@ As a library:
 
 ```python
 from board_client import BoardClient
-b = BoardClient("192.168.12.195", user="admin", password="...")
+b = BoardClient("esp32adblock.local", user="admin", password="...")
 b.metrics()["blocklist_count"]
 b.check("doubleclick.net")          # {"verdict": "BLOCKED", "raw": "<html>..."}
 b.reload(wait=True)                 # polls /metrics until blocklist_loading is False
