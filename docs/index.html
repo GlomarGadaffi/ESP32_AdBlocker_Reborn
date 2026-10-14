@@ -98,6 +98,90 @@ button.ci:hover{border-color:var(--ink-dim)}
 @media screen and (max-width:1080px){button.ci{position:absolute}}
 @media screen and (max-width:500px){th,td{padding-right:.5em}h1{font-size:1.4em;letter-spacing:.08em}h1 span{display:block;margin:.3em 0 0}}
 </style>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "FAQPage",
+  "@id": "https://glomargadaffi.github.io/ESP32_AdBlocker_Reborn/#faq",
+  "isPartOf": {
+    "@id": "https://glomargadaffi.github.io/ESP32_AdBlocker_Reborn/#code"
+  },
+  "mainEntity": [
+    {
+      "@type": "Question",
+      "name": "What does an ESP32 ad blocker do?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "It runs as a DNS sinkhole for your whole network. You point your router's DNS at the board, and it answers lookups for ad, tracker and malware domains with a block response, for every device, with no app on each one."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Which boards are supported?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "The default build is the LilyGO T-ETH-Elite, and there is a Waveshare ESP32-S3-ETH build. Both use an ESP32-S3 with a W5500 Ethernet controller. A Wi-Fi-only build runs on plain ESP32-S3 boards with PSRAM, without Ethernet or an SD card."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "How many domains can it block?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "More than 800,000 wildcard domains, held in PSRAM as compact hashes."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "How fast is it?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "On wired Ethernet the README measures about 1.8 ms per query for blocked and cached answers, and about 2,200 queries per second at saturation. Uncached queries are forwarded upstream and take about one gateway round trip, roughly 40 ms in that test."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "How much power does it use?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "About 1 W, according to the README."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "How do I install it?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Open the browser flasher in Chrome, Edge or Opera, connect the board over USB-C, click Connect, and choose Full Flash. Plug in the Ethernet cable, open esp32adblock.local in a browser, and create an admin login in the first-boot wizard. Last, set your router's primary DNS server to the board's IP address."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "What if a site I need gets blocked?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Type the domain into the Check domain box on the Dashboard, and if it shows as blocked, add it to the Whitelist. Whitelist entries take effect immediately, with no reboot."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Can it encrypt upstream DNS?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Yes. Turn on DNS-over-TLS in the Upstream DNS tab. The defaults are Cloudflare (1.1.1.1) and Quad9 (9.9.9.9). Local names such as .lan, .local and .home.arpa still go to your router in plain DNS."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Do I need a microSD card?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "No, but the README recommends one. Without a card the board downloads the blocklist again on every boot, which can take minutes. With a card it restores the list from storage in seconds."
+      }
+    }
+  ]
+}
+</script>
 </head>
 <body>
 <button class="ci" id="contrast" type="button">Contrast</button>
@@ -285,6 +369,28 @@ https://esp32adblock2.local  # Waveshare ESP32-S3-ETH</code></pre>
 <li><a href="simd-acceleration-notes.html">SIMD Acceleration &amp; Benchmark Notes</a></li>
 <li><a href="https://github.com/GlomarGadaffi/ESP32_AdBlocker_Reborn/blob/main/CHANGELOG.md">Changelog &amp; Version History</a></li>
 </ul>
+
+<section class="faq" id="faq">
+<h2>Frequently asked questions</h2>
+<h3>What does an ESP32 ad blocker do?</h3>
+<p>It runs as a DNS sinkhole for your whole network. You point your router&#x27;s DNS at the board, and it answers lookups for ad, tracker and malware domains with a block response, for every device, with no app on each one.</p>
+<h3>Which boards are supported?</h3>
+<p>The default build is the LilyGO T-ETH-Elite, and there is a Waveshare ESP32-S3-ETH build. Both use an ESP32-S3 with a W5500 Ethernet controller. A Wi-Fi-only build runs on plain ESP32-S3 boards with PSRAM, without Ethernet or an SD card.</p>
+<h3>How many domains can it block?</h3>
+<p>More than 800,000 wildcard domains, held in PSRAM as compact hashes.</p>
+<h3>How fast is it?</h3>
+<p>On wired Ethernet the README measures about 1.8 ms per query for blocked and cached answers, and about 2,200 queries per second at saturation. Uncached queries are forwarded upstream and take about one gateway round trip, roughly 40 ms in that test.</p>
+<h3>How much power does it use?</h3>
+<p>About 1 W, according to the README.</p>
+<h3>How do I install it?</h3>
+<p>Open the browser flasher in Chrome, Edge or Opera, connect the board over USB-C, click Connect, and choose Full Flash. Plug in the Ethernet cable, open esp32adblock.local in a browser, and create an admin login in the first-boot wizard. Last, set your router&#x27;s primary DNS server to the board&#x27;s IP address.</p>
+<h3>What if a site I need gets blocked?</h3>
+<p>Type the domain into the Check domain box on the Dashboard, and if it shows as blocked, add it to the Whitelist. Whitelist entries take effect immediately, with no reboot.</p>
+<h3>Can it encrypt upstream DNS?</h3>
+<p>Yes. Turn on DNS-over-TLS in the Upstream DNS tab. The defaults are Cloudflare (1.1.1.1) and Quad9 (9.9.9.9). Local names such as .lan, .local and .home.arpa still go to your router in plain DNS.</p>
+<h3>Do I need a microSD card?</h3>
+<p>No, but the README recommends one. Without a card the board downloads the blocklist again on every boot, which can take minutes. With a card it restores the list from storage in seconds.</p>
+</section>
 
 <footer>
 <p>ESP32 AdBlocker Reborn is licensed under MIT. This site is a single HTML file with no framework, no remote fonts, and no tracking cookies. The only script on this page stores your contrast and invert settings locally.</p>
