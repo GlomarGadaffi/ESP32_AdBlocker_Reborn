@@ -106,7 +106,7 @@ A single JSON object. Field names are exactly as emitted.
 | `queries_total` | int | Queries seen by the socket path. |
 | `blocked` | int | Sinkholed on the socket path. |
 | `forwarded` | int | Sent upstream. |
-| `tcp_queries` | int | Queries that arrived on the TCP/53 listener. |
+| `tcp_queries` | int | Queries that arrived on the TCP/53 listener (up to 4 concurrent connections since #154; one query per connection). |
 | `l2_blocked` | int | Blocked replies sent straight from the Ethernet RX hook. |
 | `l2_cached` | int | Forward-cache hits sent straight from the Ethernet RX hook. |
 | `l2_tx_fail` | int | Fast-path replies `esp_eth_transmit()` refused (#101). |
@@ -115,6 +115,8 @@ A single JSON object. Field names are exactly as emitted.
 | `l2_defer_lock_busy` | int | L2-hook queries that deferred to the socket path because the shared verdict's zero-wait small-table take failed (#117) — an admin write to the whitelist or custom rules was in flight. Flat in steady state. |
 | `l2_defer_snapshot` | int | L2-hook queries that deferred because a blocklist reload published underneath the verdict walk (#117). Flat outside a reload window. |
 | `wd_restarts` | int | Times the socket-path watchdog (#77) recreated `csock`/`usock` because wire traffic was arriving with no query progress for ~2s. Not reset by `/metrics/reset` (same convention as the `l2_*` counters). |
+| `select_errors` | int | `select()` failures `dns_task` has survived (#152). Before this the first one ended the task for good — DNS dead, web UI up, no reboot. Not reset by `/metrics/reset`. |
+| `dns_task_alive` | bool | `false` means `dns_task` has exited (#153); `dns_task_stack_hwm` reads 0 in that state and means nothing. |
 | `case_mismatch` | int | DNS 0x20 (#72): replies whose question section didn't echo the exact case we sent. Observability only — never rejected; see `process_reply()`'s H2 check for why a hard reject isn't safe without first proving this stays ~0 against the real configured upstream. |
 | `l2_log_dropped` | int | L2 query-log staging ring (#124) overflows: entries the L2 hook couldn't hand to `dns_task` before the next tick because the 32-slot ring was still full. Dropped, not blocked — the L2 hook never waits on the log. A nonzero count means a burst outran the drain rate for that window, not a bug; which specific queries were lost isn't recorded, only the count. |
 | `census_dropped` | int | Passive L2 census staging ring (#73) overflows — same shape and same caveat as `l2_log_dropped`, for ARP/DHCP/DNS-query sightings instead of the query log. |

@@ -5,6 +5,33 @@ firmware's `esp_app_desc` version string comes from `version.txt`.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`dns_task` no longer exits on a `select()` error (#152).** Any failure
+  other than `EINTR` used to `break` out of the serve loop into the shutdown
+  path — sockets closed, task deleted, nothing restarting it — so the board
+  sat with its web UI up and port 53 dead until a power cycle. lwIP allocates
+  its `select()` callback from the internal heap, so `ENOMEM` under heap
+  pressure (a web-UI TLS handshake is enough) was a realistic trigger. The
+  loop now counts the failure (`select_errors` in `/metrics`), backs off one
+  tick, rebuilds the sockets on `EBADF`, and reboots cleanly only after 5 s
+  of consecutive failures — the same fallback the L2 watchdog already used.
+  Present since 1.3.0.
+- **`/metrics` reports whether `dns_task` is alive (#153).** The task handle
+  was never cleared on exit, so `dns_task_stack_hwm` polled a deleted task
+  and read `0`, which looks like stack exhaustion rather than "task gone".
+  New `dns_task_alive` field and dashboard row; the handle is cleared on
+  every exit path.
+- **TCP/53 serves four connections instead of one (#154).** With a single
+  slot and `listen(lsock, 1)`, one client keeping an RFC 7766 connection open
+  got every other TCP client RST'd from `accept()`, and a connection waiting
+  in the backlog made lwIP drop the next SYN outright — on an otherwise idle
+  LAN, 7 of 8 sequential `dig +tcp` queries were reset and a 12 h watch saw
+  TCP time out in a third of its rounds while UDP never failed. The listener
+  is now non-blocking and drained fully each wakeup; when all four slots are
+  taken the idle connection nearest its deadline is evicted for the newcomer
+  (a connection parked on an upstream flight never is). ~2.4 KB more .bss.
+
 ## [1.5.0] — 2026-10-13
 
 ### Security

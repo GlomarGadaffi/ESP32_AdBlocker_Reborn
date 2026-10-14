@@ -63,6 +63,8 @@ static uint32_t s_cnt_forwarded    = 0;
 static volatile bool s_reset_req   = false;  /* set by httpd; cleared+executed by dns_task */
 static uint32_t s_cnt_drop_table   = 0;  /* upstream table full */
 static uint32_t s_cnt_wd_restarts  = 0;  /* (#77) socket-path watchdog fired */
+static uint32_t s_cnt_select_err   = 0;  /* (#152) select() failures survived — before
+                                            #152 the first one ended dns_task for good */
 static uint32_t s_cnt_case_mismatch = 0; /* (#72) 0x20: reply didn't echo our exact case —
                                              observability only, never a reject gate; see
                                              process_reply's H2 check for why */
@@ -144,9 +146,18 @@ static constexpr int      UPSTREAM_TABLE_SIZE  = 64;
 /* TCP/53 (RFC 7766): required so a TC=1 answer has somewhere to land — without
  * it the client's mandated TCP retry hits RST and resolution either fails or
  * escapes to an unfiltered secondary resolver (completes #36 / #66). One
- * listener + one active connection (+2 against the lwIP socket budget), one
- * query per connection, everything non-blocking inside the dns_task loop. */
+ * listener + TCP_CONNS_MAX active connections (+1+TCP_CONNS_MAX against the
+ * lwIP socket budget, CONFIG_LWIP_MAX_SOCKETS=24), one query per connection,
+ * everything non-blocking inside the dns_task loop.
+ *
+ * (#154) It used to be one connection and listen(lsock, 1). A client holding
+ * that slot — a stub that keeps an RFC 7766 connection open and re-dials every
+ * time the idle reaper closes it — got every other TCP client RST'd from
+ * accept(), and once one unaccepted conn sat in the backlog lwIP dropped the
+ * SYNs outright (dig +tcp: 7 of 8 sequential queries reset, 19 of 57 watch
+ * rounds timed out, UDP clean throughout). Four slots: ~3.2 KB .bss total. */
 static constexpr uint32_t TCP_CONN_IDLE_MS = 3000;
+static constexpr int      TCP_CONNS_MAX    = 4;
 static constexpr int      TCP_QUERY_MAX    = 768;
 
 /* ── Result cache (PSRAM): blocked verdicts + full forwarded responses ─
@@ -599,9 +610,10 @@ static constexpr uint32_t UPSTREAM_JOIN_MAX_AGE_MS = 250;
 struct UpstreamWaiter {
     struct sockaddr_in client_addr;
     int64_t          recv_us;        /* this waiter's own arrival — its own latency */
-    uint32_t         tcp_gen;        /* s_tcp.gen when THIS waiter joined, not when
-                                        the entry forwarded — see upstream_join */
+    uint32_t         tcp_gen;        /* s_tcp[tcp_slot].gen when THIS waiter joined, not
+                                        when the entry forwarded — see upstream_join */
     uint16_t         client_txid;
+    uint8_t          tcp_slot;       /* (#154) which s_tcp[] conn asked; gen is per slot */
     bool             via_tcp;
 };
 struct UpstreamEntry {
@@ -664,30 +676,33 @@ struct UpstreamEntry {
     uint32_t         hedge_deadline_ms; /* (#69) absolute esp_timer ms; compared wrap-safe */
     uint32_t         env_hash;       /* (#76) the forwarded query's reply-shaping envelope —
                                         see query_env_hash; unset on refresh_only entries */
-    uint32_t         tcp_gen;        /* s_tcp.gen at forward time — stale-conn detector */
+    uint32_t         tcp_gen;        /* s_tcp[tcp_slot].gen at forward time — stale-conn detector */
+    uint8_t          tcp_slot;       /* (#154) which s_tcp[] conn forwarded this flight */
     UpstreamWaiter   waiters[UPSTREAM_WAITERS_MAX];
 };
 static UpstreamEntry s_upstream[UPSTREAM_TABLE_SIZE];
 
 /* ── TCP/53 connection state (dns_task only) ─────────────────────── */
 struct TcpConn {
-    int      fd;
-    uint32_t gen;          /* bumped on every close; upstream entries snapshot it */
-    int      have;
-    bool     awaiting;     /* query forwarded upstream; conn held for the reply */
-    uint64_t deadline_ms;
-    uint32_t peer_ip;      /* host order, for ACL + query log */
-    uint8_t  buf[2 + TCP_QUERY_MAX];
+    int      fd = -1;
+    uint32_t gen = 0;      /* bumped on every close; upstream entries snapshot it
+                              together with the slot index — a gen is only
+                              meaningful against the slot it was read from */
+    int      have = 0;
+    bool     awaiting = false;  /* query forwarded upstream; conn held for the reply */
+    uint64_t deadline_ms = 0;
+    uint32_t peer_ip = 0;  /* host order, for ACL + query log */
+    uint8_t  buf[2 + TCP_QUERY_MAX] = {0};
 };
-static TcpConn  s_tcp = { -1, 0, 0, false, 0, 0, {0} };
+static TcpConn  s_tcp[TCP_CONNS_MAX];   /* (#154) */
 static uint32_t s_cnt_tcp = 0;
 
-static void tcp_conn_close(void)
+static void tcp_conn_close(TcpConn &c)
 {
-    if (s_tcp.fd != -1) { close(s_tcp.fd); s_tcp.fd = -1; }
-    s_tcp.gen++;
-    s_tcp.have = 0;
-    s_tcp.awaiting = false;
+    if (c.fd != -1) { close(c.fd); c.fd = -1; }
+    c.gen++;
+    c.have = 0;
+    c.awaiting = false;
 }
 
 /* Length-prefix + message assembled into one send (dns_task is the only
@@ -886,7 +901,7 @@ static UpstreamEntry *upstream_find_joinable(uint32_t qhash, uint32_t qkey, uint
  * connection than the entry's own can never be delivered to the wrong one. */
 static bool upstream_join(UpstreamEntry *ue, uint16_t client_txid,
                           const struct sockaddr_in *client_addr, int64_t recv_us,
-                          bool via_tcp, uint32_t tcp_gen)
+                          bool via_tcp, uint32_t tcp_gen, uint8_t tcp_slot)
 {
     if (ue->n_wait >= UPSTREAM_WAITERS_MAX) return false;
     UpstreamWaiter *w = &ue->waiters[ue->n_wait];
@@ -894,6 +909,7 @@ static bool upstream_join(UpstreamEntry *ue, uint16_t client_txid,
     else             memset(&w->client_addr, 0, sizeof(w->client_addr));
     w->recv_us     = recv_us;
     w->tcp_gen     = tcp_gen;
+    w->tcp_slot    = tcp_slot;
     w->client_txid = client_txid;
     w->via_tcp     = via_tcp;
     ue->n_wait++;
@@ -1304,6 +1320,7 @@ void DnsSinkServer::run_loop()
     if (!cache_init()) {
         ESP_LOGE(TAG, "PSRAM result cache alloc failed");
         _running.store(false, std::memory_order_release);
+        s_dns_task_handle = nullptr;   /* (#153) */
         if (_exitSem) xSemaphoreGive(_exitSem);
         vTaskDelete(nullptr);
         return;
@@ -1374,21 +1391,31 @@ void DnsSinkServer::run_loop()
         s_upstream_addr_pub.store(upstream_addr.sin_addr.s_addr, std::memory_order_release); /* #80 */
 
         /* ── Open TCP/53 listener (RFC 7766) ────────────────────── */
-        lsock = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
-        if (lsock >= 0) {
-            int one = 1;
-            setsockopt(lsock, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
-            struct sockaddr_in la{};
-            la.sin_family = AF_INET;
-            la.sin_addr.s_addr = INADDR_ANY;
-            la.sin_port = htons(53);
-            if (bind(lsock, (sockaddr *)&la, sizeof(la)) < 0 || listen(lsock, 1) < 0) {
-                ESP_LOGW(TAG, "TCP/53 unavailable (bind/listen: %d) — UDP-only", errno);
-                close(lsock); lsock = -1;
+        /* A lambda so the #152 select() recovery can rebuild it the same way.
+         * Non-blocking: the accept loop drains the whole backlog per wakeup
+         * (#154) and relies on EWOULDBLOCK to know it is empty. */
+        auto open_listener = [&]() {
+            if (lsock >= 0) { close(lsock); lsock = -1; }
+            lsock = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
+            if (lsock >= 0) {
+                int one = 1;
+                setsockopt(lsock, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+                int fl = fcntl(lsock, F_GETFL, 0);
+                fcntl(lsock, F_SETFL, fl | O_NONBLOCK);
+                struct sockaddr_in la{};
+                la.sin_family = AF_INET;
+                la.sin_addr.s_addr = INADDR_ANY;
+                la.sin_port = htons(53);
+                if (bind(lsock, (sockaddr *)&la, sizeof(la)) < 0 ||
+                    listen(lsock, TCP_CONNS_MAX) < 0) {
+                    ESP_LOGW(TAG, "TCP/53 unavailable (bind/listen: %d) — UDP-only", errno);
+                    close(lsock); lsock = -1;
+                }
+            } else {
+                ESP_LOGW(TAG, "TCP/53 unavailable (socket: %d) — UDP-only", errno);
             }
-        } else {
-            ESP_LOGW(TAG, "TCP/53 unavailable (socket: %d) — UDP-only", errno);
-        }
+        };
+        open_listener();
 
         uint8_t rx[1500], tx[512 + sizeof(DnsAnswerHeader) + 16];
         struct sockaddr_in client_addr{};
@@ -1500,6 +1527,7 @@ void DnsSinkServer::run_loop()
                     uint16_t w_txid = wt ? wt->client_txid : ue->client_txid;
                     bool     w_tcp  = wt ? wt->via_tcp     : ue->via_tcp;
                     uint32_t w_gen  = wt ? wt->tcp_gen     : ue->tcp_gen;
+                    uint8_t  w_slot = wt ? wt->tcp_slot    : ue->tcp_slot;
                     int64_t  w_recv = wt ? wt->recv_us     : ue->recv_us;
                     const struct sockaddr_in *w_addr = wt ? &wt->client_addr
                                                           : &ue->client_addr;
@@ -1513,16 +1541,19 @@ void DnsSinkServer::run_loop()
                          * delivery possible: the send clears awaiting and bumps
                          * gen, so every later TCP deliveree fails the guard. A
                          * second close would bump gen out from under the NEXT
-                         * connection's in-flight entry and strand its answer. */
-                        if (s_tcp.fd != -1 && s_tcp.awaiting && w_gen == s_tcp.gen) {
+                         * connection's in-flight entry and strand its answer.
+                         * (#154) gen is per slot, so the slot the waiter was
+                         * recorded on is the only one its gen is compared to. */
+                        TcpConn &dc = s_tcp[w_slot < TCP_CONNS_MAX ? w_slot : 0];
+                        if (dc.fd != -1 && dc.awaiting && w_gen == dc.gen) {
                             if (our_truncation)
                                 ESP_LOGW(TAG, "upstream reply exceeded %d B — relayed TC over TCP",
                                          (int)sizeof(rx));
                             else if (truncated)
                                 ESP_LOGW(TAG, "upstream truncated its own reply (TC=1) — "
                                               "relayed as-is over TCP, not cached");
-                            tcp_send_dns(s_tcp.fd, pkt, plen);
-                            tcp_conn_close();
+                            tcp_send_dns(dc.fd, pkt, plen);
+                            tcp_conn_close(dc);
                         }
                     } else {
                         sendto(csock, pkt, plen, 0,
@@ -1569,6 +1600,61 @@ void DnsSinkServer::run_loop()
             ue->in_use = false;
         };
 
+        /* (#77) Recreate csock/usock in place. Shared by the L2 watchdog and
+         * the #152 select() recovery; `who` tags the log lines. Bind the
+         * replacement BEFORE closing the original: a failed rebind then leaves
+         * dns_task on the socket it already had, never with none. SO_REUSEADDR
+         * lets the new socket share :53 with the still-open old one for the
+         * instant it takes to confirm the bind. */
+        auto reopen_sockets = [&](const char *who) {
+            int newc = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
+            bool c_ok = false;
+            if (newc >= 0) {
+                int reuse = 1;
+                setsockopt(newc, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+                struct sockaddr_in a{};
+                a.sin_family = AF_INET; a.sin_addr.s_addr = INADDR_ANY;
+                a.sin_port = htons(53);
+                if (bind(newc, (sockaddr *)&a, sizeof(a)) == 0) {
+                    int rcvbuf = 32768;
+                    setsockopt(newc, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+                    close(csock);
+                    csock = newc;
+                    _client_fd.store(csock, std::memory_order_release);
+                    c_ok = true;
+                } else {
+                    ESP_LOGE(TAG, "%s: csock rebind failed (%d) — keeping the old one",
+                             who, errno);
+                    close(newc);
+                }
+            } else {
+                ESP_LOGE(TAG, "%s: csock create failed (%d)", who, errno);
+            }
+
+            /* usock never binds (ephemeral outbound port) — no reuse dance. */
+            int newu = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
+            if (newu >= 0) {
+                int flags = 1;
+                setsockopt(newu, SOL_SOCKET, SO_REUSEADDR, &flags, sizeof(flags));
+                close(usock);
+                usock = newu;
+                _upstream_fd.store(usock, std::memory_order_release);
+            } else {
+                ESP_LOGE(TAG, "%s: usock create failed (%d)", who, errno);
+            }
+
+            /* Both recreations failed outright — the socket layer itself
+             * is out of resources at a level this task can't fix from
+             * inside. A clean reboot is the safe fallback, same
+             * philosophy as the OTA rollback path: never leave the
+             * board serving no DNS with no recovery in sight. */
+            if (!c_ok && newu < 0) {
+                ESP_LOGE(TAG, "%s: both sockets failed to recreate — restarting", who);
+                esp_restart();
+            }
+        };
+
+        uint32_t sel_err_run = 0;   /* (#152) consecutive failed select() calls */
         while (_running.load(std::memory_order_acquire)) {
             /* select() on all sockets with 100ms timeout */
             fd_set rset;
@@ -1577,17 +1663,53 @@ void DnsSinkServer::run_loop()
             FD_SET(usock, &rset);
             int nfds = (csock > usock ? csock : usock);
             if (lsock >= 0)     { FD_SET(lsock, &rset);    if (lsock    > nfds) nfds = lsock; }
-            if (s_tcp.fd != -1) { FD_SET(s_tcp.fd, &rset); if (s_tcp.fd > nfds) nfds = s_tcp.fd; }
+            for (int ti = 0; ti < TCP_CONNS_MAX; ti++) {
+                int tfd = s_tcp[ti].fd;
+                if (tfd != -1) { FD_SET(tfd, &rset); if (tfd > nfds) nfds = tfd; }
+            }
             nfds += 1;
             struct timeval tv{ .tv_sec = 0, .tv_usec = 100000 };
             int sel = select(nfds, &rset, nullptr, nullptr, &tv);
-            if (sel < 0 && errno != EINTR) break;
+            if (sel < 0 && errno != EINTR) {
+                /* (#152) This used to `break` — straight to done:, task gone,
+                 * no restart, no reboot: the web UI stayed up and port 53 was
+                 * dead until someone power-cycled the box. lwIP allocates its
+                 * select callback from the internal heap, so ENOMEM here is a
+                 * transient (a TLS handshake on the web UI holding its ~17 KB
+                 * is enough), not a verdict on the sockets. Count it, give the
+                 * heap a tick, rebuild the sockets if an fd really did go bad,
+                 * and only ever leave this loop through _running — or, after
+                 * 5 s with no good select(), through a clean esp_restart(),
+                 * the same fallback the watchdog below uses. */
+                int e = errno;
+                s_cnt_select_err++;
+                sel_err_run++;
+                if (sel_err_run == 1 || (sel_err_run % 10) == 0)
+                    ESP_LOGE(TAG, "select: %d (%" PRIu32 " in a row) — recovering, not exiting",
+                             e, sel_err_run);
+                if (!_running.load(std::memory_order_acquire)) break;   /* stop() closed our fds */
+                if (sel_err_run >= 50) {
+                    ESP_LOGE(TAG, "select: still failing after %" PRIu32 " tries — restarting",
+                             sel_err_run);
+                    esp_restart();
+                }
+                if (e == EBADF) {
+                    for (int ti = 0; ti < TCP_CONNS_MAX; ti++) tcp_conn_close(s_tcp[ti]);
+                    reopen_sockets("select");
+                    open_listener();
+                } else {
+                    vTaskDelay(pdMS_TO_TICKS(100));
+                }
+                continue;
+            }
+            if (sel >= 0) sel_err_run = 0;
 
             uint64_t now_ms = (uint64_t)(esp_timer_get_time() / 1000);
             upstream_evict_expired((uint32_t)now_ms);   /* upstream table uses uint32_t; 49d ok for 3s timeout */
             if (s_reset_req) { s_reset_req = false; do_metrics_reset(); }
-            if (s_tcp.fd != -1 && now_ms > s_tcp.deadline_ms)
-                tcp_conn_close();   /* idle/stuck client can't hold the slot */
+            for (int ti = 0; ti < TCP_CONNS_MAX; ti++)
+                if (s_tcp[ti].fd != -1 && now_ms > s_tcp[ti].deadline_ms)
+                    tcp_conn_close(s_tcp[ti]);   /* idle/stuck client can't hold a slot */
 
             /* ── L2 socket-path watchdog (#77) ───────────────────────
              * Genuine DNS demand proves lwIP handed this task something to
@@ -1653,57 +1775,7 @@ void DnsSinkServer::run_loop()
                                       "arrived with no socket-path progress — "
                                       "reopening csock/usock", s_wd_unanswered,
                                       s_wd_unanswered == 1 ? "y" : "ies");
-                        /* Bind the replacement BEFORE closing the original: a failed
-                         * rebind then leaves dns_task on the socket it already had,
-                         * never with none. SO_REUSEADDR lets the new socket share
-                         * :53 with the still-open old one for the instant it takes
-                         * to confirm the bind. */
-                        int newc = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
-                        bool c_ok = false;
-                        if (newc >= 0) {
-                            int reuse = 1;
-                            setsockopt(newc, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
-                            struct sockaddr_in a{};
-                            a.sin_family = AF_INET; a.sin_addr.s_addr = INADDR_ANY;
-                            a.sin_port = htons(53);
-                            if (bind(newc, (sockaddr *)&a, sizeof(a)) == 0) {
-                                int rcvbuf = 32768;
-                                setsockopt(newc, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
-                                close(csock);
-                                csock = newc;
-                                _client_fd.store(csock, std::memory_order_release);
-                                c_ok = true;
-                            } else {
-                                ESP_LOGE(TAG, "watchdog: csock rebind failed (%d) — "
-                                              "keeping the old one", errno);
-                                close(newc);
-                            }
-                        } else {
-                            ESP_LOGE(TAG, "watchdog: csock create failed (%d)", errno);
-                        }
-
-                        /* usock never binds (ephemeral outbound port) — no reuse dance. */
-                        int newu = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
-                        if (newu >= 0) {
-                            int flags = 1;
-                            setsockopt(newu, SOL_SOCKET, SO_REUSEADDR, &flags, sizeof(flags));
-                            close(usock);
-                            usock = newu;
-                            _upstream_fd.store(usock, std::memory_order_release);
-                        } else {
-                            ESP_LOGE(TAG, "watchdog: usock create failed (%d)", errno);
-                        }
-
-                        /* Both recreations failed outright — the socket layer itself
-                         * is out of resources at a level this task can't fix from
-                         * inside. A clean reboot is the safe fallback, same
-                         * philosophy as the OTA rollback path: never leave the
-                         * board serving no DNS with no recovery in sight. */
-                        if (!c_ok && newu < 0) {
-                            ESP_LOGE(TAG, "watchdog: both sockets failed to recreate "
-                                          "— restarting");
-                            esp_restart();
-                        }
+                        reopen_sockets("watchdog");   /* defined above the loop; shared with #152 */
                         s_cnt_wd_restarts++;
                         s_wd_unanswered = 0;
                 }
@@ -2130,7 +2202,7 @@ void DnsSinkServer::run_loop()
                                                                         (uint32_t)now_ms)
                                                : nullptr;
                     if (fl && upstream_join(fl, ntohs(hdr->id), &client_addr,
-                                            t_recv, false, 0))
+                                            t_recv, false, 0, 0))
                         continue;
                     UpstreamEntry *ue = upstream_alloc(&our_txid);
                     if (!ue) {
@@ -2187,239 +2259,267 @@ void DnsSinkServer::run_loop()
              * of it. */
             if (!mbox_drained) s_cnt_mbox_pressure++;
 
-            /* ── TCP/53: accept + read + serve (one conn, one query) ──
+            /* ── TCP/53: accept + read + serve (TCP_CONNS_MAX conns, one query each) ──
              * Same verdict ladder as the UDP path above; contained duplication
              * until the shared-verdict-helper refactor (roadmap wave 4). */
             if (lsock >= 0 && FD_ISSET(lsock, &rset)) {
-                struct sockaddr_in pa{}; socklen_t pl = sizeof(pa);
-                int nfd = accept(lsock, (sockaddr *)&pa, &pl);
-                if (nfd >= 0) {
-                    if (s_tcp.fd != -1 || !acl_permits(ntohl(pa.sin_addr.s_addr))) {
-                        close(nfd);   /* busy (client retries) or unlisted client */
-                    } else {
-                        int fl = fcntl(nfd, F_GETFL, 0);
-                        fcntl(nfd, F_SETFL, fl | O_NONBLOCK);
-                        s_tcp.fd = nfd;
-                        s_tcp.have = 0;
-                        s_tcp.awaiting = false;
-                        s_tcp.peer_ip = ntohl(pa.sin_addr.s_addr);
-                        s_tcp.deadline_ms = now_ms + TCP_CONN_IDLE_MS;
+                /* (#154) Drain the whole backlog this wakeup — lsock is
+                 * non-blocking, so accept() says EWOULDBLOCK once it is empty.
+                 * A conn left sitting in the backlog is what made lwIP drop
+                 * the next client's SYN. */
+                for (;;) {
+                    struct sockaddr_in pa{}; socklen_t pl = sizeof(pa);
+                    int nfd = accept(lsock, (sockaddr *)&pa, &pl);
+                    if (nfd < 0) break;
+                    if (!acl_permits(ntohl(pa.sin_addr.s_addr))) { close(nfd); continue; }
+                    /* A free slot, else evict the idle conn nearest its
+                     * deadline: the newcomer has a live query, the idler may
+                     * never send one. A conn parked on an upstream flight is
+                     * never evicted — its answer is due within the flight's
+                     * own 3 s. Only if every slot is mid-flight does the
+                     * newcomer get the old "busy, client retries" close. */
+                    TcpConn *slot = nullptr;
+                    for (int ti = 0; ti < TCP_CONNS_MAX; ti++)
+                        if (s_tcp[ti].fd == -1) { slot = &s_tcp[ti]; break; }
+                    if (!slot) {
+                        for (int ti = 0; ti < TCP_CONNS_MAX; ti++)
+                            if (!s_tcp[ti].awaiting &&
+                                (!slot || s_tcp[ti].deadline_ms < slot->deadline_ms))
+                                slot = &s_tcp[ti];
+                        if (slot) tcp_conn_close(*slot);
+                    }
+                    if (!slot) { close(nfd); continue; }
+                    int fl = fcntl(nfd, F_GETFL, 0);
+                    fcntl(nfd, F_SETFL, fl | O_NONBLOCK);
+                    slot->fd = nfd;
+                    slot->have = 0;
+                    slot->awaiting = false;
+                    slot->peer_ip = ntohl(pa.sin_addr.s_addr);
+                    slot->deadline_ms = now_ms + TCP_CONN_IDLE_MS;
+                }
+            }
+            /* (#154) Every slot gets a turn per wakeup; a conn parked on an
+             * upstream flight (awaiting) is skipped until its reply lands or
+             * the idle reaper frees it. tx is shared: each conn is fully
+             * served (or parked) before the next is looked at. */
+            for (int ti = 0; ti < TCP_CONNS_MAX; ti++) {
+                TcpConn &tc = s_tcp[ti];
+                if (tc.fd != -1 && !tc.awaiting) {
+                    int r = recv(tc.fd, tc.buf + tc.have,
+                                 sizeof(tc.buf) - tc.have, MSG_DONTWAIT);
+                    if (r == 0 || (r < 0 && errno != EWOULDBLOCK && errno != EAGAIN)) {
+                        tcp_conn_close(tc);
+                    } else if (r > 0) {
+                        tc.have += r;
+                        tc.deadline_ms = now_ms + TCP_CONN_IDLE_MS;
                     }
                 }
-            }
-            if (s_tcp.fd != -1 && !s_tcp.awaiting) {
-                int r = recv(s_tcp.fd, s_tcp.buf + s_tcp.have,
-                             sizeof(s_tcp.buf) - s_tcp.have, MSG_DONTWAIT);
-                if (r == 0 || (r < 0 && errno != EWOULDBLOCK && errno != EAGAIN)) {
-                    tcp_conn_close();
-                } else if (r > 0) {
-                    s_tcp.have += r;
-                    s_tcp.deadline_ms = now_ms + TCP_CONN_IDLE_MS;
-                }
-            }
-            if (s_tcp.fd != -1 && !s_tcp.awaiting && s_tcp.have >= 2) {
-                int mlen = ((int)s_tcp.buf[0] << 8) | s_tcp.buf[1];
-                if (mlen < (int)sizeof(DnsHeader) || mlen > TCP_QUERY_MAX) {
-                    tcp_conn_close();               /* oversize or garbage framing */
-                } else if (s_tcp.have >= 2 + mlen) {
-                    uint8_t *q = s_tcp.buf + 2;
-                    auto *qh = reinterpret_cast<DnsHeader *>(q);
-                    int64_t t_recv = esp_timer_get_time();
-                    char name[256]; size_t nlen = 0;
-                    int qend = -1;
-                    if (!(ntohs(qh->flags) & 0x8000) && ntohs(qh->qdcount) != 0)
-                        qend = dns_extract_qname(q, mlen, sizeof(DnsHeader),
-                                             name, sizeof(name), &nlen);
-                    if (qend < 0) {
-                        tcp_conn_close();
-                    } else {
-                        s_cnt_total++; s_cnt_tcp++;
-                        uint16_t qtype = ntohs(*reinterpret_cast<uint16_t *>(q + qend - 4));
-                        uint16_t qclass = ntohs(*reinterpret_cast<uint16_t *>(q + qend - 2));
-                        bool cls_in = (qclass == 1);              /* (#106), as on UDP */
-                        uint32_t h = domain_hash(name, nlen);
-                        const uint8_t *qn = q + sizeof(DnsHeader);   /* rest of the cache key */
-                        int qn_len = qend - 4 - (int)sizeof(DnsHeader);
-                        int tlen = 0;    /* >0: answer in tx; 0: forwarded, conn held */
-                        /* (#48/#74) Same delivery-time pause + bypass override
-                         * as UDP — tcp_no_cache is true for the whole query
-                         * whenever either applies, not only when the direct
-                         * name is blocked (see the UDP declaration for why). */
-                        bool paused_client   = cls_in && pause_active_for(s_tcp.peer_ip);
-                        bool bypassed_client = cls_in && bypass_active_for(s_tcp.peer_ip);
-                        bool tcp_no_cache    = paused_client || bypassed_client;
-                        bool verdict_exempt  = false;   /* (#117), set below; see UDP's twin */
-                        uint32_t verdict_gen = blocklist_generation();  /* (#85); see UDP's twin */
-
-                        /* (#100) Rewrite verdict before the cache, as on UDP. */
-                        uint32_t rw_pre = (cls_in && qtype == 1) ? rewrite_lookup(name) : 0;
-                        s_cnt_cache_probe++;
-                        CacheEntry *ce = (rw_pre || !cls_in) ? nullptr
-                                                             : cache_lookup(h, qtype, qn, qn_len, now_ms);
-                        /* (#48/#74) A cached BLOCK is skipped for a paused or
-                         * bypassed client: the verdict branch below re-derives
-                         * it, stores it, and forwards this one delivery. */
-                        if (ce && !(ce->blocked && (paused_client || bypassed_client)) &&
-                            (ce->blocked ||
-                             (ce->resp_len > 0 && ce->resp_len <= (int)sizeof(tx)))) {
-                            s_cnt_cache_hit++;
-                            if (ce->blocked) {
-                                s_cnt_blocked++;
-                                tlen = build_blocked_any(q, qend, qtype, tx, sizeof(tx));
-                                hist_record(&s_h_blocked, esp_timer_get_time() - t_recv);
-                                query_log_record(name, qtype, s_tcp.peer_ip, true, false);
-                            } else {
-                                memcpy(tx, ce->resp, ce->resp_len);
-                                tx[0] = q[0]; tx[1] = q[1];   /* client's txid */
-                                tlen = ce->resp_len;
-                                hist_record(&s_h_cached, esp_timer_get_time() - t_recv);
-                                query_log_record(name, qtype, s_tcp.peer_ip, false, false);
-                            }
+                if (tc.fd != -1 && !tc.awaiting && tc.have >= 2) {
+                    int mlen = ((int)tc.buf[0] << 8) | tc.buf[1];
+                    if (mlen < (int)sizeof(DnsHeader) || mlen > TCP_QUERY_MAX) {
+                        tcp_conn_close(tc);               /* oversize or garbage framing */
+                    } else if (tc.have >= 2 + mlen) {
+                        uint8_t *q = tc.buf + 2;
+                        auto *qh = reinterpret_cast<DnsHeader *>(q);
+                        int64_t t_recv = esp_timer_get_time();
+                        char name[256]; size_t nlen = 0;
+                        int qend = -1;
+                        if (!(ntohs(qh->flags) & 0x8000) && ntohs(qh->qdcount) != 0)
+                            qend = dns_extract_qname(q, mlen, sizeof(DnsHeader),
+                                                 name, sizeof(name), &nlen);
+                        if (qend < 0) {
+                            tcp_conn_close(tc);
                         } else {
-                            uint32_t rw_ip = rw_pre;
-                            /* (#117) Shared rank-ordered verdict, as on UDP. */
-                            bl_verdict_t v = { .state = BL_NO_MATCH, .rank = 0,
-                                                .unproven = 0, .src = 0xFF, .depth = 0 };
-                            if (!rw_ip && cls_in) v = blocklist_verdict(name, nlen);
-                            bool is_blk = v.state == BL_BLOCK;
-                            verdict_exempt = v.state == BL_ALLOW;
-                            tcp_no_cache |= v.unproven;
-                            if (paused_client || bypassed_client) {
-                                /* (#48/#74) As on UDP: if the direct name is
-                                 * BLOCKED, the cache learns it and this
-                                 * delivery forwards uncached (tcp_no_cache is
-                                 * already true). This branch is also reached
-                                 * when the cached verdict was BLOCKED via
-                                 * CNAME-cloaking (the `ce->blocked && (...)`
-                                 * check above) rather than a direct hit —
-                                 * is_blk here only ever reflects the direct
-                                 * name, so it must not be trusted to decide
-                                 * whether to cache_store_blocked in that case
-                                 * either. */
-                                if (is_blk) cache_store_blocked(h, qtype, qn, qn_len,
-                                                                BLOCKED_TTL_S, now_ms, verdict_gen);
-                                is_blk = false;
-                            }
-                            if (rw_ip) {
-                                tlen = build_rewrite_a(q, qend, rw_ip, tx, sizeof(tx));
-                                query_log_record(name, qtype, s_tcp.peer_ip, false, true);
-                            } else if (is_blk) {
-                                s_cnt_blocked++;
-                                tlen = build_blocked_any(q, qend, qtype, tx, sizeof(tx));
-                                cache_store_blocked(h, qtype, qn, qn_len, BLOCKED_TTL_S, now_ms, verdict_gen);
-                                query_log_record(name, qtype, s_tcp.peer_ip, true, false);
-                                hist_record(&s_h_blocked, esp_timer_get_time() - t_recv);
-                            } else {
-                                query_log_record(name, qtype, s_tcp.peer_ip, false, false);
-                                uint16_t our_txid;
-                                UpstreamEntry *ue = nullptr;
-                                /* Single-flight (#76): ride an identical query
-                                 * already in flight. The waiter snapshots gen
-                                 * now, so it can only ever be delivered to the
-                                 * conn it joined on; awaiting holds that conn
-                                 * open for the fan-out exactly as a real forward
-                                 * does, and the fan-out closes it. If the reply
-                                 * never comes the idle reaper frees the conn,
-                                 * same as an entry that times out today — and
-                                 * the age gate keeps that wait from outliving
-                                 * the entry by more than a fraction of it. */
-                                uint32_t eh = query_env_hash(q, mlen, qend);
-                                UpstreamEntry *fl = (cls_in && !tcp_no_cache)  /* (#106); (#48) */
-                                    ? upstream_find_joinable(h, qname_key(name, nlen), qtype,
-                                                             eh, (uint32_t)now_ms)
-                                    : nullptr;
-                                if (fl && upstream_join(fl, ntohs(qh->id), nullptr,
-                                                        t_recv, true, s_tcp.gen)) {
-                                    s_tcp.awaiting = true;
-                                } else if (!(ue = upstream_alloc(&our_txid))) {
-                                    s_cnt_drop_table++;
-                                    /* SERVFAIL: fail fast instead of hanging the conn */
-                                    memcpy(tx, q, qend);
-                                    uint16_t qf = ((uint16_t)q[2] << 8) | q[3];
-                                    uint16_t rf = dns_resp_flags(qf, 2);
-                                    tx[2] = rf >> 8; tx[3] = rf & 0xFF;
-                                    reinterpret_cast<DnsHeader *>(tx)->ancount = 0;
-                                    reinterpret_cast<DnsHeader *>(tx)->nscount = 0;
-                                    reinterpret_cast<DnsHeader *>(tx)->arcount = 0;
-                                    tlen = qend;
+                            s_cnt_total++; s_cnt_tcp++;
+                            uint16_t qtype = ntohs(*reinterpret_cast<uint16_t *>(q + qend - 4));
+                            uint16_t qclass = ntohs(*reinterpret_cast<uint16_t *>(q + qend - 2));
+                            bool cls_in = (qclass == 1);              /* (#106), as on UDP */
+                            uint32_t h = domain_hash(name, nlen);
+                            const uint8_t *qn = q + sizeof(DnsHeader);   /* rest of the cache key */
+                            int qn_len = qend - 4 - (int)sizeof(DnsHeader);
+                            int tlen = 0;    /* >0: answer in tx; 0: forwarded, conn held */
+                            /* (#48/#74) Same delivery-time pause + bypass override
+                             * as UDP — tcp_no_cache is true for the whole query
+                             * whenever either applies, not only when the direct
+                             * name is blocked (see the UDP declaration for why). */
+                            bool paused_client   = cls_in && pause_active_for(tc.peer_ip);
+                            bool bypassed_client = cls_in && bypass_active_for(tc.peer_ip);
+                            bool tcp_no_cache    = paused_client || bypassed_client;
+                            bool verdict_exempt  = false;   /* (#117), set below; see UDP's twin */
+                            uint32_t verdict_gen = blocklist_generation();  /* (#85); see UDP's twin */
+
+                            /* (#100) Rewrite verdict before the cache, as on UDP. */
+                            uint32_t rw_pre = (cls_in && qtype == 1) ? rewrite_lookup(name) : 0;
+                            s_cnt_cache_probe++;
+                            CacheEntry *ce = (rw_pre || !cls_in) ? nullptr
+                                                                 : cache_lookup(h, qtype, qn, qn_len, now_ms);
+                            /* (#48/#74) A cached BLOCK is skipped for a paused or
+                             * bypassed client: the verdict branch below re-derives
+                             * it, stores it, and forwards this one delivery. */
+                            if (ce && !(ce->blocked && (paused_client || bypassed_client)) &&
+                                (ce->blocked ||
+                                 (ce->resp_len > 0 && ce->resp_len <= (int)sizeof(tx)))) {
+                                s_cnt_cache_hit++;
+                                if (ce->blocked) {
+                                    s_cnt_blocked++;
+                                    tlen = build_blocked_any(q, qend, qtype, tx, sizeof(tx));
+                                    hist_record(&s_h_blocked, esp_timer_get_time() - t_recv);
+                                    query_log_record(name, qtype, tc.peer_ip, true, false);
                                 } else {
-                                    ue->client_txid = ntohs(qh->id);
-                                    memset(&ue->client_addr, 0, sizeof(ue->client_addr));
-                                    ue->sent_ms  = (uint32_t)now_ms;
-                                    ue->recv_us  = t_recv;
-                                    ue->qhash    = h;
-                                    ue->qkey     = qname_key(name, nlen);
-                                    ue->qtype    = qtype;
-                                    ue->env_hash = eh;
-                                    ue->no_cache = !cls_in || tcp_no_cache;   /* (#106); (#48) */
-                                    ue->paused   = tcp_no_cache;             /* (#48) */
-                                    ue->exempt   = verdict_exempt;           /* (#117) */
-                                    ue->load_gen = verdict_gen;              /* (#85) */
-                                    ue->via_tcp  = true;
-                                    ue->tcp_gen  = s_tcp.gen;
-                                    randomize_qname_case(q, qend);   /* (#72) */
-                                    ue->case_hash = query_case_hash(q, qend);
-                                    qh->id = htons(our_txid);
-                                    ue->upstream_us = esp_timer_get_time();
-                                    bool is_local = localzone_match(name, nlen);
-                                    bool use_dot  = dot_is_enabled() && !is_local;
-                                    if (!(use_dot && dot_enqueue(q, mlen))) {
-                                        /* (#66) forwarding the client's own EDNS-less
-                                         * query gets it classic-truncated at 512 B by
-                                         * the upstream resolver — a dead end, since
-                                         * this client is already on TCP with nowhere
-                                         * left to retry. Ask upstream for a real
-                                         * answer instead. */
-                                        static uint8_t edns_q[TCP_QUERY_MAX + 11];
-                                        int elen = append_bare_edns_opt(edns_q, q, mlen,
-                                                                        sizeof(edns_q));
-                                        upstream_addr.sin_addr.s_addr =
-                                            _upstream_addr.load(std::memory_order_acquire);
-                                        sendto(usock, edns_q, elen, 0,
-                                               (sockaddr *)&upstream_addr, sizeof(upstream_addr));
-                                        /* (#69) same DoT gate as the UDP path;
-                                         * a TCP-origin flight still goes
-                                         * upstream over UDP, so it hedges the
-                                         * same way. Stash edns_q, not q: a
-                                         * hedge retransmit of the ORIGINAL
-                                         * EDNS-less query would undo the #66
-                                         * fix above for that copy — same
-                                         * txid, so whichever reply lands
-                                         * first wins, and an EDNS-less
-                                         * retransmit can still land a
-                                         * truncated dead end over TCP. elen
-                                         * may exceed HEDGE_QMAX (512; TCP_QUERY_MAX
-                                         * is 768, +11 for the OPT) — hedge_stash
-                                         * then leaves the flight un-hedged,
-                                         * same graceful no-op as before. */
-                                        if (!use_dot)
-                                            hedge_stash(ue, edns_q, elen, (uint32_t)now_ms,
-                                                        is_local);
+                                    memcpy(tx, ce->resp, ce->resp_len);
+                                    tx[0] = q[0]; tx[1] = q[1];   /* client's txid */
+                                    tlen = ce->resp_len;
+                                    hist_record(&s_h_cached, esp_timer_get_time() - t_recv);
+                                    query_log_record(name, qtype, tc.peer_ip, false, false);
+                                }
+                            } else {
+                                uint32_t rw_ip = rw_pre;
+                                /* (#117) Shared rank-ordered verdict, as on UDP. */
+                                bl_verdict_t v = { .state = BL_NO_MATCH, .rank = 0,
+                                                    .unproven = 0, .src = 0xFF, .depth = 0 };
+                                if (!rw_ip && cls_in) v = blocklist_verdict(name, nlen);
+                                bool is_blk = v.state == BL_BLOCK;
+                                verdict_exempt = v.state == BL_ALLOW;
+                                tcp_no_cache |= v.unproven;
+                                if (paused_client || bypassed_client) {
+                                    /* (#48/#74) As on UDP: if the direct name is
+                                     * BLOCKED, the cache learns it and this
+                                     * delivery forwards uncached (tcp_no_cache is
+                                     * already true). This branch is also reached
+                                     * when the cached verdict was BLOCKED via
+                                     * CNAME-cloaking (the `ce->blocked && (...)`
+                                     * check above) rather than a direct hit —
+                                     * is_blk here only ever reflects the direct
+                                     * name, so it must not be trusted to decide
+                                     * whether to cache_store_blocked in that case
+                                     * either. */
+                                    if (is_blk) cache_store_blocked(h, qtype, qn, qn_len,
+                                                                    BLOCKED_TTL_S, now_ms, verdict_gen);
+                                    is_blk = false;
+                                }
+                                if (rw_ip) {
+                                    tlen = build_rewrite_a(q, qend, rw_ip, tx, sizeof(tx));
+                                    query_log_record(name, qtype, tc.peer_ip, false, true);
+                                } else if (is_blk) {
+                                    s_cnt_blocked++;
+                                    tlen = build_blocked_any(q, qend, qtype, tx, sizeof(tx));
+                                    cache_store_blocked(h, qtype, qn, qn_len, BLOCKED_TTL_S, now_ms, verdict_gen);
+                                    query_log_record(name, qtype, tc.peer_ip, true, false);
+                                    hist_record(&s_h_blocked, esp_timer_get_time() - t_recv);
+                                } else {
+                                    query_log_record(name, qtype, tc.peer_ip, false, false);
+                                    uint16_t our_txid;
+                                    UpstreamEntry *ue = nullptr;
+                                    /* Single-flight (#76): ride an identical query
+                                     * already in flight. The waiter snapshots gen
+                                     * now, so it can only ever be delivered to the
+                                     * conn it joined on; awaiting holds that conn
+                                     * open for the fan-out exactly as a real forward
+                                     * does, and the fan-out closes it. If the reply
+                                     * never comes the idle reaper frees the conn,
+                                     * same as an entry that times out today — and
+                                     * the age gate keeps that wait from outliving
+                                     * the entry by more than a fraction of it. */
+                                    uint32_t eh = query_env_hash(q, mlen, qend);
+                                    UpstreamEntry *fl = (cls_in && !tcp_no_cache)  /* (#106); (#48) */
+                                        ? upstream_find_joinable(h, qname_key(name, nlen), qtype,
+                                                                 eh, (uint32_t)now_ms)
+                                        : nullptr;
+                                    if (fl && upstream_join(fl, ntohs(qh->id), nullptr,
+                                                            t_recv, true, tc.gen, (uint8_t)ti)) {
+                                        tc.awaiting = true;
+                                    } else if (!(ue = upstream_alloc(&our_txid))) {
+                                        s_cnt_drop_table++;
+                                        /* SERVFAIL: fail fast instead of hanging the conn */
+                                        memcpy(tx, q, qend);
+                                        uint16_t qf = ((uint16_t)q[2] << 8) | q[3];
+                                        uint16_t rf = dns_resp_flags(qf, 2);
+                                        tx[2] = rf >> 8; tx[3] = rf & 0xFF;
+                                        reinterpret_cast<DnsHeader *>(tx)->ancount = 0;
+                                        reinterpret_cast<DnsHeader *>(tx)->nscount = 0;
+                                        reinterpret_cast<DnsHeader *>(tx)->arcount = 0;
+                                        tlen = qend;
+                                    } else {
+                                        ue->client_txid = ntohs(qh->id);
+                                        memset(&ue->client_addr, 0, sizeof(ue->client_addr));
+                                        ue->sent_ms  = (uint32_t)now_ms;
+                                        ue->recv_us  = t_recv;
+                                        ue->qhash    = h;
+                                        ue->qkey     = qname_key(name, nlen);
+                                        ue->qtype    = qtype;
+                                        ue->env_hash = eh;
+                                        ue->no_cache = !cls_in || tcp_no_cache;   /* (#106); (#48) */
+                                        ue->paused   = tcp_no_cache;             /* (#48) */
+                                        ue->exempt   = verdict_exempt;           /* (#117) */
+                                        ue->load_gen = verdict_gen;              /* (#85) */
+                                        ue->via_tcp  = true;
+                                        ue->tcp_gen  = tc.gen;
+                                        ue->tcp_slot = (uint8_t)ti;
+                                        randomize_qname_case(q, qend);   /* (#72) */
+                                        ue->case_hash = query_case_hash(q, qend);
+                                        qh->id = htons(our_txid);
+                                        ue->upstream_us = esp_timer_get_time();
+                                        bool is_local = localzone_match(name, nlen);
+                                        bool use_dot  = dot_is_enabled() && !is_local;
+                                        if (!(use_dot && dot_enqueue(q, mlen))) {
+                                            /* (#66) forwarding the client's own EDNS-less
+                                             * query gets it classic-truncated at 512 B by
+                                             * the upstream resolver — a dead end, since
+                                             * this client is already on TCP with nowhere
+                                             * left to retry. Ask upstream for a real
+                                             * answer instead. */
+                                            static uint8_t edns_q[TCP_QUERY_MAX + 11];
+                                            int elen = append_bare_edns_opt(edns_q, q, mlen,
+                                                                            sizeof(edns_q));
+                                            upstream_addr.sin_addr.s_addr =
+                                                _upstream_addr.load(std::memory_order_acquire);
+                                            sendto(usock, edns_q, elen, 0,
+                                                   (sockaddr *)&upstream_addr, sizeof(upstream_addr));
+                                            /* (#69) same DoT gate as the UDP path;
+                                             * a TCP-origin flight still goes
+                                             * upstream over UDP, so it hedges the
+                                             * same way. Stash edns_q, not q: a
+                                             * hedge retransmit of the ORIGINAL
+                                             * EDNS-less query would undo the #66
+                                             * fix above for that copy — same
+                                             * txid, so whichever reply lands
+                                             * first wins, and an EDNS-less
+                                             * retransmit can still land a
+                                             * truncated dead end over TCP. elen
+                                             * may exceed HEDGE_QMAX (512; TCP_QUERY_MAX
+                                             * is 768, +11 for the OPT) — hedge_stash
+                                             * then leaves the flight un-hedged,
+                                             * same graceful no-op as before. */
+                                            if (!use_dot)
+                                                hedge_stash(ue, edns_q, elen, (uint32_t)now_ms,
+                                                            is_local);
+                                        }
+                                        s_cnt_forwarded++;
+                                        tc.awaiting = true;
                                     }
-                                    s_cnt_forwarded++;
-                                    s_tcp.awaiting = true;
                                 }
                             }
-                        }
-                        if (!s_tcp.awaiting) {
-                            /* direct answer (or builder failure) — send and close */
-                            if (tlen > 0) tcp_send_dns(s_tcp.fd, tx, tlen);
-                            tcp_conn_close();
+                            if (!tc.awaiting) {
+                                /* direct answer (or builder failure) — send and close */
+                                if (tlen > 0) tcp_send_dns(tc.fd, tx, tlen);
+                                tcp_conn_close(tc);
+                            }
                         }
                     }
                 }
-            }
+            }  /* for each TCP conn */
         }  /* while running */
     }
 
 done:
-    tcp_conn_close();
+    for (int ti = 0; ti < TCP_CONNS_MAX; ti++) tcp_conn_close(s_tcp[ti]);
     if (lsock >= 0) close(lsock);
     int fd = _client_fd.exchange(-1, std::memory_order_acq_rel);
     if (fd != -1) close(fd);
     fd = _upstream_fd.exchange(-1, std::memory_order_acq_rel);
     if (fd != -1) close(fd);
     _running.store(false, std::memory_order_release);
+    s_dns_task_handle = nullptr;   /* (#153) metrics must not poll a deleted task */
     ESP_LOGI(TAG, "dns_task exited");
     if (_exitSem) xSemaphoreGive(_exitSem);
     vTaskDelete(nullptr);
@@ -2516,6 +2616,7 @@ int dns_server_metrics_json(char *out, size_t cap)
         "\"tcp_queries\":%" PRIu32 ","
         "\"l2_blocked\":%" PRIu32 ",\"l2_cached\":%" PRIu32 ",\"l2_tx_fail\":%" PRIu32 ","
         "\"l2_fallthrough\":%" PRIu32 ",\"l2_dns_fallthrough\":%" PRIu32 ",\"wd_restarts\":%" PRIu32 ","
+        "\"select_errors\":%" PRIu32 ",\"dns_task_alive\":%s,"
         "\"l2_defer_lock_busy\":%" PRIu32 ",\"l2_defer_snapshot\":%" PRIu32 ","
         "\"l2_log_dropped\":%" PRIu32 ","
         "\"census_dropped\":%" PRIu32 ","
@@ -2551,6 +2652,7 @@ int dns_server_metrics_json(char *out, size_t cap)
         s_cnt_tcp,
         dns_sink_l2_blocked(), dns_sink_l2_cached(), dns_sink_l2_tx_fail(),
         dns_sink_l2_fallthrough(), dns_sink_l2_dns_fallthrough(), s_cnt_wd_restarts,
+        s_cnt_select_err, s_dns_task_handle ? "true" : "false",   /* (#152, #153) */
         dns_sink_l2_defer_lock_busy(), dns_sink_l2_defer_snapshot(),
         dns_sink_l2log_dropped(),
         dns_sink_census_dropped(),
