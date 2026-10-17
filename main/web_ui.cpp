@@ -74,13 +74,14 @@ extern "C" const char *dns_sink_lan_ip(void);
 
 /* ── helpers ─────────────────────────────────────────────────────── */
 
-/* Wraps a non-null error message in <p class=err>...</p>; empty string if err
- * is null. err is always a static or snprintf'd server-generated message
- * (setup_page/login_page never echo request input through it), so this
+/* Wraps a non-null validation message in a grey <p class=st>▲ ...</p> chip
+ * (validation/permission text is not a device fault, so no P1 fill); empty
+ * string if err is null. err is always a static or snprintf'd server-generated
+ * message (setup_page/login_page never echo request input through it), so this
  * applies no escaping — same as the two call sites it replaces. */
 static void err_html(char *dst, size_t cap, const char *err)
 {
-    if (err) snprintf(dst, cap, "<p class=err>%s</p>", err);
+    if (err) snprintf(dst, cap, "<p class=st>▲ %s</p>", err);
     else     dst[0] = '\0';
 }
 
@@ -354,23 +355,277 @@ static void send_html(httpd_req_t *r, const char *body)
     httpd_resp_send(r, body, HTTPD_RESP_USE_STRLEN);
 }
 
-/* Shared shell for the two pre-login pages (setup wizard, login). Kept
- * deliberately plain: no tabs, no refresh, nothing that needs a session. */
+/* Last two chunks of a response whose head already went out as raw chunks
+ * ahead of the page buffer (the theme is sent straight from flash): the buffer,
+ * then the empty terminator. */
+static esp_err_t send_chunked_tail(httpd_req_t *r, const char *body)
+{
+    esp_err_t err = httpd_resp_send_chunk(r, body, HTTPD_RESP_USE_STRLEN);
+    if (err != ESP_OK) return err;
+    return httpd_resp_send_chunk(r, nullptr, 0);
+}
+
+/* Shared console theme: shared-theme.css inlined verbatim, one C literal
+ * per CSS line (ASCII, no backslash, no double quote). Dark only; colour
+ * marks off-normal state or live traffic. Sent raw, never through printf,
+ * so its % signs are single. Keep in step with shared-theme.css. */
+static const char ADB_THEME_RAW[] =
+    "/* shared-theme.css - ISA-101 HMI console, dark only. UTF-8, no backslashes, no double quotes. */\n"
+    "\n"
+    "/* 1. TOKENS: solid hex. Grey when nominal; colour only for exceptions. */\n"
+    ":root{\n"
+    "color-scheme:dark;\n"
+    "--chassis:#121212;\n"
+    "--panel:#1c1c1c;\n"
+    "--grid:#333333;\n"
+    "--text:#a0a0a0;\n"
+    "--dim:#666666;\n"
+    "--well:#050505;\n"
+    "--p1:#ff2200;\n"
+    "--p2:#ffaa00;\n"
+    "--live:#00aaff;\n"
+    "--bevel-hi:#3a3a3a;\n"
+    "--bevel-lo:#000000;\n"
+    "--f-ui:system-ui,-apple-system,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;\n"
+    "--f-mono:ui-monospace,'SF Mono',Menlo,Consolas,'DejaVu Sans Mono',monospace;\n"
+    "--row:24px;\n"
+    "}\n"
+    "\n"
+    "/* 2. BASE */\n"
+    "*,*::before,*::after{box-sizing:border-box;border-radius:0}\n"
+    "[hidden]{display:none!important}\n"
+    "html,body{margin:0;background:var(--chassis);color:var(--text)}\n"
+    "body{font:12px/16px var(--f-ui);padding:30px 0 32px}\n"
+    "a{color:var(--text);text-decoration:underline}\n"
+    ":focus-visible{outline:1px solid var(--text);outline-offset:-1px}\n"
+    "kbd,code,.mono,.num,td.num,td.mono,.kv dd,.st,.well,.unit,.tile,.fk{font-family:var(--f-mono);font-variant-numeric:tabular-nums}\n"
+    "kbd{font-size:11px;padding:0 4px;color:var(--text);background:var(--chassis);border:1px solid var(--grid)}\n"
+    "button,.btn{margin:0;min-height:var(--row);padding:4px 6px;font:inherit;color:var(--text);background:var(--panel);border-style:solid;border-width:1px;border-color:var(--bevel-hi) var(--bevel-lo) var(--bevel-lo) var(--bevel-hi);cursor:pointer}\n"
+    "button:hover,.btn:hover{background:var(--grid)}\n"
+    "button:active,.btn:active{background:var(--text);color:var(--chassis);border-color:var(--bevel-lo) var(--bevel-hi) var(--bevel-hi) var(--bevel-lo)}\n"
+    "[disabled],[aria-disabled='true']{color:var(--dim);cursor:not-allowed}\n"
+    "[disabled]:hover,[aria-disabled='true']:hover{background:var(--panel)}\n"
+    "input,select,textarea{margin:0;min-height:var(--row);padding:4px 6px;font:inherit;color:var(--text);background:var(--well);border:1px solid var(--grid)}\n"
+    "input[type=checkbox],input[type=radio]{appearance:none;-webkit-appearance:none;width:12px;height:12px;min-height:0;padding:0;margin:0 4px 0 0;vertical-align:-2px;background:var(--well);border:1px solid var(--bevel-hi)}\n"
+    "input[type=checkbox]:checked,input[type=radio]:checked{background:var(--text)}\n"
+    "table{border-collapse:collapse;width:100%}\n"
+    "th,td{padding:4px 6px;border:1px solid var(--grid);text-align:left;vertical-align:top}\n"
+    "th{background:var(--panel);color:var(--text);font-weight:normal;font-size:10px;letter-spacing:.08em;text-transform:uppercase}\n"
+    "fieldset{margin:0;min-width:0;padding:4px 6px 6px;border:1px solid var(--grid);background:var(--panel)}\n"
+    "legend{padding:0 4px;background:var(--panel);color:var(--text);font:10px/12px var(--f-mono);letter-spacing:.08em;text-transform:uppercase}\n"
+    "\n"
+    "/* 3. COMPONENTS */\n"
+    ".alarm-bar{position:fixed;top:0;left:0;right:0;z-index:10;display:flex;align-items:stretch;height:30px;overflow:hidden;white-space:nowrap;background:var(--panel);color:var(--text);border-bottom:1px solid var(--grid);font:12px/16px var(--f-mono)}\n"
+    ".alarm-bar>*{display:flex;align-items:center;padding:0 6px;border-left:1px solid var(--grid)}\n"
+    ".fkey-bar{position:fixed;left:0;right:0;bottom:0;z-index:10;display:flex;height:32px;background:var(--panel);border-top:1px solid var(--grid)}\n"
+    ".fkey-bar>*{flex:1 1 0;min-width:0;height:100%;padding:0 4px;overflow:hidden;white-space:nowrap;text-align:left}\n"
+    ".fk{margin-right:4px;font-size:11px;font-weight:bold}\n"
+    ".pane{margin:0 -1px -1px 0;padding:4px 6px;border:1px solid var(--grid);background:var(--panel)}\n"
+    ".lbl{display:inline-block;margin:-6px 0 0 -2px;padding:0 4px;background:var(--panel);color:var(--text);font:10px/12px var(--f-mono);letter-spacing:.08em;text-transform:uppercase}\n"
+    ".well{display:inline-block;min-width:8ch;padding:3px 6px;text-align:right;background:var(--well);color:var(--text);border-style:solid;border-width:1px;border-color:var(--bevel-lo) var(--bevel-hi) var(--bevel-hi) var(--bevel-lo)}\n"
+    ".unit{margin-left:4px;color:var(--dim)}\n"
+    ".annunciator{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:0;border-top:1px solid var(--grid);border-left:1px solid var(--grid)}\n"
+    ".tile{min-width:0;padding:4px 6px;background:#181818;color:#5c5c5c;border-right:1px solid var(--grid);border-bottom:1px solid var(--grid);font:10px/12px var(--f-mono);letter-spacing:.08em;text-transform:uppercase;overflow-wrap:anywhere}\n"
+    ".st{display:inline-block;padding:0 4px;border:1px solid var(--panel);color:var(--text);white-space:nowrap}\n"
+    ".st.live{border-color:var(--live)}\n"
+    ".btn-arm.armed{color:var(--p2);border-width:4px;border-style:solid;border-image:repeating-linear-gradient(45deg, #ffaa00 0 6px, #000 6px 12px) 4}\n"
+    ".btn-exec,.btn-exec:hover{background:var(--p1);color:#000;font-weight:bold}\n"
+    ".btn-arm.armed.btn-exec,.btn-arm.armed.btn-exec:hover{background:var(--p1);color:#000}\n"
+    ".bus-h{display:block;height:0;border-top:2px solid var(--dim)}\n"
+    ".bus-v{display:block;width:0;min-height:var(--row);margin:0 auto;border-left:2px solid var(--dim)}\n"
+    ".bus-h.live,.bus-v.live{border-color:var(--live)}\n"
+    ".nav{margin:0;padding:0;list-style:none;border-top:1px solid var(--grid)}\n"
+    ".nav a,.nav button{display:flex;align-items:center;justify-content:space-between;width:100%;min-height:var(--row);margin:0;padding:4px 6px;border:0;border-bottom:1px solid var(--grid);background:var(--chassis);color:var(--text);text-align:left;text-decoration:none}\n"
+    ".nav a:hover:not([aria-current]),.nav button:hover:not([aria-current]){background:var(--grid)}\n"
+    ".nav .kbd{margin-left:auto;padding-left:6px;font-size:11px;color:var(--text)}\n"
+    ".nav [aria-current] .kbd{color:var(--chassis)}\n"
+    ".tabs{display:flex;flex-wrap:wrap;margin:0;padding:0;border-top:1px solid var(--grid);border-left:1px solid var(--grid)}\n"
+    ".tabs button{margin:0;min-height:var(--row);border:0;border-right:1px solid var(--grid);border-bottom:1px solid var(--grid);background:var(--chassis)}\n"
+    ".nav [aria-current],.tabs [aria-current],.tabs [aria-selected='true'],.fkey-bar [aria-current]{background:var(--text);color:var(--chassis)}\n"
+    ".nav [aria-current]:hover,.tabs [aria-current]:hover,.tabs [aria-selected='true']:hover,.fkey-bar [aria-current]:hover{background:var(--text);color:var(--chassis)}\n"
+    ".toast{position:sticky;bottom:32px;z-index:5;min-height:var(--row);padding:4px 6px;background:var(--panel);color:var(--text);border-top:1px solid var(--grid);font:12px/16px var(--f-mono)}\n"
+    ".kv{display:grid;grid-template-columns:minmax(8em,max-content) minmax(0,1fr);gap:0;margin:0;border-top:1px solid var(--grid);border-left:1px solid var(--grid)}\n"
+    ".kv dt,.kv dd{margin:0;min-height:var(--row);padding:4px 6px;border-right:1px solid var(--grid);border-bottom:1px solid var(--grid)}\n"
+    ".kv dd{overflow-wrap:anywhere}\n"
+    "@media (max-width:480px){.kv{grid-template-columns:1fr}}\n"
+    "\n"
+    "/* Off-normal modifiers last, so they win over component backgrounds. */\n"
+    ".p1,.p1:hover{background:var(--p1);color:#000;font-weight:bold}\n"
+    ".p2,.p2:hover{background:var(--p2);color:#000}\n"
+    ".p1.unack{animation:blink 1s steps(1) infinite}\n"
+    "@keyframes blink{0%,49%{background:#ff2200;color:#000}50%,100%{background:#000000;color:#ff2200}}\n"
+    "@media (prefers-reduced-motion:reduce){.p1.unack{animation:none}}\n"
+    ".tile.p1,.tile.p2{outline:1px solid #000;outline-offset:-2px}\n";
+
+/* AdBlocker product rules (brief 7b), sent raw right after ADB_THEME_RAW by
+ * the theme and product sends. Not a format string, so a single % is correct here. */
+static const char ADB_PRODUCT_RAW[] =
+    "/* product-7b.css - AdBlocker console product rules, brief 7b. Sent raw after shared-theme.css. Not a format string. */\n"
+    "body{margin:0;padding:30px 0 36px;max-width:960px}\n"
+    "h2{margin:0;padding:4px 6px;font:10px/12px var(--f-mono);letter-spacing:.08em;text-transform:uppercase;background:var(--panel);border-bottom:1px solid var(--grid)}\n"
+    "h2 small{font:12px/16px var(--f-ui);letter-spacing:0;text-transform:none;color:var(--dim)}\n"
+    "h3{margin:0;padding:4px 6px 0;min-height:var(--row);font:10px/12px var(--f-mono);letter-spacing:.08em;text-transform:uppercase;color:var(--text);background:none;border:0;border-top:1px solid var(--grid)}\n"
+    "p{margin:0;padding:4px 6px}\n"
+    "small{font-size:12px;color:var(--dim)}\n"
+    "form{margin:0;padding:4px 6px}\n"
+    "td form,th form{margin:0;padding:0}\n"
+    "form+br{display:none}\n"
+    "ul{margin:0;padding:0;list-style:none}\n"
+    "li{margin:0 0 -1px;padding:0}\n"
+    "li button{width:100%;text-align:left}\n"
+    "textarea{width:100%;box-sizing:border-box}\n"
+    "table{margin:0}\n"
+    "th{padding:4px 6px;background:var(--panel);color:var(--dim);font:10px/12px var(--f-mono);letter-spacing:.08em;text-transform:uppercase}\n"
+    "td{padding:4px 6px;font-family:var(--f-mono);font-variant-numeric:tabular-nums}\n"
+    "td button{min-height:20px;padding:1px 6px}\n"
+    "fieldset{padding:4px 6px}\n"
+    "legend{padding:0 4px;background:var(--panel);font:10px/12px var(--f-mono);letter-spacing:.08em;text-transform:uppercase;color:var(--text)}\n"
+    ".lbl{display:inline-block;margin:0;padding:0 4px;background:var(--panel);color:var(--text);font:10px/12px var(--f-mono);letter-spacing:.08em;text-transform:uppercase}\n"
+    ".ok{color:var(--text)}\n"
+    ".ok::before{content:'[ · ] '}\n"
+    ".warn{background:var(--p2);color:#000;font-weight:bold}\n"
+    ".warn::before{content:'[ ▲ ] '}\n"
+    ".warn:empty::before{content:none}\n"
+    ".err{background:var(--p1);color:#000;font-weight:bold}\n"
+    ".err::before{content:'[ ◆ ] '}\n"
+    ".blk{color:var(--text)}\n"
+    ".blk::before{content:'[ ■ ] '}\n"
+    ".rw{color:var(--text)}\n"
+    ".rw::before{content:'[ · ] '}\n"
+    ".live{color:var(--live)}\n"
+    ".st::before{content:'[ '}\n"
+    ".st::after{content:' ]'}\n"
+    ".st.ok::before{content:'[ · '}\n"
+    ".st.warn::before{content:'[ ▲ '}\n"
+    ".st.err::before{content:'[ ◆ '}\n"
+    "/* Status word is a chip, not a well: wells hold numbers only (brief 7b). */\n"
+    ".stat .st{display:block;flex:1 1 auto;min-height:var(--row);padding:4px 6px}\n"
+    ".stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:0;margin:0 0 -1px;border-top:1px solid var(--grid);border-left:1px solid var(--grid)}\n"
+    ".stat{min-width:0;margin:0 -1px -1px 0;padding:4px 6px;border:1px solid var(--grid);background:var(--panel)}\n"
+    ".stat .val{display:block;margin:0;padding:3px 6px;min-height:var(--row);text-align:right;background:var(--well);color:var(--text);border-width:1px;border-style:solid;border-color:#000 #3a3a3a #3a3a3a #000;font:16px/20px var(--f-mono);font-variant-numeric:tabular-nums}\n"
+    ".stat .val.warn{background:var(--p2);color:#000;font-weight:bold;border-color:#000}\n"
+    ".readrow{display:flex;align-items:stretch}\n"
+    ".readrow .val{flex:1 1 auto;min-width:0}\n"
+    ".readrow .unit{flex:none;align-self:center;margin-left:4px}\n"
+    "kbd{font-size:12px}\n"
+    ".topbar{display:flex;align-items:center;justify-content:space-between;min-height:28px;padding:0 6px;background:var(--panel);border-bottom:1px solid var(--grid)}\n"
+    ".topbar h2{padding:0;border:0;background:none}\n"
+    ".topbar form{margin:0;padding:0}\n"
+    ".tab{display:none}\n"
+    ".tab.active{display:block}\n"
+    ".tabs button.active{background:var(--text);border-color:var(--text);color:var(--chassis)}\n"
+    ".banner{margin:0;padding:4px 6px;background:var(--p2);color:#000;border:0}\n"
+    ".banner::before{content:'[ ▲ ] '}\n"
+".btn-arm:not(.armed)::before{content:'[ ARM ] '}\n"
+".btn-arm.armed::before{content:'[ EXEC ] '}\n"
+"/* Data-table cells (census, log and top: counts and ages) are table data, exempt from the sunken-well rule. pocket-dial applies the same exemption to its duration and count cells. */\n"
+    "input[name=ip],input[name=nm],input[name=gw],input[name=dns],input[name=server],input[name=min]{font-family:var(--f-mono);font-variant-numeric:tabular-nums}\n"
+    "input[type=file]::file-selector-button{border-style:solid;border-width:1px;border-color:var(--bevel-hi) var(--bevel-lo) var(--bevel-lo) var(--bevel-hi);border-radius:0;background:var(--panel);color:var(--text);font:inherit;min-height:var(--row);padding:3px 6px;cursor:pointer}\n"
+    "input[type=file]::file-selector-button:hover{background:var(--grid)}\n"
+    "input[type=file]::file-selector-button:active{background:var(--text);color:var(--chassis);border-color:var(--bevel-lo) var(--bevel-hi) var(--bevel-hi) var(--bevel-lo)}\n";
+
+/* Console chrome: the alarm banner and the F-key bar. Sent in the head right after the product
+ * rules on each console page; it closes and reopens <style> so the page's own </style> still closes it. */
+static const char ADB_CHROME_RAW[] =
+    "</style><script>\n"
+    "(function(){\n"
+    "var TABS={F1:'dashboard',F2:'blocklist',F3:'network',F4:'access',F6:'upstream'};\n"
+    "var PAGES={F7:'/census',F8:'/log',F9:'/top',F10:'/metrics/view'};\n"
+    "var NAMES=[['F1','DASH'],['F2','BLOCK'],['F3','NET'],['F4','ACCESS'],['F6','UPSTREAM'],['F7','CENSUS'],['F8','LOG'],['F9','TOP'],['F10','METRICS']];\n"
+    "var BTN=[],ST=null,TX=null,ACK=null,ALM={list:[],sig:'',nodata:true};\n"
+    "function onStatus(){return typeof showTab==='function';}\n"
+    "function activeTab(){var a=document.querySelector('.tab.active');return a?a.id.replace('tab-',''):'';}\n"
+    "function here(k){if(TABS[k])return onStatus()&&activeTab()===TABS[k];return location.pathname===PAGES[k];}\n"
+    "function go(k){\n"
+    " if(TABS[k]){if(onStatus())showTab(TABS[k]);else location.href='/#'+TABS[k];return;}\n"
+    " location.href=PAGES[k];}\n"
+    "function mark(){BTN.forEach(function(b){var k=b.getAttribute('data-fk');if(here(k))b.setAttribute('aria-current','page');else b.removeAttribute('aria-current');});}\n"
+    "function ackGet(){try{return sessionStorage.getItem('adb-ack')||'';}catch(e){return '';}}\n"
+    "function ackSet(v){try{sessionStorage.setItem('adb-ack',v);}catch(e){}}\n"
+    "function renderAlarm(){\n"
+    " var on=ALM.list.length>0,acked=on&&ackGet()===ALM.sig;\n"
+    " var part=ALM.nodata?' · STATUS PARTIAL':'';\n"
+    " ST.className='st'+(on&&!acked?' p2':'');\n"
+    " ST.textContent=on?(acked?'· ACKED':'▲ WARN'):(ALM.nodata?'◆ NO DATA':'· IDLE');\n"
+    " ACK.hidden=!on||acked;\n"
+    " TX.textContent=on?(acked?'':ALM.list.map(function(a){return '[ ▲ WARN ] '+a.t;}).join(' · ')+part):(ALM.nodata?'device status unreadable':'');}\n"
+    "function getJ(u){\n"
+    " return fetch(u,{cache:'no-store'}).then(function(r){\n"
+    "  if(!r.ok||r.redirected)return null;\n"
+    "  return r.json();\n"
+    " }).catch(function(){return null;});}\n"
+    "function poll(){\n"
+    " if(document.hidden)return;\n"
+    " Promise.all([getJ('/metrics'),getJ('/alarms')]).then(function(v){\n"
+    "  var m=v[0],a=v[1],list=[];\n"
+    "  if(a){\n"
+    "   if(a.setup_ap)list.push({k:'setup',v:1,t:'SETUP AP ACTIVE'});\n"
+    "   if(a.wifi_down)list.push({k:'wifi',v:1,t:'WI-FI NOT JOINED'});\n"
+    "  }\n"
+    "  if(m){\n"
+    "   if(+m.upstream_timeouts>0)list.push({k:'upstream',v:m.upstream_timeouts,t:'UPSTREAM TIMEOUTS '+m.upstream_timeouts});\n"
+    "   if(+m.blocklist_dropped>0)list.push({k:'overflow',v:m.blocklist_dropped,t:'FEED OVERFLOW '+m.blocklist_dropped});\n"
+    "   if(+m.blocklist_feed_failures>0)list.push({k:'feedfail',v:m.blocklist_feed_failures,t:'FEED EXCEPTION DROPS '+m.blocklist_feed_failures});\n"
+    "  }\n"
+    "  ALM.nodata=!m||!a;\n"
+    "  ALM.list=list;\n"
+    "  ALM.sig=list.map(function(x){return x.k+'='+x.v;}).join(';')+(ALM.nodata?'|nodata':'');\n"
+    "  renderAlarm();mark();});}\n"
+    "function build(){\n"
+    " var bar=document.createElement('div');bar.className='alarm-bar';bar.id='adb-alarm';\n"
+    " bar.setAttribute('role','region');bar.setAttribute('aria-label','Unacknowledged alarms');\n"
+    " ST=document.createElement('span');ST.id='adb-alarm-state';\n"
+    " ACK=document.createElement('button');ACK.type='button';ACK.className='btn';ACK.id='adb-alarm-ack';ACK.textContent='[ ACK ]';\n"
+    " TX=document.createElement('span');TX.id='adb-alarm-text';TX.setAttribute('role','status');\n"
+    " ACK.addEventListener('click',function(){ackSet(ALM.sig);renderAlarm();});\n"
+    " bar.appendChild(ST);bar.appendChild(ACK);bar.appendChild(TX);\n"
+    " document.body.insertBefore(bar,document.body.firstChild);\n"
+    " var fk=document.createElement('nav');fk.className='fkey-bar';fk.setAttribute('aria-label','Function keys');\n"
+    " NAMES.forEach(function(p){\n"
+    "  var b=document.createElement('button');b.type='button';b.setAttribute('data-fk',p[0]);b.setAttribute('aria-keyshortcuts',p[0]);\n"
+    "  var f=document.createElement('span');f.className='fk';f.textContent=p[0];\n"
+    "  b.appendChild(f);b.appendChild(document.createTextNode(p[1]));\n"
+    "  b.addEventListener('click',function(){go(p[0]);setTimeout(mark,0);});\n"
+    "  fk.appendChild(b);BTN.push(b);});\n"
+    " document.body.appendChild(fk);\n"
+    " document.addEventListener('keydown',function(e){\n"
+    "  if(e.ctrlKey||e.metaKey||e.altKey||e.shiftKey)return;\n"
+    "  var k=e.key;\n"
+    "  if(!TABS[k]&&!PAGES[k])return;\n"
+    "  e.preventDefault();go(k);setTimeout(mark,0);});\n"
+    " document.addEventListener('visibilitychange',function(){if(!document.hidden)poll();});\n"
+    " window.addEventListener('load',mark);\n"
+    " renderAlarm();mark();poll();setInterval(poll,10000);}\n"
+    "document.addEventListener('DOMContentLoaded',build);\n"
+    "})();\n"
+    "</script><style>\n";
+
+/* Shared shell for the two pre-login pages (setup wizard, login) and the
+ * onboarding network page. Kept deliberately plain: no tabs, no refresh,
+ * nothing that needs a session. Sent as chunks: AUTH_PAGE_HEAD, then
+ * the theme and product sends, then the page buffer, which opens with AUTH_PAGE_TAIL (the
+ * only part that is a printf format, so its percent signs are doubled). */
 static const char AUTH_PAGE_HEAD[] =
     "<!DOCTYPE html><html><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>"
     "<title>DNS Sinkhole</title>"
-    "<style>"
-    ":root{--bg:#fefefe;--face:#f4f4f4;--face-raised:#f0f0f0;--ink:#454545;--ink-dim:#777;--brass:#07a;--line:#ddd;--alert:#c0392b;--mono:ui-monospace,Consolas,monospace;}"
-    "@media(prefers-color-scheme:dark){:root{--bg:#0e1117;--face:#161b22;--face-raised:#1f242c;--ink:#d9d9d9;--ink-dim:#999;--brass:#00a2e7;--line:#30363d;--alert:#d24637;}}"
-    "body{font-family:var(--mono);color:var(--ink);background:var(--bg);max-width:520px;margin:3em auto;padding:0 1em;line-height:1.5}"
-    "h2{font-size:1.15em;letter-spacing:.08em;text-transform:uppercase;color:var(--ink)}"
-    "input{font:inherit;background:var(--bg);color:var(--ink);border:1px solid var(--line);border-radius:2px;padding:.45em;width:100%%;box-sizing:border-box;margin:.25em 0 .8em}"
-    "input:focus{border-color:var(--brass);outline:none}"
-    "button{font:inherit;background:var(--face-raised);color:var(--ink);border:1px solid var(--line);border-radius:2px;padding:.5em 1.2em;cursor:pointer;letter-spacing:.06em;text-transform:uppercase}"
-    "button:hover{border-color:var(--ink-dim)}"
-    ".err{color:var(--alert)}"
-    ".fp{word-break:break-all;background:var(--face);border:1px solid var(--line);padding:.6em;font-size:.85em;border-radius:2px}"
-    "small{color:var(--ink-dim)}a{color:var(--brass)}"
+    "<style>\n";
+static const char AUTH_PAGE_TAIL[] =
+    "body{max-width:520px}\n"
+    "label{display:block;margin:0;padding:4px 6px;border-bottom:1px solid var(--grid)}\n"
+    "input:not([type=radio]):not([type=checkbox]){width:100%%;margin:2px 0 4px}\n"
+    ".fp{margin:0 0 -1px;padding:4px 6px;background:var(--well);border:1px solid var(--grid);font:12px/16px var(--f-mono);overflow-wrap:anywhere}\n"
+    "li button{width:100%%;text-align:left}\n"
+    "</style></head><body>";
+
+/* Shell for the small interstitial pages (check result, reboot, firmware
+ * received): PLAIN_PAGE_HEAD, then the theme and product sends, then PLAIN_PAGE_TAIL, each a
+ * raw chunk, then the page body. None is a format string. */
+static const char PLAIN_PAGE_HEAD[] =
+    "<!DOCTYPE html><html><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>"
+    "<title>DNS Sinkhole</title>"
+    "<style>\n";
+static const char PLAIN_PAGE_TAIL[] =
+    "body{max-width:520px}\n"
     "</style></head><body>";
 
 /* Read a form body field as a bounded integer. Leaves *out unchanged and
@@ -426,7 +681,12 @@ static esp_err_t setup_page(httpd_req_t *r, const char *err)
     char fp[96]; web_tls_fingerprint(fp, sizeof(fp));
     char errp[128]; err_html(errp, sizeof(errp), err);
     int n = 0;
-    page_appendf(page, sizeof(page), &n, AUTH_PAGE_HEAD);
+    httpd_resp_set_type(r, "text/html; charset=utf-8");
+    if (httpd_resp_send_chunk(r, AUTH_PAGE_HEAD, sizeof(AUTH_PAGE_HEAD) - 1) != ESP_OK)
+        return ESP_FAIL;
+    if (httpd_resp_send_chunk(r, ADB_THEME_RAW, sizeof(ADB_THEME_RAW) - 1) != ESP_OK || httpd_resp_send_chunk(r, ADB_PRODUCT_RAW, sizeof(ADB_PRODUCT_RAW) - 1) != ESP_OK || httpd_resp_send_chunk(r, ADB_CHROME_RAW, sizeof(ADB_CHROME_RAW) - 1) != ESP_OK)
+        return ESP_FAIL;
+    page_appendf(page, sizeof(page), &n, AUTH_PAGE_TAIL);
     page_appendf(page, sizeof(page), &n,
         "<h2>Welcome &mdash; secure this device</h2>"
         "<p>This DNS sinkhole will hold your Wi-Fi password and every client's DNS history. "
@@ -450,8 +710,7 @@ static esp_err_t setup_page(httpd_req_t *r, const char *err)
         errp,
         WEB_AUTH_USER_MAX, WEB_AUTH_PASS_MIN, WEB_AUTH_PASS_MAX,
         WEB_AUTH_PASS_MIN, WEB_AUTH_PASS_MAX, WEB_AUTH_PASS_MIN, WEB_AUTH_PASS_MAX);
-    send_html(r, page);
-    return ESP_OK;
+    return send_chunked_tail(r, page);
 }
 
 static esp_err_t handle_setup_get(httpd_req_t *r) { return setup_page(r, nullptr); }
@@ -511,7 +770,12 @@ static esp_err_t handle_setup_network_get(httpd_req_t *r)
     char csrf[33] = ""; web_auth_session_csrf(s_req_sid, csrf, sizeof(csrf));
     static EXT_RAM_BSS_ATTR char page[8192];
     int n = 0;
-    page_appendf(page, sizeof(page), &n, AUTH_PAGE_HEAD);
+    httpd_resp_set_type(r, "text/html; charset=utf-8");
+    if (httpd_resp_send_chunk(r, AUTH_PAGE_HEAD, sizeof(AUTH_PAGE_HEAD) - 1) != ESP_OK)
+        return ESP_FAIL;
+    if (httpd_resp_send_chunk(r, ADB_THEME_RAW, sizeof(ADB_THEME_RAW) - 1) != ESP_OK || httpd_resp_send_chunk(r, ADB_PRODUCT_RAW, sizeof(ADB_PRODUCT_RAW) - 1) != ESP_OK || httpd_resp_send_chunk(r, ADB_CHROME_RAW, sizeof(ADB_CHROME_RAW) - 1) != ESP_OK)
+        return ESP_FAIL;
+    page_appendf(page, sizeof(page), &n, AUTH_PAGE_TAIL);
     page_appendf(page, sizeof(page), &n, "<h2>Connect this device to your network</h2>");
 
     if (dns_sink_eth_built()) {
@@ -562,7 +826,7 @@ static esp_err_t handle_setup_network_get(httpd_req_t *r)
             "<h3>Wi-Fi</h3>"
             "<p>Currently configured SSID: <b>%s</b></p>"
             "<button type=button onclick=\"wifiScan()\">Scan for networks</button>"
-            "<span id=wifi-scan-status></span>"
+            "<span id=wifi-scan-status class=mono></span>"
             "<ul id=wifi-results></ul>"
             "<form method=post action='/wifi/connect?csrf=%s'>"
             "<input id=wifi-ssid name=ssid placeholder='SSID' size=24> "
@@ -570,18 +834,18 @@ static esp_err_t handle_setup_network_get(httpd_req_t *r)
             "<button>Connect</button></form>"
             "<script>"
             "var CSRF='%s';"
-            "function wifiStat(t){document.getElementById('wifi-scan-status').textContent=t;}"
-            "function wifiScan(){wifiStat(' starting\xe2\x80\xa6');"
+            "function wifiStat(t,c){var e=document.getElementById('wifi-scan-status');e.className=c||'mono';e.textContent=t;}"
+            "function wifiScan(){wifiStat('· STARTING','st');"
             "fetch('/wifi/scan',{method:'POST',headers:{'X-CSRF':CSRF}}).then(function(r){return r.json()})"
-            ".then(function(d){if(d.state=='error'){wifiStat(' '+(d.err||'scan failed'));return;}"
+            ".then(function(d){if(d.state=='error'){wifiStat('▲ '+(d.err||'SCAN FAILED'),'st');return;}"
             "setTimeout(wifiPoll,600);})"
-            ".catch(function(){wifiStat(' scan failed');});}"
+            ".catch(function(){wifiStat('▲ SCAN FAILED','st');});}"
             "function wifiPoll(){"
             "fetch('/wifi/scan').then(function(r){return r.json()}).then(function(d){"
-            "if(d.state=='scanning'){wifiStat(' scanning\xe2\x80\xa6');setTimeout(wifiPoll,800);return;}"
-            "if(d.state=='error'){wifiStat(' '+(d.err||'scan failed'));return;}"
+            "if(d.state=='scanning'){wifiStat('· SCANNING','st');setTimeout(wifiPoll,800);return;}"
+            "if(d.state=='error'){wifiStat('▲ '+(d.err||'SCAN FAILED'),'st');return;}"
             "wifiRender(d);})"
-            ".catch(function(){wifiStat(' scan failed');});}"
+            ".catch(function(){wifiStat('▲ SCAN FAILED','st');});}"
             "function wifiRender(d){"
             "var ul=document.getElementById('wifi-results');ul.innerHTML='';"
             "if(d.state!='done'){wifiStat('');return;}"
@@ -589,7 +853,9 @@ static esp_err_t handle_setup_network_get(httpd_req_t *r)
             "d.aps.forEach(function(ap){"
             "var li=document.createElement('li');"
             "var btn=document.createElement('button');btn.type='button';"
-            "btn.textContent=ap.ssid+' ('+ap.rssi+' dBm)'+(ap.auth==0?' [open]':'');"
+            "btn.appendChild(document.createTextNode(ap.ssid+' '));"
+            "var rs=document.createElement('span');rs.className='mono';rs.textContent='('+ap.rssi+' dBm)';btn.appendChild(rs);"
+            "if(ap.auth==0)btn.appendChild(document.createTextNode(' [open]'));"
             "btn.onclick=function(){document.getElementById('wifi-ssid').value=ap.ssid;"
             "document.getElementById('wifi-pass').focus();};"
             "li.appendChild(btn);ul.appendChild(li);});}"
@@ -599,13 +865,16 @@ static esp_err_t handle_setup_network_get(httpd_req_t *r)
     }
 
     page_appendf(page, sizeof(page), &n,
-        "<form method=post action='/reboot?csrf=%s' style='margin-top:1em'>"
-        "<button>Reboot now</button></form>"
+        "<form method=post action='/reboot?csrf=%s'>"
+        "<button class=btn-arm>Reboot now</button></form>"
         "<p><a href=/>Skip &mdash; go to the dashboard &rarr;</a></p>"
+        "<script>document.addEventListener('click',function(e){var b=e.target;"
+        "if(!b||b.tagName!='BUTTON'||!b.classList.contains('btn-arm')||b.classList.contains('armed'))return;"
+        "e.preventDefault();b.classList.add('armed','btn-exec');"
+        "setTimeout(function(){b.classList.remove('armed','btn-exec');},10000);});</script>"
         "</body></html>",
         csrf);
-    send_html(r, page);
-    return ESP_OK;
+    return send_chunked_tail(r, page);
 }
 
 /* ── GET/POST /login, POST /logout ───────────────────────────────── */
@@ -614,7 +883,12 @@ static esp_err_t login_page(httpd_req_t *r, const char *err)
     static EXT_RAM_BSS_ATTR char page[2048];
     char errp[128]; err_html(errp, sizeof(errp), err);
     int n = 0;
-    page_appendf(page, sizeof(page), &n, AUTH_PAGE_HEAD);
+    httpd_resp_set_type(r, "text/html; charset=utf-8");
+    if (httpd_resp_send_chunk(r, AUTH_PAGE_HEAD, sizeof(AUTH_PAGE_HEAD) - 1) != ESP_OK)
+        return ESP_FAIL;
+    if (httpd_resp_send_chunk(r, ADB_THEME_RAW, sizeof(ADB_THEME_RAW) - 1) != ESP_OK || httpd_resp_send_chunk(r, ADB_PRODUCT_RAW, sizeof(ADB_PRODUCT_RAW) - 1) != ESP_OK || httpd_resp_send_chunk(r, ADB_CHROME_RAW, sizeof(ADB_CHROME_RAW) - 1) != ESP_OK)
+        return ESP_FAIL;
+    page_appendf(page, sizeof(page), &n, AUTH_PAGE_TAIL);
     page_appendf(page, sizeof(page), &n,
         "<h2>DNS Sinkhole &mdash; sign in</h2>"
         "%s"
@@ -625,8 +899,7 @@ static esp_err_t login_page(httpd_req_t *r, const char *err)
         "</body></html>",
         errp,
         WEB_AUTH_USER_MAX, WEB_AUTH_PASS_MAX);
-    send_html(r, page);
-    return ESP_OK;
+    return send_chunked_tail(r, page);
 }
 
 static esp_err_t handle_login_get(httpd_req_t *r)
@@ -683,7 +956,9 @@ static esp_err_t handle_logout(httpd_req_t *r)
  * substitute those two; now each half goes out as its own chunk straight
  * from flash and never touches the page buffer. Emitted bytes are
  * unchanged. These are no longer format strings, so a literal percent is
- * written once, not doubled. */
+ * written once, not doubled. The <style> opened at the end of HEAD_1 is
+ * filled by the theme and product sends (shared theme, then product rules), then closed by
+ * HEAD_1B: the same chunks, in order. */
 static const char STATUS_HEAD_1[] =
         "<!DOCTYPE html><html><head><meta charset=utf-8>"
         "<title>DNS Sinkhole</title>"
@@ -691,36 +966,33 @@ static const char STATUS_HEAD_1[] =
          * kicked you back to the Dashboard mid-edit, and it wiped half-typed
          * form input on the config tabs (#63). Refresh is JS-driven below and
          * only runs while the Dashboard is actually showing. */
-        "<style>"
-        ":root{--bg:#fefefe;--face:#f4f4f4;--face-raised:#f0f0f0;--ink:#454545;--ink-dim:#777;--brass:#07a;--brass-hi:#07a;--line:#ddd;--alert:#c0392b;--ok:#1a7f37;--warn:#b58900;--mono:ui-monospace,Consolas,monospace;}"
-        "@media(prefers-color-scheme:dark){:root{--bg:#0e1117;--face:#161b22;--face-raised:#1f242c;--ink:#d9d9d9;--ink-dim:#999;--brass:#00a2e7;--brass-hi:#00a2e7;--line:#30363d;--alert:#d24637;--ok:#5fd377;--warn:#e3b341;}}"
-        "body{font-family:var(--mono);color:var(--ink);background:var(--bg);max-width:780px;margin:2em auto;padding:0 1em;line-height:1.5;}"
-        "h2{font-size:1.15em;letter-spacing:.08em;text-transform:uppercase;margin:0 0 .5em;color:var(--ink);}"
-        "table{border-collapse:collapse;width:100%;font-size:.92em;margin:1em 0;}"
-        "td,th{border:1px solid var(--line);padding:.4em .7em;text-align:left;}"
-        "th{background:var(--face-raised);color:var(--ink);font-size:.8em;letter-spacing:.06em;text-transform:uppercase;}"
-        ".ok{color:var(--ok);}.warn{color:var(--warn);}.err{color:var(--alert);}"
-        ".stats{display:flex;gap:.8em;flex-wrap:wrap;margin:1.2em 0;}"
-        ".stat{background:var(--face);border:1px solid var(--line);border-radius:3px;padding:.6em 1em;min-width:110px;text-align:center;}"
-        ".stat .val{font-size:1.5em;font-weight:700;color:var(--brass-hi);}"
-        ".stat .lbl{font-size:.72em;letter-spacing:.08em;text-transform:uppercase;color:var(--ink-dim);}"
-        ".tabs{display:flex;gap:.3em;flex-wrap:wrap;border-bottom:1px solid var(--line);margin-bottom:1.2em;}"
-        ".tabs button{background:none;border:none;border-bottom:2px solid transparent;padding:.5em .8em;font:inherit;font-size:.85em;letter-spacing:.06em;text-transform:uppercase;cursor:pointer;color:var(--ink-dim);}"
-        ".tabs button.active{border-bottom-color:var(--brass-hi);color:var(--brass-hi);font-weight:700;}"
-        ".tab{display:none;}.tab.active{display:block;}"
-        "button,input,select{font:inherit;}"
-        "button{background:var(--face-raised);color:var(--ink);border:1px solid var(--line);border-radius:2px;padding:4px 10px;cursor:pointer;}"
-        "button:hover{border-color:var(--ink-dim);}"
-        "input,select{background:var(--bg);color:var(--ink);border:1px solid var(--line);border-radius:2px;padding:4px 8px;}"
-        "input:focus,select:focus{border-color:var(--brass);outline:none;}"
-        "a{color:var(--brass);text-underline-offset:.15em;}"
+        "<style>\n";
+/* Status-page rules now live in ADB_PRODUCT_RAW (sent by the theme and product sends); this
+ * chunk only closes the <style> and opens the script. */
+static const char STATUS_HEAD_1B[] =
         "</style>"
         "<script>";
 static const char STATUS_HEAD_2[] =
+        /* ARM then EXEC for every .btn-arm button (Reboot, Clear all): the first
+         * click arms it for 10 s and does not submit; a second click while armed
+         * falls through to the form's own submit. */
+        "document.addEventListener('click',function(e){var b=e.target;"
+        "if(!b||b.tagName!='BUTTON'||!b.classList.contains('btn-arm')||b.classList.contains('armed'))return;"
+        "e.preventDefault();b.classList.add('armed','btn-exec');"
+        "setTimeout(function(){b.classList.remove('armed','btn-exec');},10000);});"
         "document.addEventListener('submit',function(e){var f=e.target;"
         "if(f.method&&f.method.toLowerCase()=='post'){var a=f.getAttribute('action')||location.pathname;"
         "f.action=a+(a.indexOf('?')<0?'?':'&')+'csrf='+CSRF;}});"
-        "var _fetch=window.fetch;window.fetch=function(u,o){o=o||{};o.headers=o.headers||{};"
+        /* /pause's button is rendered with btn-arm (see handle_status); only
+         * the pause direction (on=1) is destructive, so un-arm Resume. */
+        "document.addEventListener('DOMContentLoaded',function(){"
+        "var f=document.querySelector('form[action=\"/pause\"]');if(!f)return;"
+        "var o=f.querySelector('input[name=on]'),b=f.querySelector('button');"
+        "if(o&&b&&o.value=='0')b.classList.remove('btn-arm');});"
+            "document.addEventListener('change',function(e){var t=e.target;if(!t||t.name!='scope')return;\n"
+    "var b=document.getElementById('pause-btn'),c=document.getElementById('pause-confirm');if(!b||!c)return;\n"
+    "var all=t.value=='all'&&t.checked;c.value=all?'1':'';b.classList.toggle('btn-arm',all);});\n"
+"var _fetch=window.fetch;window.fetch=function(u,o){o=o||{};o.headers=o.headers||{};"
         "o.headers['X-CSRF']=CSRF;return _fetch(u,o);};"
         "var RT=null;"
         "function showTab(id){"
@@ -776,12 +1048,12 @@ static const char STATUS_HEAD_2[] =
         "document.getElementById('st-queries').textContent=m.queries_total;"
         "document.getElementById('st-blocked').textContent=m.blocked;"
         "var pct=m.queries_total>0?(100*m.blocked/m.queries_total):0;"
-        "document.getElementById('st-rate').textContent=pct.toFixed(1)+'%';"
+        "document.getElementById('st-rate').textContent=pct.toFixed(1);"
         "var degraded=(m.blocklist_dropped>0)||(m.blocklist_feed_failures>0)||(m.exceptions_dropped>0);"
-        "var cls=m.blocklist_loading?'warn':(m.blocklist_paused?'warn':(degraded?'warn':'ok'));"
+        "var cls=m.blocklist_loading?'warn':(m.blocklist_paused?'ok':(degraded?'warn':'ok'));"
         "var txt=m.blocklist_loading?'Reloading':(m.blocklist_paused?'Paused':(degraded?'Degraded':'Active'));"
         "var st=document.getElementById('st-status');"
-        "st.className='val '+cls;st.textContent=txt;"
+        "st.className='st '+cls;st.textContent=txt;"
         "var sl=document.getElementById('stop-load-form');"
         "if(sl)sl.hidden=!m.blocklist_loading;"
         "renderPause(m.pause_list||[]);"
@@ -819,11 +1091,11 @@ static const char STATUS_HEAD_2[] =
         "var who=p.ip=='all'?'<b>All devices</b>':p.ip;"
         "if(p.ip==MY_IP)who+=' (this device)';"
         "var m=Math.floor(p.remaining_s/60),s=p.remaining_s%60;"
-        "h+='<tr><td>'+who+'</td><td>'+m+'m '+(s<10?'0':'')+s+'s</td>'+"
-        "'<td><form method=post action=/pause/resume style=\"margin:0\">'+"
+        "h+='<tr><td'+(p.ip=='all'?'':' class=mono')+'>'+who+'</td><td class=mono>'+m+'m '+(s<10?'0':'')+s+'s</td>'+"
+        "'<td><form method=post action=/pause/resume>'+"
         "'<input type=hidden name=ip value=\"'+p.ip+'\"><button>Resume now</button></form></td></tr>';"
         "}"
-        "h+='</table><form method=post action=/pause/resume style=\"margin-top:.4em\">'+"
+        "h+='</table><form method=post action=/pause/resume>'+"
         "'<input type=hidden name=ip value=every><button>Resume all now</button></form>';"
         "c.innerHTML=h;"
         "}"
@@ -839,11 +1111,11 @@ static const char STATUS_HEAD_2[] =
         "var c=document.getElementById('clock-status');if(!c)return;"
         "var d=new Date(epoch*1000);"
         "if(clock=='synced'){"
-        "c.innerHTML='Clock: <b>'+d.toISOString().slice(0,19).replace('T',' ')+"
+        "c.innerHTML='Clock: <b class=mono>'+d.toISOString().slice(0,19).replace('T',' ')+"
         "' UTC</b> (NTP synced)';"
         "}else{"
         "c.innerHTML='Clock: <span class=warn>syncing via NTP\\u2026</span> '+"
-        "'running on the <b>'+src+'</b> clock ('+d.toISOString().slice(0,10)+') '+"
+        "'running on the <b>'+src+'</b> clock (<span class=mono>'+d.toISOString().slice(0,10)+'</span>) '+"
         "'\\u2014 good enough for TLS certificate dates, not for timestamps, '+"
         "'so the log shows uptime until synced.';"
         "}"
@@ -860,7 +1132,7 @@ static const char STATUS_HEAD_2[] =
         "}"
         "</script>"
         "</head><body>"
-        "<div style='display:flex;justify-content:space-between;align-items:baseline'>"
+        "<div class=topbar>"
         "<h2>ESP32 AdBlocker</h2>"
         "<form method=post action=/logout><button>Sign out</button></form></div>"
         "<div class=tabs>"
@@ -909,6 +1181,10 @@ static esp_err_t handle_status(httpd_req_t *r)
     httpd_resp_set_type(r, "text/html; charset=utf-8");
     if (httpd_resp_send_chunk(r, STATUS_HEAD_1, sizeof(STATUS_HEAD_1) - 1) != ESP_OK)
         return ESP_FAIL;
+    if (httpd_resp_send_chunk(r, ADB_THEME_RAW, sizeof(ADB_THEME_RAW) - 1) != ESP_OK || httpd_resp_send_chunk(r, ADB_PRODUCT_RAW, sizeof(ADB_PRODUCT_RAW) - 1) != ESP_OK || httpd_resp_send_chunk(r, ADB_CHROME_RAW, sizeof(ADB_CHROME_RAW) - 1) != ESP_OK)
+        return ESP_FAIL;
+    if (httpd_resp_send_chunk(r, STATUS_HEAD_1B, sizeof(STATUS_HEAD_1B) - 1) != ESP_OK)
+        return ESP_FAIL;
     /* Per-session CSRF token. Every <form> gets it appended to its action
      * as ?csrf= on submit and every fetch() sends it as X-CSRF, so no
      * handler body-parsing had to change (csrf_ok reads the query string
@@ -934,15 +1210,15 @@ static esp_err_t handle_status(httpd_req_t *r)
      * incidental condition, so it should never be silently masked by a stale
      * "Degraded" chip left over from before blocking was paused. Loading still
      * wins over both — it's transient and self-clears. */
-    const char *status_cls = loading ? "warn" : (paused ? "warn" : (degraded ? "warn" : "ok"));
+    const char *status_cls = loading ? "warn" : (paused ? "ok" : (degraded ? "warn" : "ok"));
     const char *status_txt = loading ? "Reloading" : (paused ? "Paused" : (degraded ? "Degraded" : "Active"));
     pb.appendf(
         "<div class=stats>"
-        "<div class=stat><div class=val id=st-domains>%" PRIu32 "</div><div class=lbl>Domains</div></div>"
-        "<div class=stat><div class=val id=st-queries>%" PRIu32 "</div><div class=lbl>Queries</div></div>"
-        "<div class=stat><div class=val id=st-blocked>%" PRIu32 "</div><div class=lbl>Blocked</div></div>"
-        "<div class=stat><div class=val id=st-rate>%.1f%%</div><div class=lbl>Block rate</div></div>"
-        "<div class=stat><div class='val %s' id=st-status>%s</div><div class=lbl>Status</div></div>"
+        "<fieldset class=stat><legend>Domains</legend><div class=readrow><div class=val id=st-domains>%" PRIu32 "</div><span class=unit>domains</span></div></fieldset>"
+        "<fieldset class=stat><legend>Queries</legend><div class=readrow><div class=val id=st-queries>%" PRIu32 "</div><span class=unit>queries</span></div></fieldset>"
+        "<fieldset class=stat><legend>Blocked</legend><div class=readrow><div class=val id=st-blocked>%" PRIu32 "</div><span class=unit>blocked</span></div></fieldset>"
+        "<fieldset class=stat><legend>Block rate</legend><div class=readrow><div class=val id=st-rate>%.1f</div><span class=unit>%%</span></div></fieldset>"
+        "<fieldset class=stat><legend>Status</legend><div class='st %s' id=st-status>%s</div></fieldset>"
         "</div>"
         "<p id=dash-stale class=warn hidden><small>The numbers above stopped "
         "updating a few polls ago &mdash; reload the page to check "
@@ -952,10 +1228,9 @@ static esp_err_t handle_status(httpd_req_t *r)
 
     if (dns_sink_setup_ap_active()) {
         pb.appendf(
-            "<p style='background:#fff3cd;border:1px solid #ffe08a;border-radius:6px;"
-            "padding:.6em 1em'><b>Setup AP active</b> — no Ethernet or Wi-Fi link yet. "
+            "<p class=banner><b>Setup AP active</b> — no Ethernet or Wi-Fi link yet. "
             "Join \"ESP32AdBlock-Setup\" (WPA2 passphrase printed on the USB console) and browse "
-            "<b>https://192.168.4.1</b> to enter real Wi-Fi credentials in the Network tab; "
+            "<b class=mono>https://192.168.4.1</b> to enter real Wi-Fi credentials in the Network tab; "
             "this AP shuts off automatically once a link comes up.</p>");
     }
     pb.appendf(
@@ -967,12 +1242,16 @@ static esp_err_t handle_status(httpd_req_t *r)
          * full-page reload; now the 10s poll flips it live like the status
          * chip already does. */
         "<form method=post action=/blocklist/stop id=stop-load-form%s>"
-        "<button>Stop load</button></form><br>",
+        "<button class=btn-arm>Stop load</button></form><br>",
         loading ? "" : " hidden");
+    /* The untimed global pause is destructive (blocking off for every device,
+     * no timer), so its button is ARM then EXEC. The markup always carries
+     * btn-arm; the head script drops it when the form is the resume direction
+     * (on=0), so a script failure leaves the safe (armed) state. */
     pb.appendf(
         "<form method=post action=/pause>"
         "<input type=hidden name=on value=%d>"
-        "<button>%s</button></form><br>"
+        "<button class=btn-arm>%s</button></form><br>"
         "<form method=post action=/check>"
         "<input name=domain placeholder='Check domain' size=40>"
         "<button>Check</button></form><br>"
@@ -1008,11 +1287,12 @@ static esp_err_t handle_status(httpd_req_t *r)
             "<form method=post action=/pause/timed>"
             "<input name=min type=number min=1 max=%u value=30 style='width:5em'> minutes "
             "(max %u = 24 h)<br>"
-            "<label><input type=radio name=scope value=me checked> This device (%u.%u.%u.%u)</label><br>"
+            "<label><input type=radio name=scope value=me checked> This device (<span class=mono>%u.%u.%u.%u</span>)</label><br>"
             "<label><input type=radio name=scope value=host> Another host:</label> "
             "<input name=ip placeholder='192.168.1.23' size=15><br>"
-            "<label><input type=radio name=scope value=all> All devices (asks you to confirm)</label><br>"
-            "<button>Pause</button></form>"
+            "<label><input type=radio name=scope value=all> All devices (ARM then EXEC on Pause)</label><br>"
+            "<input type=hidden name=confirm id=pause-confirm value=''>"
+        "<button id=pause-btn>Pause</button></form>"
             "<p><small>Only the chosen scope stops being filtered. Blocking resumes on its own "
             "when the time is up, and a reboot always comes back blocking.</small></p>",
             (unsigned)PAUSE_MAX_MINUTES, (unsigned)PAUSE_MAX_MINUTES,
@@ -1076,10 +1356,10 @@ static esp_err_t handle_status(httpd_req_t *r)
             char safe_text[384];
             web_html_escape(safe_text, sizeof(safe_text), wl[i]);
             pb.appendf(
-                "<tr><td>%s</td><td>"
+                "<tr><td class=mono>%s</td><td>"
                 "<form method=post action=/whitelist/remove>"
                 "<input type=hidden name=domain value=\"%s\">"
-                "<button>Remove</button></form></td></tr>",
+                "<button class=btn-arm>Remove</button></form></td></tr>",
                 safe_text, safe_text);
         }
         pb.appendf("</table>");
@@ -1125,10 +1405,10 @@ static esp_err_t handle_status(httpd_req_t *r)
                 char safe_d[128]; web_html_escape(safe_d, sizeof(safe_d), rw_domains[i]);
                 uint32_t ip = rw_ips[i];
                 pb.appendf(
-                    "<tr><td>%s</td><td>%u.%u.%u.%u</td><td>"
+                    "<tr><td class=mono>%s</td><td class=mono>%u.%u.%u.%u</td><td>"
                     "<form method=post action=/rewrite/clear>"
                     "<input type=hidden name=domain value=\"%s\">"
-                    "<button>Remove</button></form></td></tr>",
+                    "<button class=btn-arm>Remove</button></form></td></tr>",
                     safe_d,
                     (unsigned)((ip>>24)&0xFF),(unsigned)((ip>>16)&0xFF),
                     (unsigned)((ip>>8)&0xFF),(unsigned)(ip&0xFF),
@@ -1142,7 +1422,7 @@ static esp_err_t handle_status(httpd_req_t *r)
     pb.appendf(
         "<h3>Blocklist Sources</h3>"
         "<table><tr><th>#</th><th>URL</th><th>Status</th><th>Action</th></tr>"
-        "<tr><td>0 (primary)</td><td>%s</td><td class='ok'>enabled</td><td>built-in</td></tr>",
+        "<tr><td class=mono>0</td><td class=mono>%s</td><td class='ok'>enabled</td><td>built-in (primary)</td></tr>",
         BLOCKLIST_URL);
     int free_slot = -1;
     for (int i = 0; i < BLOCKLIST_EXTRA_MAX; i++) {
@@ -1155,19 +1435,19 @@ static esp_err_t handle_status(httpd_req_t *r)
             char safe_url[BLOCKLIST_URL_CAP * 2]; web_html_escape(safe_url, sizeof(safe_url), url);
             bool en = blocklist_extra_enabled_get(i);
             pb.appendf(
-                "<tr><td>%d</td><td>%s</td><td class='%s'>%s</td><td>"
+                "<tr><td class=mono>%d</td><td class=mono>%s</td><td class='%s'>%s</td><td>"
                 "<form method=post action=/blocklist/url/toggle style='display:inline'>"
                 "<input type=hidden name=idx value=%d>"
                 "<button>%s</button></form> "
                 "<form method=post action=/blocklist/url/clear style='display:inline'>"
                 "<input type=hidden name=idx value=%d>"
-                "<button>Remove</button></form></td></tr>",
+                "<button class=btn-arm>Remove</button></form></td></tr>",
                 i + 1, safe_url, en ? "ok" : "warn", en ? "enabled" : "disabled",
                 i, en ? "Disable" : "Enable", i);
         } else {
             if (free_slot < 0) free_slot = i;
             pb.appendf(
-                "<tr><td>%d (empty)</td><td>"
+                "<tr><td class=mono>%d</td><td>"
                 "<form method=post action=/blocklist/url/set style='display:inline'>"
                 "<input type=hidden name=idx value=%d>"
                 "<input name=url placeholder='https://...' size=50>"
@@ -1242,7 +1522,7 @@ static esp_err_t handle_status(httpd_req_t *r)
 
     if (bl_dropped > 0)
         pb.appendf(
-            "<p class=warn><b>&#9888; Last reload overflowed the %uk-entry buffer: "
+            "<p class=warn><b>Last reload overflowed the %uk-entry buffer: "
             "%" PRIu32 " entries dropped — blocking is incomplete.</b> "
             "Remove a source or pick smaller lists.</p>",
             (unsigned)(BLOCKLIST_CAPACITY / 1000), bl_dropped);
@@ -1251,14 +1531,14 @@ static esp_err_t handle_status(httpd_req_t *r)
      * got to attempt, not entries it fetched and then discarded. */
     if (bl_feed_fail > 0)
         pb.appendf(
-            "<p class=warn>&#9888; %" PRIu32 " source feed(s) failed to download on "
+            "<p class=warn>%" PRIu32 " source feed(s) failed to download on "
             "the last reload — the live list is missing their entries.</p>",
             bl_feed_fail);
 
     uint32_t bl_exc_drop = blocklist_exceptions_dropped();
     if (bl_exc_drop > 0)
         pb.appendf(
-            "<p class=warn>&#9888; %" PRIu32 " feed exception rule(s) dropped (capacity %u) — "
+            "<p class=warn>%" PRIu32 " feed exception rule(s) dropped (capacity %u) — "
             "allow-rules were dropped and affected names fail closed (remain blocked).</p>",
             bl_exc_drop, (unsigned)BL_EXCEPT_CAPACITY);
 
@@ -1292,15 +1572,15 @@ static esp_err_t handle_status(httpd_req_t *r)
             }
                 char safe_ip[48]; web_html_escape(safe_ip, sizeof(safe_ip), acl_ips[i]);
                 pb.appendf(
-                    "<tr><td>%s</td><td>"
+                    "<tr><td class=mono>%s</td><td>"
                     "<form method=post action=/acl/remove>"
                     "<input type=hidden name=ip value=\"%s\">"
-                    "<button>Remove</button></form></td></tr>",
+                    "<button class=btn-arm>Remove</button></form></td></tr>",
                     safe_ip, safe_ip);
             }
             pb.appendf("</table>"
-                "<form method=post action=/acl/clear style='margin-top:.5em'>"
-                "<button>Clear all (allow everyone)</button></form>");
+                "<form method=post action=/acl/clear>"
+                "<button class=btn-arm>Clear all (allow everyone)</button></form>");
         }
     }
 
@@ -1325,15 +1605,15 @@ static esp_err_t handle_status(httpd_req_t *r)
             }
                 char safe_ip[48]; web_html_escape(safe_ip, sizeof(safe_ip), byp_ips[i]);
                 pb.appendf(
-                    "<tr><td>%s</td><td>"
+                    "<tr><td class=mono>%s</td><td>"
                     "<form method=post action=/bypass/remove>"
                     "<input type=hidden name=ip value=\"%s\">"
-                    "<button>Remove</button></form></td></tr>",
+                    "<button class=btn-arm>Remove</button></form></td></tr>",
                     safe_ip, safe_ip);
             }
             pb.appendf("</table>"
-                "<form method=post action=/bypass/clear style='margin-top:.5em'>"
-                "<button>Clear all</button></form>");
+                "<form method=post action=/bypass/clear>"
+                "<button class=btn-arm>Clear all</button></form>");
         }
     }
 
@@ -1417,8 +1697,8 @@ static esp_err_t handle_status(httpd_req_t *r)
                 ip, nm, gw, dns_ip);
         }
         pb.appendf(
-            "<form method=post action=/reboot style='margin-top:.5em'>"
-            "<button>Reboot now</button></form>");
+            "<form method=post action=/reboot>"
+            "<button class=btn-arm>Reboot now</button></form>");
     }
 
     /* Firmware update (#1) — mirrors upstream's OTA Upload tab */
@@ -1431,17 +1711,18 @@ static esp_err_t handle_status(httpd_req_t *r)
             "toolchain or serial cable needed. If the new image never comes "
             "back up cleanly, it auto-reverts to this slot.</small></p>"
             "<input type=file id=ota-file accept='.bin'> "
-            "<button type=button onclick=\"otaUpload()\">Upload &amp; apply</button>"
+            "<button type=button class=btn-arm onclick=\"if(this.classList.contains('armed'))otaUpload(this);else{this.classList.add('armed','btn-exec');var t=this;setTimeout(function(){t.classList.remove('armed','btn-exec');},10000);}\">Upload &amp; apply</button>"
             "<span id=ota-status></span>"
             "<script>"
-            "function otaUpload(){"
+            "function otaStat(t,c){var e=document.getElementById('ota-status');e.className=c;e.textContent=t;}"
+            "function otaUpload(b){if(!b||!b.classList.contains('armed'))return;"
             "var f=document.getElementById('ota-file').files[0];"
-            "if(!f){document.getElementById('ota-status').textContent=' pick a file first';return;}"
-            "document.getElementById('ota-status').textContent=' uploading\xe2\x80\xa6';"
+            "if(!f){otaStat('· PICK A FILE FIRST','st');return;}"
+            "otaStat('· UPLOADING','st');"
             "fetch('/ota/update',{method:'POST',body:f})"
             ".then(function(r){if(!r.ok)return r.text().then(function(t){throw new Error(t)});"
-            "document.getElementById('ota-status').textContent=' applied, rebooting\xe2\x80\xa6';})"
-            ".catch(function(e){document.getElementById('ota-status').textContent=' failed: '+e.message;});"
+            "otaStat('· APPLIED, REBOOTING','st');})"
+            ".catch(function(e){otaStat('failed: '+e.message,'err');});"
             "}"
             "</script>",
             running ? running->label : "?");
@@ -1478,28 +1759,28 @@ static esp_err_t handle_status(httpd_req_t *r)
         pb.appendf(
             "<p>Currently configured SSID: <b>%s</b></p>"
             "<button type=button onclick=\"wifiScan()\">Scan for networks</button>"
-            "<span id=wifi-scan-status></span>"
+            "<span id=wifi-scan-status class=mono></span>"
             "<ul id=wifi-results></ul>"
             "<form method=post action=/wifi/connect>"
             "<input id=wifi-ssid name=ssid placeholder='SSID' size=24> "
             "<input id=wifi-pass name=password placeholder='Password' size=24 type=password> "
             "<button>Connect</button></form>"
             "<script>"
-            "function wifiStat(t){document.getElementById('wifi-scan-status').textContent=t;}"
+            "function wifiStat(t,c){var e=document.getElementById('wifi-scan-status');e.className=c||'mono';e.textContent=t;}"
             /* Trigger only — the scan runs in a worker task on the device, so
              * this returns straight away and other viewers aren't blocked. */
-            "function wifiScan(){wifiStat(' starting\xe2\x80\xa6');"
+            "function wifiScan(){wifiStat('· STARTING','st');"
             "fetch('/wifi/scan',{method:'POST'}).then(function(r){return r.json()})"
-            ".then(function(d){if(d.state=='error'){wifiStat(' '+(d.err||'scan failed'));return;}"
+            ".then(function(d){if(d.state=='error'){wifiStat('▲ '+(d.err||'SCAN FAILED'),'st');return;}"
             "setTimeout(wifiPoll,600);})"
-            ".catch(function(){wifiStat(' scan failed');});}"
+            ".catch(function(){wifiStat('▲ SCAN FAILED','st');});}"
             /* Poll the cached result until the worker publishes it. */
             "function wifiPoll(){"
             "fetch('/wifi/scan').then(function(r){return r.json()}).then(function(d){"
-            "if(d.state=='scanning'){wifiStat(' scanning\xe2\x80\xa6');setTimeout(wifiPoll,800);return;}"
-            "if(d.state=='error'){wifiStat(' '+(d.err||'scan failed'));return;}"
+            "if(d.state=='scanning'){wifiStat('· SCANNING','st');setTimeout(wifiPoll,800);return;}"
+            "if(d.state=='error'){wifiStat('▲ '+(d.err||'SCAN FAILED'),'st');return;}"
             "wifiRender(d);})"
-            ".catch(function(){wifiStat(' scan failed');});}"
+            ".catch(function(){wifiStat('▲ SCAN FAILED','st');});}"
             "function wifiRender(d){"
             "var ul=document.getElementById('wifi-results');ul.innerHTML='';"
             "if(d.state!='done'){wifiStat('');return;}"
@@ -1507,7 +1788,9 @@ static esp_err_t handle_status(httpd_req_t *r)
             "d.aps.forEach(function(ap){"
             "var li=document.createElement('li');"
             "var btn=document.createElement('button');btn.type='button';"
-            "btn.textContent=ap.ssid+' ('+ap.rssi+' dBm)'+(ap.auth==0?' [open]':'');"
+            "btn.appendChild(document.createTextNode(ap.ssid+' '));"
+            "var rs=document.createElement('span');rs.className='mono';rs.textContent='('+ap.rssi+' dBm)';btn.appendChild(rs);"
+            "if(ap.auth==0)btn.appendChild(document.createTextNode(' [open]'));"
             "btn.onclick=function(){document.getElementById('wifi-ssid').value=ap.ssid;"
             "document.getElementById('wifi-pass').focus();};"
             "li.appendChild(btn);ul.appendChild(li);});}"
@@ -1561,6 +1844,22 @@ static esp_err_t handle_status(httpd_req_t *r)
 }
 
 /* ── GET /metrics — JSON telemetry ───────────────────────────────── */
+/* ── GET /alarms: alarm states the console banner cannot read from /metrics ──
+ * Setup AP active, and Wi-Fi enabled with no address. The other banner states (feed overflow,
+ * feed exception drops, upstream timeouts) are counters in /metrics, which the page already polls. */
+static esp_err_t handle_alarms(httpd_req_t *r)
+{
+    char iface[8] = "", eth_ip[16] = "", wifi_ip[16] = "";
+    dns_sink_net_status(iface, sizeof(iface), eth_ip, sizeof(eth_ip), wifi_ip, sizeof(wifi_ip));
+    bool wifi_down = dns_sink_wifi_built() && dns_sink_wifi_enabled() && wifi_ip[0] == '\0';
+    char body[48];
+    int n = snprintf(body, sizeof(body), "{\"setup_ap\":%d,\"wifi_down\":%d}",
+                     dns_sink_setup_ap_active() ? 1 : 0, wifi_down ? 1 : 0);
+    httpd_resp_set_type(r, "application/json");
+    httpd_resp_set_hdr(r, "Cache-Control", "no-store");
+    return httpd_resp_send(r, body, n > 0 ? n : 0);
+}
+
 static esp_err_t handle_metrics(httpd_req_t *r)
 {
     static EXT_RAM_BSS_ATTR char json[2048];
@@ -1572,9 +1871,10 @@ static esp_err_t handle_metrics(httpd_req_t *r)
 }
 
 /* ── GET /metrics/view ─ rendered dashboard over /metrics (#126) ──── */
-/* The page is a plain `static const char[]` in .rodata and goes out through
- * send_html() with no format pass: no PSRAM page buffer (§3a), no vsnprintf
- * over ~7 KB on every request, and CSS percent signs need no doubling.
+/* The page is plain `static const char[]`s in .rodata (head, the shared
+ * ADB_THEME_RAW, body) that go out as three raw chunks with no format pass:
+ * no PSRAM page buffer (§3a), no vsnprintf over ~7 KB on every request, and
+ * CSS percent signs need no doubling.
  *
  * It renders nothing server-side. The field map lives in the page's JS and it
  * polls /metrics, so dns_server_metrics_json() stays the single source of
@@ -1598,25 +1898,17 @@ static esp_err_t handle_metrics(httpd_req_t *r)
  * fetch through. */
 static esp_err_t handle_metrics_view(httpd_req_t *r)
 {
-    static const char PAGE[] =
+    static const char PAGE_A[] =
     "<!DOCTYPE html><html><head><meta charset=utf-8>\n"
     "<title>Metrics</title>\n"
-    "<style>\n"
-    ":root{--bg:#fefefe;--face:#f4f4f4;--face-raised:#f0f0f0;--ink:#454545;--ink-dim:#777;--brass:#07a;--brass-hi:#07a;--line:#ddd;--alert:#c0392b;--ok:#1a7f37;--warn:#b58900;--mono:ui-monospace,Consolas,monospace;}\n"
-    "@media(prefers-color-scheme:dark){:root{--bg:#0e1117;--face:#161b22;--face-raised:#1f242c;--ink:#d9d9d9;--ink-dim:#999;--brass:#00a2e7;--brass-hi:#00a2e7;--line:#30363d;--alert:#d24637;--ok:#5fd377;--warn:#e3b341;}}\n"
-    "body{font-family:var(--mono);color:var(--ink);background:var(--bg);max-width:920px;margin:1.5em auto;padding:0 .5em;line-height:1.5}\n"
-    "table{border-collapse:collapse;width:100%;margin:0 0 1.2em;font-size:.92em}\n"
-    "td,th{border:1px solid var(--line);padding:.35em .65em;font-size:.85em}\n"
-    "th{background:var(--face-raised);color:var(--ink);text-align:left;letter-spacing:.06em;text-transform:uppercase}th.r{text-align:right}\n"
-    "td.k{width:55%;color:var(--ink)}td.v{text-align:right;font-weight:bold;color:var(--brass-hi)}\n"
-    ".stats{display:flex;gap:.8em;flex-wrap:wrap;margin:1em 0}\n"
-    ".stat{background:var(--face);border:1px solid var(--line);border-radius:3px;padding:.5em 1em;min-width:100px;text-align:center}\n"
-    ".stat .val{font-size:1.4em;font-weight:bold;color:var(--brass-hi)}\n"
-    ".stat .lbl{font-size:.7em;color:var(--ink-dim);letter-spacing:.06em;text-transform:uppercase}\n"
-    ".ok{color:var(--ok)}.warn{color:var(--warn)}\n"
-    ".stat .val.ok{color:var(--ok)}.stat .val.warn{color:var(--warn)}\n"
-    "#age{color:var(--ink-dim);font-size:.8em}#age.stale{color:var(--alert);font-weight:bold}\n"
-    "a{color:var(--brass)}\n"
+    "<style>\n";
+    static const char PAGE_B[] =
+    "th.r,td.v{text-align:right}\n"
+    "td.k{width:55%;font-family:var(--f-ui)}\n"
+    "td.v{font-family:var(--f-mono)}\n"
+    "#age{color:var(--text);font-family:var(--f-mono);font-variant-numeric:tabular-nums}\n"
+    "#age.stale{color:#000;background:var(--p2);font-weight:bold}\n"
+    "#age.stale::before{content:'[ ▲ ] '}\n"
     "</style>\n"
     "</head><body>\n"
     "<h2>Metrics <small>(<a href='/'>home</a> &middot; <a href='/metrics'>raw JSON</a>)</small></h2>\n"
@@ -1630,45 +1922,45 @@ static esp_err_t handle_metrics_view(httpd_req_t *r)
     "<script>\n"
     "var F=[\n"
     "['Traffic',[\n"
-    " ['queries_total','Queries (socket path)','n',0],\n"
-    " ['blocked','Blocked','n',0],\n"
-    " ['forwarded','Forwarded upstream','n',0],\n"
-    " ['tcp_queries','TCP queries','n',0],\n"
-    " ['coalesced','Coalesced duplicates','n',0],\n"
-    " ['stale_served','Stale answers served','n',0],\n"
-    " ['case_mismatch','0x20 case mismatches','n',1]]],\n"
+    " ['queries_total','Queries (socket path)','n:queries',0],\n"
+    " ['blocked','Blocked','n:blocked',0],\n"
+    " ['forwarded','Forwarded upstream','n:queries',0],\n"
+    " ['tcp_queries','TCP queries','n:queries',0],\n"
+    " ['coalesced','Coalesced duplicates','n:dupes',0],\n"
+    " ['stale_served','Stale answers served','n:answers',0],\n"
+    " ['case_mismatch','0x20 case mismatches','n:mismatches',1]]],\n"
     "['Ethernet fast path',[\n"
-    " ['l2_blocked','Blocked in the L2 hook','n',0],\n"
-    " ['l2_cached','Cache hits in the L2 hook','n',0],\n"
-    " ['l2_fallthrough','Handed to lwIP','n',0],\n"
-    " ['l2_dns_fallthrough','...of which, confirmed DNS','n',0],\n"
-    " ['l2_tx_fail','Transmit failures','n',1],\n"
-    " ['l2_log_dropped','Query-log entries dropped','n',1],\n"
-    " ['census_dropped','Census sightings dropped','n',1],\n"
-    " ['wd_restarts','Watchdog restarts','n',1]]],\n"
+    " ['l2_blocked','Blocked in the L2 hook','n:blocked',0],\n"
+    " ['l2_cached','Cache hits in the L2 hook','n:hits',0],\n"
+    " ['l2_fallthrough','Handed to lwIP','n:frames',0],\n"
+    " ['l2_dns_fallthrough','...of which, confirmed DNS','n:queries',0],\n"
+    " ['l2_tx_fail','Transmit failures','n:fails',1],\n"
+    " ['l2_log_dropped','Query-log entries dropped','n:drops',1],\n"
+    " ['census_dropped','Census sightings dropped','n:drops',1],\n"
+    " ['wd_restarts','Watchdog restarts','n:restarts',1]]],\n"
     "['Forward cache',[\n"
-    " ['cache_probes','Probes','n',0],\n"
-    " ['cache_hits','Hits','n',0],\n"
+    " ['cache_probes','Probes','n:probes',0],\n"
+    " ['cache_hits','Hits','n:hits',0],\n"
     " ['cache_hit_rate','Hit rate','p',0],\n"
-    " ['cache_evictions','Evictions','n',0],\n"
-    " ['cache_too_big','Replies too big to cache','n',1]]],\n"
+    " ['cache_evictions','Evictions','n:evictions',0],\n"
+    " ['cache_too_big','Replies too big to cache','n:replies',1]]],\n"
     "['Upstream',[\n"
     " ['upstream','Resolver','s',0],\n"
-    " ['upstream_inflight','In flight','n',0],\n"
-    " ['upstream_max','Table size','n',0],\n"
-    " ['upstream_timeouts','Timeouts','n',1],\n"
-    " ['hedges_sent','Hedged retransmits sent','n',0],\n"
-    " ['hedged_completions','Answered by the hedge','n',0],\n"
-    " ['dropped.table_full','Dropped: table full','n',1],\n"
-    " ['dropped.mbox_pressure','Dropped: mailbox pressure','n',1]]],\n"
+    " ['upstream_inflight','In flight','n:queries',0],\n"
+    " ['upstream_max','Table size','n:slots',0],\n"
+    " ['upstream_timeouts','Timeouts','n:timeouts',1],\n"
+    " ['hedges_sent','Hedged retransmits sent','n:sends',0],\n"
+    " ['hedged_completions','Answered by the hedge','n:answers',0],\n"
+    " ['dropped.table_full','Dropped: table full','n:drops',1],\n"
+    " ['dropped.mbox_pressure','Dropped: mailbox pressure','n:drops',1]]],\n"
     "['Blocklist',[\n"
-    " ['blocklist_count','Domains loaded','n',0],\n"
+    " ['blocklist_count','Domains loaded','n:domains',0],\n"
     " ['blocklist_loading','Reloading','B',0],\n"
     " ['blocklist_paused','Blocking paused','B',0],\n"
-    " ['pause_active','Timed pauses active','n',0],\n"
-    " ['bypass_count','Bypass entries','n',0],\n"
-    " ['blocklist_dropped','Domains dropped (overflow)','n',1],\n"
-    " ['blocklist_feed_failures','Feed failures','n',1],\n"
+    " ['pause_active','Timed pauses active','n:pauses',0],\n"
+    " ['bypass_count','Bypass entries','n:entries',0],\n"
+    " ['blocklist_dropped','Domains dropped (overflow)','n:drops',1],\n"
+    " ['blocklist_feed_failures','Feed failures','n:failures',1],\n"
     " ['flash_status','Flash snapshot','T',0],\n"
     " ['sd_status','SD snapshot','T',0],\n"
     " ['sd_bytes','SD snapshot size','b',0]]],\n"
@@ -1684,25 +1976,22 @@ static esp_err_t handle_metrics_view(httpd_req_t *r)
     "var SNEU={unknown:1,absent:1,empty:1,'open-failed':1};\n"
     "function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}\n"
     "function nf(v){return String(v).replace(/\\B(?=(\\d{3})+(?!\\d))/g,',');}\n"
-    "function bf(v){v=+v;if(v<1024)return v+' B';if(v<1048576)return (v/1024).toFixed(1)+' KB';\n"
-    " return (v/1048576).toFixed(2)+' MB';}\n"
-    "function df(v){v=+v;var d=Math.floor(v/86400),h=Math.floor(v%86400/3600);\n"
-    " var m=Math.floor(v%3600/60),s=Math.floor(v%60);\n"
-    " return (d?d+'d ':'')+(d||h?h+'h ':'')+m+'m '+s+'s';}\n"
-    "function uf(v){v=+v;if(v<1000)return v+' &micro;s';if(v<1000000)return (v/1000).toFixed(1)+' ms';\n"
-    " return (v/1000000).toFixed(2)+' s';}\n"
+    "function bf(v){v=+v;if(v<1024)return [v,'B'];if(v<1048576)return [(v/1024).toFixed(1),'KB'];return [(v/1048576).toFixed(2),'MB'];}\n"
+    "function df(v){return [nf(Math.floor(+v||0)),'s'];}\n"
+    "function uf(v){v=+v;if(v<1000)return [v,'&micro;s'];if(v<1000000)return [(v/1000).toFixed(1),'ms'];return [(v/1000000).toFixed(2),'s'];}\n"
+    "function wu(n,u){return '<span class=well>'+n+'</span>'+(u?'<span class=unit>'+u+'</span>':'');}\n"
     "function fmt(f,v){\n"
     " if(v===undefined||v===null)return '&mdash;';\n"
-    " if(f[2]=='n')return nf(v);\n"
-    " if(f[2]=='b')return bf(v);\n"
-    " if(f[2]=='p')return (+v).toFixed(1)+'%';\n"
-    " if(f[2]=='d')return df(v);\n"
+    " if(f[2].slice(0,1)=='n')return wu(nf(v),f[2].slice(2)||'count');\n"
+    " if(f[2]=='b'){var b=bf(v);return wu(b[0],b[1]);}\n"
+    " if(f[2]=='p')return wu((+v).toFixed(1),'%');\n"
+    " if(f[2]=='d'){var d=df(v);return wu(d[0],d[1]);}\n"
     " if(f[2]=='B')return v?'yes':'no';\n"
     " return esc(v);}\n"
     "function cls(f,v){\n"
     " if(v===undefined||v===null)return '';\n"
     " if(f[2]=='T')return SOK[v]?'ok':(SNEU[v]?'':'warn');\n"
-    " if(f[2]=='B')return v?'warn':'';\n"
+    " if(f[2]=='B')return '';\n"
     " if(f[3])return (+v>0)?'warn':'';\n"
     " return '';}\n"
     "function flat(j){var o={};\n"
@@ -1714,39 +2003,40 @@ static esp_err_t handle_metrics_view(httpd_req_t *r)
     "function render(j){\n"
     " var m=flat(j),seen={},h='',i,s,k;\n"
     " var tot=+m.queries_total||0,blk=+m.blocked||0;\n"
-    " var st=m.blocklist_loading?['Reloading','warn']:(m.blocklist_paused?['Paused','warn']:\n"
+    " var st=m.blocklist_loading?['Reloading','warn']:(m.blocklist_paused?['Paused','ok']:\n"
     "  ((+m.blocklist_dropped>0||+m.blocklist_feed_failures>0||+m.exceptions_dropped>0)?['Degraded','warn']:['Active','ok']));\n"
-    " var chips=[[nf(m.blocklist_count),'Domains',''],[nf(tot),'Queries',''],[nf(blk),'Blocked',''],\n"
-    "  [(tot?(100*blk/tot).toFixed(1):'0.0')+'%','Block rate',''],[st[0],'Status',st[1]],\n"
-    "  [df(m.uptime_s),'Uptime','']];\n"
+    " var chips=[[nf(m.blocklist_count),'Domains','','domains'],[nf(tot),'Queries','','queries'],[nf(blk),'Blocked','','blocked'],\n"
+    "  [(tot?(100*blk/tot).toFixed(1):'0.0'),'Block rate','','%'],[st[0],'Status',st[1],''],\n"
+    "  [nf(Math.floor(+m.uptime_s||0)),'Uptime','','s']];\n"
     " var c='';\n"
     " for(i=0;i<chips.length;i++)\n"
-    "  c+='<div class=stat><div class=\"val '+chips[i][2]+'\">'+chips[i][0]+\n"
-    "     '</div><div class=lbl>'+chips[i][1]+'</div></div>';\n"
+    "  c+='<fieldset class=stat><legend>'+chips[i][1]+'</legend><div class=readrow><div class=\"'+(chips[i][3]?'val':'st')+' '+chips[i][2]+'\">'+chips[i][0]+\n"
+    "     '</div>'+(chips[i][3]?'<span class=unit>'+chips[i][3]+'</span>':'')+'</div></fieldset>';\n"
     " document.getElementById('chips').innerHTML=c;\n"
     " for(s=0;s<F.length;s++){\n"
     "  h+='<table><tr><th>'+F[s][0]+'</th><th class=r>value</th></tr>';\n"
     "  for(i=0;i<F[s][1].length;i++){\n"
     "   var f=F[s][1][i];seen[f[0]]=1;\n"
-    "   h+='<tr><td class=k>'+f[1]+'</td><td class=\"v '+cls(f,m[f[0]])+'\">'+fmt(f,m[f[0]])+'</td></tr>';}\n"
+    "   h+='<tr><td class=k>'+f[1]+'</td><td class=v '+cls(f,m[f[0]])+'>'+fmt(f,m[f[0]])+'</td></tr>';}\n"
     "  h+='</table>';}\n"
     " var L=j.latency_us||{};\n"
     " h+='<table><tr><th>Latency</th><th class=r>p50</th><th class=r>p99</th>'+\n"
     "    '<th class=r>max</th><th class=r>count</th></tr>';\n"
-    " for(k in L)h+='<tr><td class=k>'+esc(k)+'</td><td class=v>'+uf(L[k].p50)+'</td><td class=v>'+\n"
-    "    uf(L[k].p99)+'</td><td class=v>'+uf(L[k].max)+'</td><td class=v>'+nf(L[k].count)+'</td></tr>';\n"
+    " for(k in L){var p50=uf(L[k].p50),p99=uf(L[k].p99),mx=uf(L[k].max);\n"
+    "  h+='<tr><td class=k>'+esc(k)+'</td><td class=v>'+wu(p50[0],p50[1])+'</td><td class=v>'+wu(p99[0],p99[1])+\n"
+    "     '</td><td class=v>'+wu(mx[0],mx[1])+'</td><td class=v>'+wu(nf(L[k].count),'count')+'</td></tr>';}\n"
     " h+='</table>';\n"
     " var o='';\n"
-    " for(k in m)if(!seen[k])o+='<tr><td class=k>'+esc(k)+'</td><td class=v>'+esc(m[k])+'</td></tr>';\n"
+    " for(k in m)if(!seen[k])o+='<tr><td class=k>'+esc(k)+'</td><td class=v>'+(typeof m[k]=='number'?wu(nf(m[k]),'count'):esc(m[k]))+'</td></tr>';\n"
     " if(o)h+='<table><tr><th>Other (ungrouped)</th><th class=r>value</th></tr>'+o+'</table>';\n"
     " document.getElementById('body').innerHTML=h;}\n"
     "var LAST=0,FAILS=0,BUSY=false;\n"
     "function mark(){var a=document.getElementById('age');\n"
     " if(!LAST){\n"
-    "  a.textContent=FAILS?('could not load /metrics - '+FAILS+' failed attempt'+(FAILS>1?'s':'')):'waiting for the first sample';\n"
+    "  a.textContent=FAILS?('error: could not load /metrics - '+FAILS+' failed attempt'+(FAILS>1?'s':'')):'waiting for the first sample';\n"
     "  a.className=FAILS?'stale':'';return;}\n"
     " var s=Math.round((Date.now()-LAST)/1000);\n"
-    " a.textContent='updated '+(s<2?'just now':s+'s ago')+(FAILS?' ('+FAILS+' failed since)':'');\n"
+    " a.textContent=(s>25?'stale: ':'')+'updated '+(s<2?'just now':s+'s ago')+(FAILS?' ('+FAILS+' failed since)':'');\n"
     " a.className=s>25?'stale':'';}\n"
     "function tick(force){\n"
     " if(BUSY||(document.hidden&&!force))return;\n"
@@ -1762,8 +2052,11 @@ static esp_err_t handle_metrics_view(httpd_req_t *r)
     "tick(1);\n"
     "</script>\n"
     "</body></html>\n";
-    send_html(r, PAGE);
-    return ESP_OK;
+    httpd_resp_set_type(r, "text/html; charset=utf-8");
+    if (httpd_resp_send_chunk(r, PAGE_A, sizeof(PAGE_A) - 1) != ESP_OK) return ESP_FAIL;
+    if (httpd_resp_send_chunk(r, ADB_THEME_RAW, sizeof(ADB_THEME_RAW) - 1) != ESP_OK || httpd_resp_send_chunk(r, ADB_PRODUCT_RAW, sizeof(ADB_PRODUCT_RAW) - 1) != ESP_OK || httpd_resp_send_chunk(r, ADB_CHROME_RAW, sizeof(ADB_CHROME_RAW) - 1) != ESP_OK) return ESP_FAIL;
+    if (httpd_resp_send_chunk(r, PAGE_B, sizeof(PAGE_B) - 1) != ESP_OK) return ESP_FAIL;
+    return httpd_resp_send_chunk(r, nullptr, 0);
 }
 
 /* ── GET /lastwords — crash flight recorder (#71) ────────────────── */
@@ -1869,25 +2162,31 @@ static esp_err_t handle_pause_timed(httpd_req_t *r)
              * page (no tab script), so the CSRF token rides on the action. */
             char csrf[33] = ""; web_auth_session_csrf(s_req_sid, csrf, sizeof(csrf));
             static EXT_RAM_BSS_ATTR char page[1536];
+            httpd_resp_set_type(r, "text/html; charset=utf-8");
+            if (httpd_resp_send_chunk(r,
+                    "<!DOCTYPE html><html><head><meta charset=utf-8><title>Confirm pause</title>"
+                    "<style>\n", HTTPD_RESP_USE_STRLEN) != ESP_OK)
+                return ESP_FAIL;
+            if (httpd_resp_send_chunk(r, ADB_THEME_RAW, sizeof(ADB_THEME_RAW) - 1) != ESP_OK || httpd_resp_send_chunk(r, ADB_PRODUCT_RAW, sizeof(ADB_PRODUCT_RAW) - 1) != ESP_OK || httpd_resp_send_chunk(r, ADB_CHROME_RAW, sizeof(ADB_CHROME_RAW) - 1) != ESP_OK)
+                return ESP_FAIL;
             int n = snprintf(page, sizeof(page),
-                "<!DOCTYPE html><html><head><meta charset=utf-8><title>Confirm pause</title>"
-                "<style>:root{--bg:#fefefe;--ink:#454545;--brass:#07a;--mono:ui-monospace,Consolas,monospace}"
-                "@media(prefers-color-scheme:dark){:root{--bg:#0e1117;--ink:#d9d9d9;--brass:#00a2e7}}"
-                "body{font-family:var(--mono);color:var(--ink);background:var(--bg);max-width:700px;margin:2em auto;padding:0 1em}"
-                "button{font:inherit;background:#eee;border:1px solid #ccc;padding:4px 10px;cursor:pointer}a{color:var(--brass)}</style>"
-                "</head><body><h2>Pause blocking for every device?</h2>"
+                "</style></head><body><h2>Pause blocking for every device?</h2>"
                 "<p>Are you sure? This disables blocking for <b>every device</b> on the "
                 "network for <b>%ld minute%s</b>. It resumes by itself afterwards.</p>"
                 "<form method=post action='/pause/timed?csrf=%s'>"
                 "<input type=hidden name=min value=%ld>"
                 "<input type=hidden name=scope value=all>"
                 "<input type=hidden name=confirm value=1>"
-                "<button>Yes, pause for everyone</button></form>"
-                "<p><a href='/'>Cancel</a></p></body></html>",
+                "<button class=btn-arm>Yes, pause for everyone</button></form>"
+                "<p><a href='/'>Cancel</a></p>"
+                "<script>document.addEventListener('click',function(e){var b=e.target;"
+                "if(!b||b.tagName!='BUTTON'||!b.classList.contains('btn-arm')||b.classList.contains('armed'))return;"
+                "e.preventDefault();b.classList.add('armed','btn-exec');"
+                "setTimeout(function(){b.classList.remove('armed','btn-exec');},10000);});</script>"
+                "</body></html>",
                 minutes, minutes == 1 ? "" : "s", csrf, minutes);
-            httpd_resp_set_type(r, "text/html");
-            httpd_resp_send(r, page, n);
-            return ESP_OK;
+            if (httpd_resp_send_chunk(r, page, n) != ESP_OK) return ESP_FAIL;
+            return httpd_resp_send_chunk(r, nullptr, 0);
         }
         target = PAUSE_IP_ALL;
     } else if (strcmp(scope, "host") == 0) {
@@ -1996,18 +2295,19 @@ static esp_err_t handle_check(httpd_req_t *r)
      * correctly — the tool meant to verify a rule couldn't verify its own
      * kind of rule. */
     char verdict_text[64] = "ALLOWED";
-    const char *color = "green";
+    const char *cls = "ok";
+    const char *glyph = "";   /* the status glyph comes from the class (CSS ::before) */
     if (nlen > 0) {
         uint32_t rw_ip = rewrite_lookup(norm);
         if (rw_ip) {
             snprintf(verdict_text, sizeof(verdict_text), "REWRITE -&gt; %u.%u.%u.%u",
                      (unsigned)((rw_ip >> 24) & 0xFF), (unsigned)((rw_ip >> 16) & 0xFF),
                      (unsigned)((rw_ip >> 8) & 0xFF), (unsigned)(rw_ip & 0xFF));
-            color = "blue";
+            cls = "rw";
         } else {
             bl_verdict_t v = blocklist_verdict(norm, nlen);
             bool blocked = v.state == BL_BLOCK;
-            color = blocked ? "red" : "green";
+            cls = blocked ? "blk" : "ok";
             if (v.state == BL_NO_MATCH) {
                 snprintf(verdict_text, sizeof(verdict_text), "ALLOWED");
             } else {
@@ -2019,13 +2319,21 @@ static esp_err_t handle_check(httpd_req_t *r)
 
     char safe[384]; web_html_escape(safe, sizeof(safe), norm);
     char page[768];
+    httpd_resp_set_type(r, "text/html; charset=utf-8");
+    if (httpd_resp_send_chunk(r, PLAIN_PAGE_HEAD, sizeof(PLAIN_PAGE_HEAD) - 1) != ESP_OK)
+        return ESP_FAIL;
+    if (httpd_resp_send_chunk(r, ADB_THEME_RAW, sizeof(ADB_THEME_RAW) - 1) != ESP_OK || httpd_resp_send_chunk(r, ADB_PRODUCT_RAW, sizeof(ADB_PRODUCT_RAW) - 1) != ESP_OK || httpd_resp_send_chunk(r, ADB_CHROME_RAW, sizeof(ADB_CHROME_RAW) - 1) != ESP_OK)
+        return ESP_FAIL;
+    if (httpd_resp_send_chunk(r, PLAIN_PAGE_TAIL, sizeof(PLAIN_PAGE_TAIL) - 1) != ESP_OK)
+        return ESP_FAIL;
     snprintf(page, sizeof(page),
-        "<!DOCTYPE html><html><body><h2>Check result</h2>"
-        "<p><b>%s</b> is <b style='color:%s'>%s</b></p>"
+        "<h2>Check result</h2>"
+        "<p><b>%s</b> is <b class=%s>%s %s</b></p>"
         "<a href='/'>Back</a></body></html>",
-        safe, color, verdict_text);
-    send_html(r, page);
-    return ESP_OK;
+        safe, cls, glyph, verdict_text);
+    if (httpd_resp_send_chunk(r, page, HTTPD_RESP_USE_STRLEN) != ESP_OK)
+        return ESP_FAIL;
+    return httpd_resp_send_chunk(r, nullptr, 0);
 }
 
 /* ── POST /whitelist/add ─────────────────────────────────────────── */
@@ -2157,8 +2465,16 @@ static esp_err_t handle_net_wifi_enable(httpd_req_t *r)
 static esp_err_t handle_reboot(httpd_req_t *r)
 {
     if (!csrf_ok(r)) { httpd_resp_send_err(r, HTTPD_403_FORBIDDEN, "CSRF"); return ESP_FAIL; }
-    send_html(r, "<!DOCTYPE html><html><body><h2>Rebooting…</h2>"
-                 "<p>Reconnecting in ~10s. <a href='/'>Back</a> (once it's up).</p></body></html>");
+    /* Best effort: the reboot below must happen even if the client went away,
+     * so the chunk results are deliberately not checked. */
+    httpd_resp_set_type(r, "text/html; charset=utf-8");
+    httpd_resp_send_chunk(r, PLAIN_PAGE_HEAD, sizeof(PLAIN_PAGE_HEAD) - 1);
+    httpd_resp_send_chunk(r, ADB_THEME_RAW, sizeof(ADB_THEME_RAW) - 1); httpd_resp_send_chunk(r, ADB_PRODUCT_RAW, sizeof(ADB_PRODUCT_RAW) - 1); httpd_resp_send_chunk(r, ADB_CHROME_RAW, sizeof(ADB_CHROME_RAW) - 1);
+    httpd_resp_send_chunk(r, PLAIN_PAGE_TAIL, sizeof(PLAIN_PAGE_TAIL) - 1);
+    httpd_resp_send_chunk(r, "<h2>Rebooting…</h2>"
+                 "<p>Reconnecting in ~10s. <a href='/'>Back</a> (once it's up).</p></body></html>",
+                 HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send_chunk(r, nullptr, 0);
     vTaskDelay(pdMS_TO_TICKS(300));   /* let the response flush before the reset */
     dns_sink_reboot();
     return ESP_OK;
@@ -2225,11 +2541,17 @@ static esp_err_t handle_ota_update(httpd_req_t *r)
         return ESP_FAIL;
     }
 
-    send_html(r, "<!DOCTYPE html><html><body><h2>Firmware received</h2>"
+    /* Best effort, as in handle_reboot: the reboot below must happen. */
+    httpd_resp_set_type(r, "text/html; charset=utf-8");
+    httpd_resp_send_chunk(r, PLAIN_PAGE_HEAD, sizeof(PLAIN_PAGE_HEAD) - 1);
+    httpd_resp_send_chunk(r, ADB_THEME_RAW, sizeof(ADB_THEME_RAW) - 1); httpd_resp_send_chunk(r, ADB_PRODUCT_RAW, sizeof(ADB_PRODUCT_RAW) - 1); httpd_resp_send_chunk(r, ADB_CHROME_RAW, sizeof(ADB_CHROME_RAW) - 1);
+    httpd_resp_send_chunk(r, PLAIN_PAGE_TAIL, sizeof(PLAIN_PAGE_TAIL) - 1);
+    httpd_resp_send_chunk(r, "<h2>Firmware received</h2>"
                  "<p>Rebooting into the new image in ~10s. If it doesn't come "
                  "back up, the previous firmware reboots itself back in "
                  "automatically.</p><a href='/'>Back</a> (once it's up)."
-                 "</body></html>");
+                 "</body></html>", HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send_chunk(r, nullptr, 0);
     vTaskDelay(pdMS_TO_TICKS(300));
     dns_sink_reboot();
     return ESP_OK;
@@ -2287,12 +2609,15 @@ static esp_err_t handle_wifi_connect(httpd_req_t *r)
         char dhcp_name[32]; snprintf(dhcp_name, sizeof(dhcp_name), "%s", dns_sink_hostname());
         char *dot = strchr(dhcp_name, '.'); if (dot) *dot = '\0';
         static EXT_RAM_BSS_ATTR char page[1024];
+        httpd_resp_set_type(r, "text/html; charset=utf-8");
+        if (httpd_resp_send_chunk(r,
+                "<!DOCTYPE html><html><head><meta charset=utf-8><title>Connecting</title>"
+                "<style>\n", HTTPD_RESP_USE_STRLEN) != ESP_OK)
+            return ESP_FAIL;
+        if (httpd_resp_send_chunk(r, ADB_THEME_RAW, sizeof(ADB_THEME_RAW) - 1) != ESP_OK || httpd_resp_send_chunk(r, ADB_PRODUCT_RAW, sizeof(ADB_PRODUCT_RAW) - 1) != ESP_OK || httpd_resp_send_chunk(r, ADB_CHROME_RAW, sizeof(ADB_CHROME_RAW) - 1) != ESP_OK)
+            return ESP_FAIL;
         int n = snprintf(page, sizeof(page),
-            "<!DOCTYPE html><html><head><meta charset=utf-8><title>Connecting</title>"
-            "<style>:root{--bg:#fefefe;--ink:#454545;--brass:#07a;--mono:ui-monospace,Consolas,monospace}"
-            "@media(prefers-color-scheme:dark){:root{--bg:#0e1117;--ink:#d9d9d9;--brass:#00a2e7}}"
-            "body{font-family:var(--mono);color:var(--ink);background:var(--bg);max-width:520px;margin:3em auto;padding:0 1em}a{color:var(--brass)}</style>"
-            "</head><body><h2>Connecting to \"%s\"&hellip;</h2>"
+            "</style></head><body><h2>Connecting to \"%s\"&hellip;</h2>"
             "<p>If that succeeds, this device's temporary setup network switches off "
             "within a few seconds and this page stops loading &mdash; that's expected, "
             "not a failure. Rejoin your own Wi-Fi, then browse to <b>https://%s</b> "
@@ -2303,9 +2628,8 @@ static esp_err_t handle_wifi_connect(httpd_req_t *r)
             "try again.</p>"
             "</body></html>",
             safe_ssid, dns_sink_hostname(), dhcp_name);
-        httpd_resp_set_type(r, "text/html");
-        httpd_resp_send(r, page, n);
-        return ESP_OK;
+        if (httpd_resp_send_chunk(r, page, n) != ESP_OK) return ESP_FAIL;
+        return httpd_resp_send_chunk(r, nullptr, 0);
     }
     httpd_resp_set_status(r, "303 See Other"); httpd_resp_set_hdr(r, "Location", "/#network"); httpd_resp_send(r,nullptr,0); return ESP_OK;
 }
@@ -2425,18 +2749,15 @@ static esp_err_t handle_log(httpd_req_t *r)
     uint32_t n = query_log_snapshot(entries, 64);
     static EXT_RAM_BSS_ATTR char page[6144];
     int pg = 0;
+    httpd_resp_set_type(r, "text/html; charset=utf-8");
+    if (httpd_resp_send_chunk(r,
+            "<!DOCTYPE html><html><head><meta charset=utf-8>"
+            "<title>Query Log</title><style>\n", HTTPD_RESP_USE_STRLEN) != ESP_OK)
+        return ESP_FAIL;
+    if (httpd_resp_send_chunk(r, ADB_THEME_RAW, sizeof(ADB_THEME_RAW) - 1) != ESP_OK || httpd_resp_send_chunk(r, ADB_PRODUCT_RAW, sizeof(ADB_PRODUCT_RAW) - 1) != ESP_OK || httpd_resp_send_chunk(r, ADB_CHROME_RAW, sizeof(ADB_CHROME_RAW) - 1) != ESP_OK)
+        return ESP_FAIL;
     page_appendf(page, sizeof(page), &pg,
-        "<!DOCTYPE html><html><head><meta charset=utf-8>"
-        "<title>Query Log</title>"
-        "<style>"
-        ":root{--bg:#fefefe;--face:#f4f4f4;--face-raised:#f0f0f0;--ink:#454545;--ink-dim:#777;--brass:#07a;--line:#ddd;--alert:#c0392b;--ok:#1a7f37;--mono:ui-monospace,Consolas,monospace;}"
-        "@media(prefers-color-scheme:dark){:root{--bg:#0e1117;--face:#161b22;--face-raised:#1f242c;--ink:#d9d9d9;--ink-dim:#999;--brass:#00a2e7;--line:#30363d;--alert:#d24637;--ok:#5fd377;}}"
-        "body{font-family:var(--mono);color:var(--ink);background:var(--bg);max-width:920px;margin:1.5em auto;padding:0 .5em;line-height:1.5}"
-        "table{border-collapse:collapse;width:100%%;font-size:.88em}"
-        "td,th{border:1px solid var(--line);padding:.35em .6em}"
-        "th{background:var(--face-raised);color:var(--ink);letter-spacing:.06em;text-transform:uppercase}"
-        ".blk{color:var(--alert);font-weight:bold}.rw{color:var(--brass);font-weight:bold}.ok{color:var(--ok)}"
-        "a{color:var(--brass)}</style></head><body>"
+        "</style></head><body>"
         "<h2>Query Log <small>(<a href='/'>home</a>)</small></h2>"
         "<table><tr><th>Time (UTC)</th><th>Client</th><th>Domain</th>"
         "<th>Type</th><th>Result</th></tr>");
@@ -2458,7 +2779,7 @@ static esp_err_t handle_log(httpd_req_t *r)
             snprintf(tbuf, sizeof(tbuf), "+%lus", (unsigned long)e->ts_s);
         }
         page_appendf(page, sizeof(page), &pg,
-            "<tr><td>%s</td><td>%u.%u.%u.%u</td><td>%s</td>"
+            "<tr><td class=mono>%s</td><td class=mono>%u.%u.%u.%u</td><td class=mono>%s</td>"
             "<td>%s</td><td class='%s'>%s</td></tr>",
             tbuf,
             (unsigned)((ip>>24)&0xFF),(unsigned)((ip>>16)&0xFF),
@@ -2466,8 +2787,7 @@ static esp_err_t handle_log(httpd_req_t *r)
             safe, type, cls, res);
     }
     page_appendf(page, sizeof(page), &pg, "</table></body></html>");
-    send_html(r, page);
-    return ESP_OK;
+    return send_chunked_tail(r, page);
 }
 
 /* ── GET /census — passive L2 census (#73 foundation) ────────────── */
@@ -2489,17 +2809,15 @@ static esp_err_t handle_census(httpd_req_t *r)
 
     static EXT_RAM_BSS_ATTR char page[12288];
     int pg = 0;
+    httpd_resp_set_type(r, "text/html; charset=utf-8");
+    if (httpd_resp_send_chunk(r,
+            "<!DOCTYPE html><html><head><meta charset=utf-8>"
+            "<title>LAN Census</title><style>\n", HTTPD_RESP_USE_STRLEN) != ESP_OK)
+        return ESP_FAIL;
+    if (httpd_resp_send_chunk(r, ADB_THEME_RAW, sizeof(ADB_THEME_RAW) - 1) != ESP_OK || httpd_resp_send_chunk(r, ADB_PRODUCT_RAW, sizeof(ADB_PRODUCT_RAW) - 1) != ESP_OK || httpd_resp_send_chunk(r, ADB_CHROME_RAW, sizeof(ADB_CHROME_RAW) - 1) != ESP_OK)
+        return ESP_FAIL;
     page_appendf(page, sizeof(page), &pg,
-        "<!DOCTYPE html><html><head><meta charset=utf-8>"
-        "<title>LAN Census</title>"
-        "<style>"
-        ":root{--bg:#fefefe;--face:#f4f4f4;--face-raised:#f0f0f0;--ink:#454545;--ink-dim:#777;--brass:#07a;--line:#ddd;--warn:#b58900;--mono:ui-monospace,Consolas,monospace;}"
-        "@media(prefers-color-scheme:dark){:root{--bg:#0e1117;--face:#161b22;--face-raised:#1f242c;--ink:#d9d9d9;--ink-dim:#999;--brass:#00a2e7;--line:#30363d;--warn:#e3b341;}}"
-        "body{font-family:var(--mono);color:var(--ink);background:var(--bg);max-width:920px;margin:1.5em auto;padding:0 .5em;line-height:1.5}"
-        "table{border-collapse:collapse;width:100%%;font-size:.88em}"
-        "td,th{border:1px solid var(--line);padding:.35em .6em}"
-        "th{background:var(--face-raised);color:var(--ink);letter-spacing:.06em;text-transform:uppercase}"
-        ".warn{color:var(--warn);font-weight:bold}a{color:var(--brass)}</style></head><body>"
+        "</style></head><body>"
         "<h2>LAN Census <small>(<a href='/'>home</a>)</small></h2>"
         "<p>Sightings on the wire (ARP/DHCP/DNS), not a verdict — a client "
         "flagged <b class='warn'>suspected bypass</b> has been seen on the "
@@ -2520,17 +2838,17 @@ static esp_err_t handle_census(httpd_req_t *r)
         bool bypass = (c->arp_count || c->dhcp_count) && !c->query_count &&
                       age_s >= CENSUS_GRACE_S;
         page_appendf(page, sizeof(page), &pg,
-            "<tr><td>%02x:%02x:%02x:%02x:%02x:%02x</td><td>%u.%u.%u.%u</td>"
-            "<td>%s</td><td>%lus ago</td><td>%lus ago</td>"
-            "<td>%" PRIu32 "</td><td>%" PRIu32 "</td><td>%" PRIu32 "</td>"
-            "<td class='warn'>%s</td></tr>",
+            "<tr><td class=mono>%02x:%02x:%02x:%02x:%02x:%02x</td><td class=mono>%u.%u.%u.%u</td>"
+            "<td>%s</td><td class=mono>%lus ago</td><td class=mono>%lus ago</td>"
+            "<td class=mono>%" PRIu32 "</td><td class=mono>%" PRIu32 "</td><td class=mono>%" PRIu32 "</td>"
+            "<td>%s</td></tr>",
             c->mac[0], c->mac[1], c->mac[2], c->mac[3], c->mac[4], c->mac[5],
             (unsigned)((c->ip>>24)&0xFF),(unsigned)((c->ip>>16)&0xFF),
             (unsigned)((c->ip>>8)&0xFF),(unsigned)(c->ip&0xFF),
             host,
             (unsigned long)age_s, (unsigned long)(now_s - c->last_seen_s),
             c->arp_count, c->dhcp_count, c->query_count,
-            bypass ? "suspected bypass" : "");
+            bypass ? "<b class='warn'>suspected bypass</b>" : "");
     }
     page_appendf(page, sizeof(page), &pg, "</table>");
     if (shown < n) {
@@ -2539,8 +2857,7 @@ static esp_err_t handle_census(httpd_req_t *r)
             "buffer filled before the rest would fit.</p>", shown, n);
     }
     page_appendf(page, sizeof(page), &pg, "</body></html>");
-    send_html(r, page);
-    return ESP_OK;
+    return send_chunked_tail(r, page);
 }
 
 /* ── GET /top — top domains, clients + live history graph (#7,#11) ─ */
@@ -2558,20 +2875,21 @@ static esp_err_t handle_top(httpd_req_t *r)
 
     static EXT_RAM_BSS_ATTR char page[6144];
     int pg = 0;
+    httpd_resp_set_type(r, "text/html; charset=utf-8");
+    if (httpd_resp_send_chunk(r,
+            "<!DOCTYPE html><html><head><meta charset=utf-8>"
+            "<meta http-equiv='refresh' content='30'>"
+            "<title>Stats</title><style>\n", HTTPD_RESP_USE_STRLEN) != ESP_OK)
+        return ESP_FAIL;
+    if (httpd_resp_send_chunk(r, ADB_THEME_RAW, sizeof(ADB_THEME_RAW) - 1) != ESP_OK || httpd_resp_send_chunk(r, ADB_PRODUCT_RAW, sizeof(ADB_PRODUCT_RAW) - 1) != ESP_OK || httpd_resp_send_chunk(r, ADB_CHROME_RAW, sizeof(ADB_CHROME_RAW) - 1) != ESP_OK)
+        return ESP_FAIL;
     page_appendf(page, sizeof(page), &pg,
-        "<!DOCTYPE html><html><head><meta charset=utf-8>"
-        "<meta http-equiv='refresh' content='30'>"
-        "<title>Stats</title>"
-        "<style>"
-        ":root{--bg:#fefefe;--face:#f4f4f4;--face-raised:#f0f0f0;--ink:#454545;--ink-dim:#777;--brass:#07a;--line:#ddd;--alert:#c0392b;--mono:ui-monospace,Consolas,monospace;}"
-        "@media(prefers-color-scheme:dark){:root{--bg:#0e1117;--face:#161b22;--face-raised:#1f242c;--ink:#d9d9d9;--ink-dim:#999;--brass:#00a2e7;--line:#30363d;--alert:#d24637;}}"
-        "body{font-family:var(--mono);color:var(--ink);background:var(--bg);max-width:820px;margin:1.5em auto;padding:0 .5em;line-height:1.5}"
-        "table{border-collapse:collapse;width:100%%;font-size:.9em}"
-        "td,th{border:1px solid var(--line);padding:.35em .6em}"
-        "th{background:var(--face-raised);color:var(--ink);letter-spacing:.06em;text-transform:uppercase}"
-        ".chart{display:flex;align-items:flex-end;gap:2px;height:80px;border-bottom:1px solid var(--line);margin:.5em 0}"
+        "h3+.chart{margin-top:0}"
+        ".chart{display:flex;align-items:flex-end;gap:2px;height:80px;margin:0;padding:0 4px;border:1px solid var(--grid);background:var(--well)}"
         ".bar{width:10px;display:inline-flex;flex-direction:column;justify-content:flex-end}"
-        ".bt{background:var(--brass)}.bb{background:var(--alert)}a{color:var(--brass)}</style></head><body>"
+        ".bt{background:var(--text)}"
+        ".bb{background:var(--dim)}"
+        "</style></head><body>"
         "<h2>Stats &amp; Graphs <small>(<a href='/'>home</a>)</small></h2>"
         "<h3>Query Volume (last %lu minutes)</h3>"
         "<div class=chart>",
@@ -2589,13 +2907,13 @@ static esp_err_t handle_top(httpd_req_t *r)
             (unsigned long)bh, (unsigned long)th);
     }
     page_appendf(page, sizeof(page), &pg,
-        "</div><p><small>Blue=allowed Red=blocked. Each bar=1 min.</small></p>"
+        "</div><p><small><span class=ok>allowed</span> <span class=blk>blocked</span>. Each bar=1 min.</small></p>"
         "<h3>Top Queried Domains</h3>"
         "<table><tr><th>Domain</th><th>Total</th><th>Blocked</th></tr>");
     for (uint32_t i = 0; i < nd && top_d[i].total > 0 && pg < (int)sizeof(page) - 256; i++) {
         char safe[128]; web_html_escape(safe, sizeof(safe), top_d[i].key);
         page_appendf(page, sizeof(page), &pg,
-            "<tr><td>%s</td><td>%lu</td><td>%lu</td></tr>",
+            "<tr><td class=mono>%s</td><td class=mono>%lu</td><td class=mono>%lu</td></tr>",
             safe, (unsigned long)top_d[i].total, (unsigned long)top_d[i].blocked);
     }
     page_appendf(page, sizeof(page), &pg,
@@ -2604,12 +2922,11 @@ static esp_err_t handle_top(httpd_req_t *r)
     for (uint32_t i = 0; i < nc && top_c[i].total > 0 && pg < (int)sizeof(page) - 256; i++) {
         char safe[64]; web_html_escape(safe, sizeof(safe), top_c[i].key);
         page_appendf(page, sizeof(page), &pg,
-            "<tr><td>%s</td><td>%lu</td><td>%lu</td></tr>",
+            "<tr><td class=mono>%s</td><td class=mono>%lu</td><td class=mono>%lu</td></tr>",
             safe, (unsigned long)top_c[i].total, (unsigned long)top_c[i].blocked);
     }
     page_appendf(page, sizeof(page), &pg, "</table></body></html>");
-    send_html(r, page);
-    return ESP_OK;
+    return send_chunked_tail(r, page);
 }
 
 /* ── POST /rewrite/set — add a DNS rewrite rule (#12) ─────────── */
@@ -2841,7 +3158,7 @@ bool web_ui_start(DnsSinkServer *dns)
     cfg.prvtkey_pem      = (const uint8_t *)key;
     cfg.prvtkey_len      = key_len;
     cfg.port_secure      = 443;
-    cfg.httpd.max_uri_handlers = 48;   /* 44 registered as of #73 — keep headroom */
+    cfg.httpd.max_uri_handlers = 50;   /* 47 registered with /alarms (44 as of #73) — keep headroom */
     cfg.httpd.max_resp_headers = 16;   /* 5 hardening headers + cookie + Location + type */
     cfg.httpd.stack_size       = 16384;
     /* Recycle the least-recently-used connection instead of refusing new ones
@@ -2879,6 +3196,7 @@ bool web_ui_start(DnsSinkServer *dns)
         { "/logout",              HTTP_POST, H(handle_logout)        },
         { "/",                    HTTP_GET,  H(handle_status)        },
         { "/metrics",             HTTP_GET,  H(handle_metrics)       },
+        { "/alarms",              HTTP_GET,  H(handle_alarms)        },
         { "/metrics/view",        HTTP_GET,  H(handle_metrics_view)  },
         { "/lastwords",           HTTP_GET,  H(handle_lastwords)     },
         { "/metrics/reset",       HTTP_POST, H(handle_metrics_reset) },
