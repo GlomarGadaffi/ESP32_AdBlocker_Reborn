@@ -160,6 +160,13 @@ CONFIG_MBEDTLS_PEM_WRITE_C=y
 # Posts a default-event-loop event on every TLS recv/send with a 2 s timeout;
 # nothing here listens, and the UI shouldn't depend on a shared queue.
 CONFIG_ESP_HTTPS_SERVER_EVENTS=n
+# Deterministic ECDSA (RFC 6979) for every signature the TLS server makes.
+# IDF's default is already y, but the "minimal" mbedTLS preset sets it n and
+# tf-psa-crypto warns its MBEDTLS_PK_ALG_ECDSA default "might change": with it
+# off, the PEM key esp-tls re-imports signs each handshake with a nonce from
+# esp_random(), which is only a TRNG while an entropy source runs (dns_sink.cpp
+# app_main). A weak nonce leaks the P-256 key. web_tls.c #errors if this is off.
+CONFIG_MBEDTLS_ECDSA_DETERMINISTIC=y
 # Login uses PSA PBKDF2-HMAC-SHA256 (web_auth.c). No Kconfig pins it: it comes
 # from TF-PSA-Crypto's default crypto_config.h (PSA_WANT_ALG_PBKDF2_HMAC). If
 # a future IDF gates it, login breaks at build time, not at runtime.

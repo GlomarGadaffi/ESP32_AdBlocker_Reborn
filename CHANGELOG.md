@@ -5,6 +5,33 @@ firmware's `esp_app_desc` version string comes from `version.txt`.
 
 ## [Unreleased]
 
+### Security
+
+- **`esp_random()` could be pseudo-random for the whole uptime.** ESP-IDF's
+  RNG is a true RNG only while an entropy source runs — the RF subsystem once
+  Wi-Fi starts, or the SAR ADC source the bootloader turns off before the app
+  runs — and nothing in the firmware ever turned one on. On an Ethernet board
+  booted with Wi-Fi disabled (Network tab or console `wifi-off`) every
+  security-relevant number came from the fallback PRNG: the TLS private key
+  if it was (re)generated on such a boot, ECDHE ephemeral keys and server
+  randoms, session and CSRF tokens, PBKDF2 salts, DNS transaction IDs and
+  0x20 bits. Default (Wi-Fi-on) boots were covered by RF from before the first
+  draw. Now `app_main` enables the SAR ADC source first thing and leaves it on;
+  a Wi-Fi-on boot hands over to RF just before `esp_wifi_init()`. Two
+  `[boot] entropy:` log lines show the state on the serial console.
+  Handshake signatures were never the leak: the TLS server already signs with
+  deterministic ECDSA (RFC 6979) by IDF Kconfig default, but nothing pinned
+  that — `CONFIG_MBEDTLS_ECDSA_DETERMINISTIC=y` is now in `sdkconfig.defaults`
+  and `web_tls.c` refuses to build without it.
+  **Every board mints a new TLS key and certificate on the first boot of this
+  release** (stored-identity format 2→3), because the firmware cannot tell
+  which boot generated the current one. Expect one browser certificate
+  warning with a new fingerprint; compare it against console `cert` before
+  accepting. Sessions are RAM-only and are cleared by the OTA reboot; the
+  admin password is unaffected. The boot log should say "stored certificate
+  is format 2, want 3 — regenerating"; if it says "loaded stored TLS
+  identity" instead, console `cert-reset` + reboot forces the same thing.
+
 ## [1.5.0] — 2026-10-13
 
 ### Security

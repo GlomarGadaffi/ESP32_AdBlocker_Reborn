@@ -715,8 +715,10 @@ static UpstreamEntry *upstream_alloc(uint16_t *our_txid_out)
         if (!s_upstream[i].in_use) {
             /* Random txid (H2): a predictable sequential counter lets an
              * off-path attacker guess the in-flight txid and forge a cached
-             * reply. esp_random() is the hardware RNG. Re-roll on the rare
-             * collision with another in-flight query. */
+             * reply. esp_random() is the hardware RNG — a TRNG only while an
+             * entropy source runs, which app_main guarantees (SAR ADC source,
+             * or RF once Wi-Fi starts). Re-roll on the rare collision with
+             * another in-flight query. */
             uint16_t t;
             do { t = (uint16_t)(esp_random() & 0xFFFFu); } while (t == 0 || txid_in_use(t));
             s_upstream[i].in_use       = true;
