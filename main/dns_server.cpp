@@ -11,6 +11,7 @@
 #include "query_log.h"
 #include "census.h"
 #include "timesync.h"
+#include "upstream_port.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
@@ -678,9 +679,30 @@ struct UpstreamEntry {
                                         see query_env_hash; unset on refresh_only entries */
     uint32_t         tcp_gen;        /* s_tcp[tcp_slot].gen at forward time — stale-conn detector */
     uint8_t          tcp_slot;       /* (#154) which s_tcp[] conn forwarded this flight */
+    uint8_t          up_gen;         /* upstream socket generation this flight left on; its
+                                        reply and its hedge both stay on that socket */
     UpstreamWaiter   waiters[UPSTREAM_WAITERS_MAX];
 };
 static UpstreamEntry s_upstream[UPSTREAM_TABLE_SIZE];
+
+/* Upstream source-port rotation (dns_task only, so no locking): policy state,
+ * and the fd of the draining socket (-1 when there is none). The current
+ * socket is run_loop's `usock`. */
+static up_state_t s_up;
+static int        s_drain_fd = -1;
+static uint32_t   s_cnt_up_rotations   = 0;   /* sockets rotated in */
+static uint32_t   s_cnt_up_rotate_fail = 0;   /* rotations abandoned (no socket / no free port) */
+
+/* Live flights that left on socket generation `gen` — what a draining socket
+ * waits on. Counted from the table rather than kept as a running total, so an
+ * eviction or reset path can never leave the count wrong. */
+static uint32_t upstream_flights_on(uint8_t gen)
+{
+    uint32_t n = 0;
+    for (int i = 0; i < UPSTREAM_TABLE_SIZE; i++)
+        if (s_upstream[i].in_use && s_upstream[i].up_gen == gen) n++;
+    return n;
+}
 
 /* ── TCP/53 connection state (dns_task only) ─────────────────────── */
 struct TcpConn {
@@ -750,6 +772,8 @@ static UpstreamEntry *upstream_alloc(uint16_t *our_txid_out)
                                                    a stale deadline+qlen would retransmit
                                                    the predecessor's question */
             s_upstream[i].hedge_qlen   = 0;
+            s_upstream[i].up_gen       = s_up.cur_gen;   /* every flight leaves on the current socket */
+            up_note_forward(&s_up);
             s_upstream[i].hedge_deadline_ms = 0;
             s_upstream[i].hedge_local  = false;   /* (#72) a stale flag would pin this
                                                      flight's hedge to the primary for
@@ -1372,14 +1396,41 @@ void DnsSinkServer::run_loop()
 
     /* ── Open upstream socket ───────────────────────────────────── */
     {
-        int usock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
-        if (usock < 0) { ESP_LOGE(TAG, "upstream socket: %d", errno); goto done; }
-        /* SO_REUSEADDR: lets the task restart without waiting for TIME_WAIT.
+        /* Source-port rotation. The upstream socket used to be created once and
+         * never bound, so lwIP gave it one ephemeral port for the whole uptime
+         * and the txid + 0x20 case pattern were the only entropy an off-path
+         * spoofer had to match. Now at most two upstream sockets exist: the
+         * current one and, while a rotation settles, the draining previous
+         * one. The policy (when to rotate, which port, when a drain is over)
+         * is in upstream_port.c; the socket calls are here.
          * Non-blocking receive is via MSG_DONTWAIT on each recvfrom() call. */
-        {
-            int flags = 1;
-            setsockopt(usock, SOL_SOCKET, SO_REUSEADDR, &flags, sizeof(flags));
-        }
+        s_drain_fd = -1;
+        up_init(&s_up, (uint32_t)(esp_timer_get_time() / 1000));
+        /* Open a UDP socket bound to a random port in UP_PORT_MIN..UP_PORT_MAX.
+         * A collision just re-rolls, at most UP_BIND_ATTEMPTS times. Returns the
+         * fd, or -1 with no socket left open. When asked for a first socket
+         * (fallback) and every bind failed, an unbound socket is better than
+         * none: that is exactly how it behaved before rotation existed. */
+        auto open_upstream_sock = [&](bool fallback_unbound = false) -> int {
+            int s = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
+            if (s < 0) { ESP_LOGE(TAG, "upstream socket: %d", errno); return -1; }
+            for (int a = 0; a < UP_BIND_ATTEMPTS; a++) {
+                struct sockaddr_in b{};
+                b.sin_family      = AF_INET;
+                b.sin_addr.s_addr = INADDR_ANY;
+                b.sin_port        = htons(up_port_from_random(esp_random()));
+                if (bind(s, (sockaddr *)&b, sizeof(b)) == 0) return s;
+            }
+            if (fallback_unbound) {
+                ESP_LOGW(TAG, "upstream port bind failed %d times — using an ephemeral port",
+                         UP_BIND_ATTEMPTS);
+                return s;
+            }
+            close(s);
+            return -1;
+        };
+        int usock = open_upstream_sock(true);
+        if (usock < 0) goto done;
         _upstream_fd.store(usock, std::memory_order_release);
 
         /* resolve upstream IP once; _upstream_addr may change at runtime via
@@ -1431,10 +1482,15 @@ void DnsSinkServer::run_loop()
          * Used for plain-UDP replies from usock AND raw DoT-worker replies —
          * the transports differ, the trust and delivery logic must not. */
         auto process_reply = [&](uint8_t *pkt, int plen, int64_t t_ureply,
-                                 uint64_t now_ms_) {
+                                 uint64_t now_ms_, int rx_gen) {
             uint16_t our_txid = ntohs(reinterpret_cast<DnsHeader *>(pkt)->id);
             UpstreamEntry *ue = upstream_find(our_txid);
             if (!ue) return;
+            /* rx_gen is the generation of the UDP socket the reply came in on,
+             * or -1 for a DoT worker reply (TLS-authenticated, no socket). A
+             * UDP reply is only valid on the socket its flight left on: the
+             * source port is part of what an off-path spoofer must guess. */
+            if (rx_gen >= 0 && !up_reply_ok(ue->up_gen, (uint8_t)rx_gen)) return;
             /* Anti-spoofing (H2): even with a matching txid, verify the
              * reply's question matches what we actually asked. An attacker
              * who guesses the txid would have to also match the qname+qtype.
@@ -1602,6 +1658,35 @@ void DnsSinkServer::run_loop()
             ue->in_use = false;
         };
 
+        /* The socket a flight tagged with generation `gen` left on, or -1 if
+         * that generation's socket is gone. Only the current and the draining
+         * generation can have a live fd. */
+        auto usock_for = [&](uint8_t gen) -> int {
+            if (gen == s_up.cur_gen) return usock;
+            if (up_draining(&s_up) && gen == up_drain_gen(&s_up)) return s_drain_fd;
+            return -1;
+        };
+
+        /* Move to a fresh socket on a new random port. Called only when
+         * up_rotate_due() allows it, i.e. never while a socket is draining, so
+         * the total never exceeds two. On any failure the current socket is
+         * kept and the clocks restart so the retry comes one interval later. */
+        auto rotate_upstream = [&](uint32_t now32) {
+            int nu = open_upstream_sock(false);
+            uint8_t ng = 0;
+            if (nu < 0) {
+                up_rotate_failed(&s_up, now32);
+                s_cnt_up_rotate_fail++;
+                ESP_LOGW(TAG, "upstream port rotation failed — keeping the current socket");
+                return;
+            }
+            if (!up_begin_rotate(&s_up, now32, &ng)) { close(nu); return; }
+            s_drain_fd = usock;
+            usock = nu;
+            _upstream_fd.store(usock, std::memory_order_release);
+            s_cnt_up_rotations++;
+        };
+
         /* (#77) Recreate csock/usock in place. Shared by the L2 watchdog and
          * the #152 select() recovery; `who` tags the log lines. Bind the
          * replacement BEFORE closing the original: a failed rebind then leaves
@@ -1633,14 +1718,21 @@ void DnsSinkServer::run_loop()
                 ESP_LOGE(TAG, "%s: csock create failed (%d)", who, errno);
             }
 
-            /* usock never binds (ephemeral outbound port) — no reuse dance. */
-            int newu = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
+            /* usock binds a random high port (see open_upstream_sock) — no reuse
+             * dance. Replacing it also retires the draining socket, if any:
+             * flights that left on either are lost with them and simply time
+             * out, and a fresh generation keeps their tags from ever matching
+             * the new socket. */
+            int newu = open_upstream_sock();
             if (newu >= 0) {
-                int flags = 1;
-                setsockopt(newu, SOL_SOCKET, SO_REUSEADDR, &flags, sizeof(flags));
                 close(usock);
                 usock = newu;
                 _upstream_fd.store(usock, std::memory_order_release);
+                if (s_drain_fd >= 0) { close(s_drain_fd); s_drain_fd = -1; }
+                (void)up_drain_poll(&s_up, 0);          /* clear any draining state */
+                uint8_t ng;
+                if (up_begin_rotate(&s_up, (uint32_t)(esp_timer_get_time() / 1000), &ng))
+                    (void)up_drain_poll(&s_up, 0);      /* nothing left to drain */
             } else {
                 ESP_LOGE(TAG, "%s: usock create failed (%d)", who, errno);
             }
@@ -1664,7 +1756,8 @@ void DnsSinkServer::run_loop()
             FD_SET(csock, &rset);
             FD_SET(usock, &rset);
             int nfds = (csock > usock ? csock : usock);
-            if (lsock >= 0)     { FD_SET(lsock, &rset);    if (lsock    > nfds) nfds = lsock; }
+            if (s_drain_fd >= 0) { FD_SET(s_drain_fd, &rset); if (s_drain_fd > nfds) nfds = s_drain_fd; }
+            if (lsock >= 0)    { FD_SET(lsock, &rset);    if (lsock    > nfds) nfds = lsock; }
             for (int ti = 0; ti < TCP_CONNS_MAX; ti++) {
                 int tfd = s_tcp[ti].fd;
                 if (tfd != -1) { FD_SET(tfd, &rset); if (tfd > nfds) nfds = tfd; }
@@ -1785,10 +1878,17 @@ void DnsSinkServer::run_loop()
 
             (void)sel;  /* select() is just the wait; we drain non-blocking below */
 
-            /* ── Drain ALL upstream replies first (frees table slots) ── */
+            /* ── Drain ALL upstream replies first (frees table slots) ──
+             * Both upstream sockets (current, and the draining one while a
+             * rotation is settling); each reply is tagged with the generation
+             * of the socket it arrived on. */
+            for (int us = 0; us < 2; us++) {
             for (int dn = 0; dn < 64; dn++) {
+                int ufd = (us == 0) ? usock : s_drain_fd;
+                if (ufd < 0) break;
+                uint8_t ugen = (us == 0) ? s_up.cur_gen : up_drain_gen(&s_up);
                 struct sockaddr_in from{}; socklen_t fromlen = sizeof(from);
-                int rlen = recvfrom(usock, rx, sizeof(rx), MSG_DONTWAIT,
+                int rlen = recvfrom(ufd, rx, sizeof(rx), MSG_DONTWAIT,
                                     (sockaddr *)&from, &fromlen);
                 if (rlen < 0) break;                           /* EWOULDBLOCK: drained */
                 if (rlen < (int)sizeof(DnsHeader)) continue;
@@ -1809,8 +1909,21 @@ void DnsSinkServer::run_loop()
                 if ((from_a != _upstream_addr.load(std::memory_order_acquire) &&
                      from_a != _upstream_addr2.load(std::memory_order_acquire)) ||
                     from.sin_port != upstream_addr.sin_port) continue;
-                process_reply(rx, rlen, esp_timer_get_time(), now_ms);
+                process_reply(rx, rlen, esp_timer_get_time(), now_ms, (int)ugen);
             }
+            }   /* for each upstream socket */
+
+            /* ── Source-port rotation: retire the draining socket once its last
+             * flight is gone, then open a new generation if one is due. After
+             * the reply drain so finished flights are already out of the table. */
+            if (up_draining(&s_up)) {
+                if (up_drain_poll(&s_up, upstream_flights_on(up_drain_gen(&s_up))) &&
+                    s_drain_fd >= 0) {
+                    close(s_drain_fd);
+                    s_drain_fd = -1;
+                }
+            }
+            if (up_rotate_due(&s_up, (uint32_t)now_ms)) rotate_upstream((uint32_t)now_ms);
 
             /* ── Drain DoT worker results (replies + failed-query echoes) ──
              * Replies arrived over an authenticated TLS session, so the
@@ -1821,7 +1934,7 @@ void DnsSinkServer::run_loop()
                 int rlen = dot_reply_get(rx, sizeof(rx), &dot_failed);
                 if (rlen <= 0) break;
                 if (!dot_failed) {
-                    process_reply(rx, rlen, esp_timer_get_time(), now_ms);
+                    process_reply(rx, rlen, esp_timer_get_time(), now_ms, -1);
                 } else if (rlen >= (int)sizeof(DnsHeader)) {
                     /* rx holds the original query (txid = our table txid):
                      * fall back to plain UDP for this one, same entry. */
@@ -1831,6 +1944,7 @@ void DnsSinkServer::run_loop()
                         upstream_addr.sin_addr.s_addr =
                             _upstream_addr.load(std::memory_order_acquire);
                         ue->upstream_us = esp_timer_get_time();
+                        ue->up_gen = s_up.cur_gen;   /* this copy leaves on the current socket */
                         sendto(usock, rx, rlen, 0,
                                (sockaddr *)&upstream_addr, sizeof(upstream_addr));
                         ESP_LOGW(TAG, "DoT failed — query re-sent over plain UDP");
@@ -1923,7 +2037,12 @@ void DnsSinkServer::run_loop()
                                        : _upstream_addr2.load(std::memory_order_acquire);
                     if (!hedge_a) hedge_a = _upstream_addr.load(std::memory_order_acquire);
                     upstream_addr.sin_addr.s_addr = hedge_a;
-                    sendto(usock, s_hedge_q + (size_t)i * HEDGE_QMAX,
+                    /* Same socket the original left on (source-port rotation):
+                     * the reply is only accepted back on that socket, and the
+                     * drain rule keeps it open while this flight lives. */
+                    int hedge_fd = usock_for(he->up_gen);
+                    if (hedge_fd < 0) continue;
+                    sendto(hedge_fd, s_hedge_q + (size_t)i * HEDGE_QMAX,
                            he->hedge_qlen, 0,
                            (sockaddr *)&upstream_addr, sizeof(upstream_addr));
                     he->hedged = true;
@@ -2516,6 +2635,7 @@ void DnsSinkServer::run_loop()
 done:
     for (int ti = 0; ti < TCP_CONNS_MAX; ti++) tcp_conn_close(s_tcp[ti]);
     if (lsock >= 0) close(lsock);
+    if (s_drain_fd >= 0) { close(s_drain_fd); s_drain_fd = -1; }
     int fd = _client_fd.exchange(-1, std::memory_order_acq_rel);
     if (fd != -1) close(fd);
     fd = _upstream_fd.exchange(-1, std::memory_order_acq_rel);
@@ -2628,6 +2748,7 @@ int dns_server_metrics_json(char *out, size_t cap)
         "\"stale_served\":%" PRIu32 ","
         "\"coalesced\":%" PRIu32 ","
         "\"hedges_sent\":%" PRIu32 ",\"hedged_completions\":%" PRIu32 ","
+        "\"up_rotations\":%" PRIu32 ",\"up_rotate_failures\":%" PRIu32 ","
         "\"dropped\":{\"table_full\":%" PRIu32 ",\"mbox_pressure\":%" PRIu32 "},"
         "\"upstream_timeouts\":%" PRIu32 ","
         "\"upstream_inflight\":%d,\"upstream_max\":%d,"
@@ -2664,6 +2785,7 @@ int dns_server_metrics_json(char *out, size_t cap)
         s_cnt_stale,
         s_cnt_coalesced,
         s_cnt_hedges_sent, s_cnt_hedged_done,
+        s_cnt_up_rotations, s_cnt_up_rotate_fail,
         s_cnt_drop_table, s_cnt_mbox_pressure, s_cnt_upstream_to,
         upstream_inflight(), UPSTREAM_TABLE_SIZE,
         blocklist_domain_count(), blocklist_is_loading() ? "true" : "false",
