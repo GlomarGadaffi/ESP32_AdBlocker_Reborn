@@ -6,4 +6,4 @@ l2_finish_reply_test: tests/l2_finish_reply_test.c
 qname_case_scrub_test: tests/qname_case_scrub_test.c main/domain.c
 rule_parse_test: tests/rule_parse_test.c main/domain.c
 web_parse_test: tests/web_parse_test.c main/web_parse.c
-verdict_test: tests/verdict_test.c main/bl_verdict.c main/bl_rank.c main/bl_table.c main/domain.c
+verdict_test: tests/verdict_test.c main/bl_rank.c main/domain.c
