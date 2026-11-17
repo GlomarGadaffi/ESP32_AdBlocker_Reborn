@@ -21,6 +21,7 @@ idf_component_register(
         "murmur3.c"
         "domain.c"
         "dns_wire.c"
+        "fwd_cache.c"
         "dns_health.c"
         "upstream_port.c"
         "web_parse.c"

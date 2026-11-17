@@ -12,6 +12,7 @@
 #include "census.h"
 #include "timesync.h"
 #include "upstream_port.h"
+#include "fwd_cache.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
@@ -82,11 +83,9 @@ static uint32_t s_cnt_mbox_pressure = 0; /* (#81) client-socket drain loop hit i
 static uint32_t s_cnt_upstream_to  = 0;  /* upstream timeouts (evicted in_use) */
 static uint32_t s_cnt_cache_probe  = 0;  /* result-cache lookups */
 static uint32_t s_cnt_cache_hit    = 0;  /* result-cache hits */
-static uint32_t s_cnt_cache_evict  = 0;  /* still-useful entries evicted by a colliding
-                                            store — the set-associativity pressure gauge:
-                                            near zero means WAYS×SETS is big enough */
-static uint32_t s_cnt_cache_toobig = 0;  /* responses skipped: len > FWD_RESP_MAX. The
-                                            evidence for (or against) a bigger resp[] */
+/* Cache eviction / too-big counters live in s_fwd (s_fwd.evict: still-useful
+ * entries evicted by a colliding store — the set-associativity pressure gauge;
+ * s_fwd.toobig: responses skipped for len > FWD_RESP_MAX). */
 static uint32_t s_cnt_stale        = 0;  /* serve-stale replays (#68) */
 static uint32_t s_cnt_coalesced    = 0;  /* upstream queries avoided by single-flight (#76):
                                             waiters attached + refreshes suppressed */
@@ -176,56 +175,13 @@ static constexpr int      TCP_QUERY_MAX    = 768;
  * without re-measuring. Storing raw wire bytes per entry — rather than parsed
  * records — is the layout Cloudflare's 1.1.1.1 cache rework converged on
  * (56% smaller, faster inserts/lookups), so the entry format stays as is. */
-#define CACHE_WAYS     4
-#define CACHE_SETS     512    /* power of two; 4×512 = 2048 entries ≈ 1.1MB PSRAM */
-#define CACHE_ENTRIES  (CACHE_WAYS * CACHE_SETS)
-#define FWD_RESP_MAX   512
-#define FWD_TTL_MIN_S  10u
-#define FWD_TTL_MAX_S  3600u
-
-/* Serve-stale (#68, RFC 8767 / AdGuard "optimistic cache"): an expired allowed
- * entry is replayed immediately (answer TTLs clamped to STALE_TTL_S) and a
- * background refresh is forwarded upstream, so a repeat visitor never eats the
- * ~40ms cold path for a name we've resolved before. Stale window capped at
- * STALE_MAX_S past expiry; refresh launches are rate-limited per entry. */
-#define STALE_MAX_S    86400u
-#define STALE_TTL_S    30u
-struct CacheEntry {
-    uint32_t   key_hash;
-    uint64_t   ttl_deadline_ms;       /* esp_timer ms — 64-bit, no 49-day wrap (#30) */
-    bool       valid;
-    bool       blocked;
-    uint16_t   qtype;
-    uint16_t   resp_len;              /* allowed: cached raw response length (0 = blocked) */
-    uint16_t   qn_len;                /* wire length of the question name at resp[12..].
-                                         key_hash only picks the set: a hit also has to be
-                                         this exact name (dns_qname_wire_eq), or two names
-                                         with colliding 32-bit hashes would answer for each
-                                         other. Allowed entries have it in their stored reply
-                                         already; blocked ones (resp_len 0) store just the
-                                         name there. */
-    uint64_t   refresh_after_ms;      /* stale-refresh rate gate; dns_task only, not
-                                         read by the L2 path so no seqlock needed */
-    uint32_t   load_gen;              /* blocklist_generation() as of the VERDICT that
-                                         authorised this entry (#85) — a lookup under a
-                                         newer generation treats this entry as a miss
-                                         instead of trusting a verdict made under a
-                                         blocklist that's no longer current. Read at the
-                                         verdict, not here at the store: an upstream reply
-                                         lands one RTT later, and a bump inside that window
-                                         would otherwise stamp a pre-bump ALLOW with the
-                                         post-bump generation — the exact state this field
-                                         exists to reject. */
-    uint8_t    resp[FWD_RESP_MAX];    /* allowed: raw upstream response */
-};
-static CacheEntry *s_cache = nullptr; /* CACHE_ENTRIES entries in PSRAM */
-
-/* Seqlock for cross-task cache reads. The dns_task is the only writer; the L2
- * eth-RX task reads the cache from dns_cache_l2_get() (a different task/core).
- * Writers bump the counter odd→write→even; a reader that sees an odd value or a
- * changed value bails (treats it as a miss → passthrough to lwIP). The dns_task's
- * own cache_lookup() needs no seqlock — it never races itself. */
-static std::atomic<uint32_t> s_cache_seq{0};
+/* The cache itself (entry layout, WAYS/SETS, FWD_RESP_MAX, TTL clamps, the
+ * serve-stale window of #68 / RFC 8767, the seqlock for the L2 reader, key
+ * compare, eviction, the SD record codec) lives in fwd_cache.c/.h, which has
+ * host tests. This file owns the storage (PSRAM, below), the metrics counters
+ * and the socket-path policy around it. dns_task is the only writer; the L2
+ * eth-RX task reads through dns_cache_l2_get(). */
+static fwd_cache_t s_fwd;
 
 /* Live upstream address, published for /metrics (#80). The forwarding path
  * reads DnsSinkServer::_upstream_addr; this mirrors it so the httpd task can
@@ -239,136 +195,15 @@ static std::atomic<uint32_t> s_upstream_addr_pub{0};
  * primary alone, so it cannot clobber a secondary already applied. */
 static std::atomic<uint32_t> s_upstream_addr2_pub{0};
 
-static inline void cache_write_begin(void)
-{
-    s_cache_seq.store(s_cache_seq.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
-    std::atomic_thread_fence(std::memory_order_release);
-}
-static inline void cache_write_end(void)
-{
-    std::atomic_thread_fence(std::memory_order_release);
-    s_cache_seq.store(s_cache_seq.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
-}
-
 static bool cache_init(void)
 {
-    s_cache = (CacheEntry *)heap_caps_calloc(CACHE_ENTRIES, sizeof(CacheEntry), MALLOC_CAP_SPIRAM);
-    return s_cache != nullptr;
-}
-/* First entry of the set that (h, qtype) maps to; its CACHE_WAYS ways are
- * contiguous. qtype folded in as before, so A and AAAA live in separate sets. */
-static inline CacheEntry *cache_set(uint32_t h, uint16_t qtype)
-{
-    return &s_cache[((h ^ ((uint32_t)qtype << 1)) & (CACHE_SETS - 1)) * CACHE_WAYS];
-}
-/* The full cache key: (hash, qtype) plus the exact question name. qn/qn_len
- * are the query's own wire QNAME (pkt + 12, dns_extract_qname's qend - 16);
- * case is ignored, as it is by domain_hash. IRAM: dns_cache_l2_get uses it. */
-static inline IRAM_ATTR bool cache_key_eq(const CacheEntry *e, uint32_t h, uint16_t qtype,
-                                          const uint8_t *qn, int qn_len)
-{
-    return e->key_hash == h && e->qtype == qtype && e->qn_len == qn_len &&
-           dns_qname_wire_eq(e->resp + sizeof(DnsHeader), qn, qn_len);
-}
-static CacheEntry *cache_lookup(uint32_t h, uint16_t qtype, const uint8_t *qn, int qn_len,
-                                uint64_t now_ms)
-{
-    CacheEntry *set = cache_set(h, qtype);
-    uint32_t gen = blocklist_generation();  /* (#85) one load, reused across all WAYS */
-    for (int w = 0; w < CACHE_WAYS; w++) {
-        CacheEntry *e = &set[w];
-        if (e->valid && cache_key_eq(e, h, qtype, qn, qn_len) && e->ttl_deadline_ms > now_ms
-            && e->load_gen == gen)
-            return e;
-    }
-    return nullptr;
-}
-/* The way a store for (h, qtype) must write. Priority: the key's OWN way if it
- * already has one — writing anywhere else would leave two live entries for one
- * key, and lookups could keep returning the outdated twin — then an invalid
- * way, then the way whose usefulness ends soonest. "Usefulness" is not the TTL
- * deadline alone: an expired BLOCKED entry is already worthless (re-blocking
- * is microseconds; cache_lookup_stale never serves them) while an expired
- * allowed entry still answers through the serve-stale window (#68), so blocked
- * entries compare at their deadline and allowed ones at deadline + STALE_MAX_S.
- * Evicting a still-useful entry bumps s_cnt_cache_evict — the gauge that says
- * whether WAYS×SETS is actually big enough for the traffic. */
-static CacheEntry *cache_victim(uint32_t h, uint16_t qtype, const uint8_t *qn, int qn_len,
-                                uint64_t now_ms)
-{
-    CacheEntry *set = cache_set(h, qtype);
-    CacheEntry *victim = &set[0];
-    uint64_t victim_end = UINT64_MAX;
-    for (int w = 0; w < CACHE_WAYS; w++) {
-        CacheEntry *e = &set[w];
-        /* Own way = same name, not merely same hash: a colliding name gets a
-         * way of its own instead of overwriting this one. */
-        if (e->valid && cache_key_eq(e, h, qtype, qn, qn_len))
-            return e;                          /* overwrite in place */
-        uint64_t end = !e->valid ? 0
-            : e->ttl_deadline_ms + (e->blocked ? 0 : (uint64_t)STALE_MAX_S * 1000u);
-        if (end < victim_end) { victim = e; victim_end = end; }
-    }
-    if (victim->valid && victim_end > now_ms)
-        s_cnt_cache_evict++;
-    return victim;
-}
-/* load_gen is the generation as of the verdict that authorised this store, passed
- * in by the caller — never re-read here. See CacheEntry::load_gen. */
-static void cache_store_blocked(uint32_t h, uint16_t qtype, const uint8_t *qn, int qn_len,
-                                uint32_t ttl_s, uint64_t now_ms, uint32_t load_gen)
-{
-    if (qn_len <= 0 || qn_len > DNS_QNAME_WIRE_MAX) return;
-    CacheEntry *e = cache_victim(h, qtype, qn, qn_len, now_ms);
-    cache_write_begin();
-    e->key_hash = h; e->qtype = qtype; e->blocked = true; e->valid = true;
-    e->resp_len = 0;
-    memcpy(e->resp + sizeof(DnsHeader), qn, (size_t)qn_len);
-    e->qn_len = (uint16_t)qn_len;
-    e->ttl_deadline_ms = now_ms + (uint64_t)ttl_s * 1000u;
-    e->load_gen = load_gen;  /* (#85) */
-    cache_write_end();
-}
-static void cache_store_resp(uint32_t h, uint16_t qtype, const uint8_t *resp, int len,
-                             uint32_t ttl_s, uint64_t now_ms, uint32_t load_gen)
-{
-    if (len <= 0) return;
-    if (len > FWD_RESP_MAX) { s_cnt_cache_toobig++; return; }
-    int qn_len = dns_qname_wire_len(resp, len, sizeof(DnsHeader));
-    if (qn_len < 0) return;
-    CacheEntry *e = cache_victim(h, qtype, resp + sizeof(DnsHeader), qn_len, now_ms);
-    cache_write_begin();
-    e->key_hash = h; e->qtype = qtype; e->blocked = false; e->valid = true;
-    e->resp_len = (uint16_t)len;
-    memcpy(e->resp, resp, len);
-    e->qn_len = (uint16_t)qn_len;
-    e->ttl_deadline_ms   = now_ms + (uint64_t)ttl_s * 1000u;
-    e->refresh_after_ms  = 0;
-    e->load_gen          = load_gen;  /* (#85) */
-    cache_write_end();
+    fwd_entry_t *buf = (fwd_entry_t *)heap_caps_calloc(FWD_CACHE_ENTRIES, sizeof(fwd_entry_t),
+                                                       MALLOC_CAP_SPIRAM);
+    return fwd_cache_init(&s_fwd, buf, FWD_CACHE_ENTRIES);   /* false on a null buf */
 }
 
-/* Serve-stale lookup (#68): expired ALLOWED entry within the stale window.
- * Fresh entries are cache_lookup()'s job; expired blocked entries stay misses
- * (re-blocking via the blocklist is microseconds — no staleness needed). */
-static CacheEntry *cache_lookup_stale(uint32_t h, uint16_t qtype, const uint8_t *qn,
-                                      int qn_len, uint64_t now_ms)
-{
-    CacheEntry *set = cache_set(h, qtype);
-    uint32_t gen = blocklist_generation();  /* (#85) */
-    for (int w = 0; w < CACHE_WAYS; w++) {
-        CacheEntry *e = &set[w];
-        if (e->valid && !e->blocked && e->resp_len > 0 &&
-            cache_key_eq(e, h, qtype, qn, qn_len) &&
-            e->ttl_deadline_ms <= now_ms &&
-            e->ttl_deadline_ms + (uint64_t)STALE_MAX_S * 1000u > now_ms &&
-            e->load_gen == gen)
-            return e;
-    }
-    return nullptr;
-}
-
-/* L2 fast-path cache read (called from the eth-RX task). Seqlock-protected.
+/* L2 fast-path cache read (called from the eth-RX task). Seqlock-protected;
+ * the read itself is fwd_cache_l2_get() (fwd_cache.c).
  * Copies the cached ALLOWED response for (qhash, qtype, exact qname qn) into out
  * (caller patches the txid + builds the frame). Returns the DNS length, or -1 on
  * miss / expired /
@@ -378,37 +213,13 @@ extern "C" int IRAM_ATTR dns_cache_l2_get(uint32_t qhash, uint16_t qtype,
                                           const uint8_t *qn, int qn_len,
                                           uint8_t *out, int out_cap)
 {
-    if (!s_cache || !out) return -1;
+    if (!s_fwd.e || !out) return -1;
     uint64_t now_ms = (uint64_t)(esp_timer_get_time() / 1000);
-    CacheEntry *set = cache_set(qhash, qtype);
     uint32_t gen = blocklist_generation();  /* (#85) — this path only ever serves
                                                 ALLOWED entries, so it's exactly as
                                                 exposed to a stale cached ALLOW as
                                                 the dns_task path is */
-
-    uint32_t s1 = s_cache_seq.load(std::memory_order_relaxed);
-    if (s1 & 1u) return -1;                       /* writer mid-update */
-    std::atomic_thread_fence(std::memory_order_acquire);
-
-    /* Scan the whole set inside ONE seqlock window: a mid-scan write would
-     * invalidate any way we matched, and the single end check catches it. */
-    int len = -1;
-    for (int w = 0; w < CACHE_WAYS; w++) {
-        CacheEntry *e = &set[w];
-        if (!e->valid || e->blocked || !cache_key_eq(e, qhash, qtype, qn, qn_len)) continue;
-        if (e->ttl_deadline_ms <= now_ms) continue;  /* expired */
-        if (e->load_gen != gen) continue;            /* (#85) stale verdict */
-        int l = e->resp_len;
-        if (l <= 0 || l > out_cap || l > FWD_RESP_MAX) continue;
-        memcpy(out, e->resp, (size_t)l);
-        len = l;
-        break;
-    }
-    if (len < 0) return -1;
-
-    std::atomic_thread_fence(std::memory_order_acquire);
-    if (s_cache_seq.load(std::memory_order_relaxed) != s1) return -1; /* raced */
-    return len;
+    return fwd_cache_l2_get(&s_fwd, qhash, qtype, qn, qn_len, now_ms, gen, out, out_cap);
 }
 
 /* --- SD warm-boot for the forward cache (#79) -------------------------
@@ -416,35 +227,12 @@ extern "C" int IRAM_ATTR dns_cache_l2_get(uint32_t qhash, uint16_t qtype,
  * across a reset, so they are deliberately NOT persisted. Restored entries
  * come back marked expired-but-inside-the-stale-window, which hands the
  * whole job to the serve-stale machinery (#68): the first touch of a
- * remembered domain answers in ~2ms with TTLs clamped to STALE_TTL_S and
+ * remembered domain answers in ~2ms with TTLs clamped to FWD_STALE_TTL_S and
  * fires the normal background refresh. No new delivery path, and the worst
- * case is exactly what RFC 8767 already permits. */
+ * case is exactly what RFC 8767 already permits. The record format and the
+ * entry copy/insert live in fwd_cache.c; only the file I/O is here. */
 #define FWDCACHE_PATH   "/sdcard/fwdcache.bin"
 #define FWDCACHE_TMP    "/sdcard/fwdcache.tmp"
-#define FWDCACHE_MAGIC  0xFDCACE01u
-#define FWDCACHE_HDR_SZ 12   /* magic u32 | count u32 | entry_max u16 | rsv u16 */
-#define FWDCACHE_REC_SZ 8    /* key_hash u32 | qtype u16 | resp_len u16 | resp[] */
-
-/* Explicit little-endian field IO. The struct layouts happen to be
- * padding-free on ILP32 Xtensa, but an on-disk format should not lean on it. */
-static inline void fc_put_u16(uint8_t *p, uint16_t v)
-{
-    p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8);
-}
-static inline void fc_put_u32(uint8_t *p, uint32_t v)
-{
-    p[0] = (uint8_t)v;         p[1] = (uint8_t)(v >> 8);
-    p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24);
-}
-static inline uint16_t fc_get_u16(const uint8_t *p)
-{
-    return (uint16_t)(p[0] | (p[1] << 8));
-}
-static inline uint32_t fc_get_u32(const uint8_t *p)
-{
-    return (uint32_t)p[0]         | ((uint32_t)p[1] << 8)
-         | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
-}
 
 /* Restore the snapshot. Called from run_loop() immediately after cache_init(),
  * by which point sd_mount() has already run (dns_sink.cpp mounts the card
@@ -454,17 +242,17 @@ static void cache_load_sd(void)
     FILE *f = fopen(FWDCACHE_PATH, "rb");
     if (!f) return;
 
-    uint8_t hdr[FWDCACHE_HDR_SZ];
+    uint8_t hdr[FWD_SNAP_HDR_SZ];
     if (fread(hdr, 1, sizeof(hdr), f) != sizeof(hdr)) { fclose(f); return; }
 
-    uint32_t magic = fc_get_u32(hdr);
-    uint32_t count = fc_get_u32(hdr + 4);
-    uint16_t emax  = fc_get_u16(hdr + 8);
-    /* count > CACHE_ENTRIES is impossible from a good save (at most one record
+    uint32_t magic = 0;
+    uint32_t count = 0;
+    uint16_t emax  = 0;
+    /* count > FWD_CACHE_ENTRIES is impossible from a good save (at most one record
      * per entry), so it means corruption or a format change. A pre-associative
      * snapshot (≤1024 records, same entry_max) still loads fine: records carry
-     * their own key_hash and are re-inserted through cache_victim below. */
-    if (magic != FWDCACHE_MAGIC || emax != FWD_RESP_MAX || count > CACHE_ENTRIES) {
+     * their own key_hash and are re-inserted through fwd_cache_victim. */
+    if (!fwd_cache_hdr_decode(hdr, sizeof(hdr), FWD_CACHE_ENTRIES, &count, &magic, &emax)) {
         ESP_LOGW(TAG, "warm boot: snapshot rejected (magic %08" PRIx32 ", count %" PRIu32
                       ", entry_max %u)", magic, count, (unsigned)emax);
         fclose(f);
@@ -475,40 +263,30 @@ static void cache_load_sd(void)
      * boot against a freshly calloc-ed cache: an L2 reader seeing the odd
      * counter bails to lwIP, and there is nothing servable to bail out of yet.
      * Do NOT reuse this shape for a mid-life reload. */
-    cache_write_begin();
+    fwd_cache_write_begin(&s_fwd);
     uint32_t loaded = 0;
     const uint64_t now_ms = (uint64_t)(esp_timer_get_time() / 1000);
     for (uint32_t i = 0; i < count; i++) {
-        uint8_t rec[FWDCACHE_REC_SZ];
+        uint8_t rec[FWD_SNAP_REC_SZ];
         if (fread(rec, 1, sizeof(rec), f) != sizeof(rec)) break;   /* truncated */
 
-        uint32_t h        = fc_get_u32(rec);
-        uint16_t qtype    = fc_get_u16(rec + 4);
-        uint16_t resp_len = fc_get_u16(rec + 6);
-        if (resp_len == 0 || resp_len > FWD_RESP_MAX) break;       /* corrupt */
+        uint32_t h        = 0;
+        uint16_t qtype    = 0;
+        uint16_t resp_len = 0;
+        if (!fwd_cache_rec_decode(rec, sizeof(rec), &h, &qtype, &resp_len)) break;   /* corrupt */
 
         /* Freshly calloc-ed cache → this lands on an invalid way (a good save
-         * has at most CACHE_WAYS records per set; an old direct-mapped one at
+         * has at most FWD_CACHE_WAYS records per set; an old direct-mapped one at
          * most 2). Only a corrupt file can force a real eviction here. */
         /* Read into scratch first: the slot is picked by the stored reply's
          * own question name, the same full key a live store uses. */
         static EXT_RAM_BSS_ATTR uint8_t s_ld[FWD_RESP_MAX];   /* boot-only, cold */
         if (fread(s_ld, 1, resp_len, f) != resp_len) break;         /* truncated */
-        int qn_len = dns_qname_wire_len(s_ld, resp_len, sizeof(DnsHeader));
-        if (qn_len < 0) continue;                                   /* skip, keep going */
-        CacheEntry *e = cache_victim(h, qtype, s_ld + sizeof(DnsHeader), qn_len, now_ms);
-        memcpy(e->resp, s_ld, resp_len);
-        e->qn_len           = (uint16_t)qn_len;
-        e->key_hash         = h;
-        e->qtype            = qtype;
-        e->resp_len         = resp_len;
-        e->blocked          = false;
-        e->valid            = true;
-        e->ttl_deadline_ms  = 1;   /* expired, but inside the STALE_MAX_S window */
-        e->refresh_after_ms = 0;   /* first touch is free to refresh at once */
+        if (!fwd_cache_load_insert(&s_fwd, h, qtype, s_ld, resp_len, now_ms))
+            continue;                                               /* skip, keep going */
         loaded++;
     }
-    cache_write_end();
+    fwd_cache_write_end(&s_fwd);
     fclose(f);
 
     ESP_LOGI(TAG, "warm boot: %" PRIu32 " cached responses loaded stale from SD", loaded);
@@ -516,55 +294,34 @@ static void cache_load_sd(void)
 
 extern "C" void dns_server_cache_save(void)
 {
-    if (!s_cache) return;
+    if (!s_fwd.e) return;
 
     FILE *f = fopen(FWDCACHE_TMP, "wb");
     if (!f) { ESP_LOGW(TAG, "cache save: open %s failed (%d)", FWDCACHE_TMP, errno); return; }
 
-    uint8_t hdr[FWDCACHE_HDR_SZ];
-    fc_put_u32(hdr, FWDCACHE_MAGIC);
-    fc_put_u32(hdr + 4, 0);                  /* count patched in at the end */
-    fc_put_u16(hdr + 8, FWD_RESP_MAX);
-    fc_put_u16(hdr + 10, 0);
+    uint8_t hdr[FWD_SNAP_HDR_SZ];
+    fwd_cache_hdr_encode(hdr, 0);            /* count patched in at the end */
     if (fwrite(hdr, 1, sizeof(hdr), f) != sizeof(hdr)) {
         fclose(f); remove(FWDCACHE_TMP); return;
     }
 
     /* This runs in download_task while dns_task may be writing, so each entry
-     * is copied under the same seqlock protocol as dns_cache_l2_get() and
-     * written to SD OUTSIDE the window - an fwrite inside it would race on
-     * essentially every entry. Static buffer: single caller, not re-entrant. */
+     * is copied under the same seqlock protocol as dns_cache_l2_get()
+     * (fwd_cache_snap_read) and written to SD OUTSIDE the window - an fwrite
+     * inside it would race on essentially every entry. Static buffer: single
+     * caller, not re-entrant. */
     static uint8_t s_snap[FWD_RESP_MAX];
     const uint64_t now_ms = (uint64_t)(esp_timer_get_time() / 1000);
     uint32_t saved = 0;
 
-    for (int i = 0; i < CACHE_ENTRIES; i++) {
-        CacheEntry *e = &s_cache[i];
+    for (uint32_t i = 0; i < s_fwd.entries; i++) {
+        uint32_t h        = 0;
+        uint16_t qtype    = 0;
+        uint16_t resp_len = 0;
+        if (!fwd_cache_snap_read(&s_fwd, i, now_ms, s_snap, &h, &qtype, &resp_len)) continue;
 
-        uint32_t s1 = s_cache_seq.load(std::memory_order_relaxed);
-        if (s1 & 1u) continue;                        /* writer mid-update */
-        std::atomic_thread_fence(std::memory_order_acquire);
-
-        if (!e->valid || e->blocked) continue;
-        uint32_t h        = e->key_hash;
-        uint16_t qtype    = e->qtype;
-        uint16_t resp_len = e->resp_len;
-        uint64_t deadline = e->ttl_deadline_ms;
-        if (resp_len == 0 || resp_len > FWD_RESP_MAX) continue;
-        memcpy(s_snap, e->resp, resp_len);
-
-        std::atomic_thread_fence(std::memory_order_acquire);
-        if (s_cache_seq.load(std::memory_order_relaxed) != s1) continue;   /* raced */
-
-        /* Drop entries already past their stale window: restoring one would
-         * serve data older than the STALE_MAX_S contract the runtime enforces
-         * everywhere else. (Not in the written #79 design - added here.) */
-        if (deadline + (uint64_t)STALE_MAX_S * 1000u <= now_ms) continue;
-
-        uint8_t rec[FWDCACHE_REC_SZ];
-        fc_put_u32(rec, h);
-        fc_put_u16(rec + 4, qtype);
-        fc_put_u16(rec + 6, resp_len);
+        uint8_t rec[FWD_SNAP_REC_SZ];
+        fwd_cache_rec_encode(rec, h, qtype, resp_len);
         if (fwrite(rec, 1, sizeof(rec), f) != sizeof(rec)) break;
         if (fwrite(s_snap, 1, resp_len, f) != resp_len)     break;
         saved++;
@@ -574,7 +331,7 @@ extern "C" void dns_server_cache_save(void)
      * that either never gets renamed or still reads as count 0. */
     if (fseek(f, 4, SEEK_SET) == 0) {
         uint8_t cnt[4];
-        fc_put_u32(cnt, saved);
+        fwd_cache_count_encode(cnt, saved);
         fwrite(cnt, 1, sizeof(cnt), f);
     }
     fclose(f);
@@ -819,7 +576,7 @@ static UpstreamEntry *upstream_find_inflight(uint32_t qhash, uint32_t qkey, uint
  * only when these bytes match. Without the check a >512 B reply built for an
  * EDNS0 primary reaches a waiter that advertised nothing above the RFC 1035
  * 512 B default (RFC 6891 §6.2.5) — a delivery the forward cache could never
- * make, since cache_store_resp rejects anything over FWD_RESP_MAX. */
+ * make, since fwd_cache_store_resp rejects anything over FWD_RESP_MAX. */
 static inline uint32_t query_env_hash(const uint8_t *q, int qlen, int qend)
 {
     uint32_t seed = DOMAIN_HASH_SEED ^ (((uint32_t)q[2] << 8) | q[3]);
@@ -1355,8 +1112,8 @@ void DnsSinkServer::run_loop()
         return;
     }
     ESP_LOGI(TAG, "Result cache: %d-way x %d sets x %d B in PSRAM (%u KB)",
-             CACHE_WAYS, CACHE_SETS, (int)sizeof(CacheEntry),
-             (unsigned)(CACHE_ENTRIES * sizeof(CacheEntry) / 1024));
+             FWD_CACHE_WAYS, FWD_CACHE_SETS, (int)sizeof(fwd_entry_t),
+             (unsigned)(FWD_CACHE_ENTRIES * sizeof(fwd_entry_t) / 1024));
 
     /* #69 hedge stash: same shape as the forward cache above — PSRAM, one
      * boot-time allocation, dns_task-private. Failure is deliberately
@@ -1648,14 +1405,14 @@ void DnsSinkServer::run_loop()
                  * so storing a CH/HS reply here would hand it to a later IN query
                  * for the same name and type. Deliver it and forget it. */
             } else if (cloaked) {
-                cache_store_blocked(ue->qhash, ue->qtype, pkt + sizeof(DnsHeader),
-                                    rqend - 4 - (int)sizeof(DnsHeader),
-                                    BLOCKED_TTL_S, now_ms_, ue->load_gen);
+                fwd_cache_store_blocked(&s_fwd, ue->qhash, ue->qtype, pkt + sizeof(DnsHeader),
+                                        rqend - 4 - (int)sizeof(DnsHeader),
+                                        BLOCKED_TTL_S, now_ms_, ue->load_gen);
             } else {
                 uint8_t rcode = pkt[3] & 0x0F;
                 if (!truncated && (rcode == 0 || rcode == 3))
-                    cache_store_resp(ue->qhash, ue->qtype, pkt, plen,
-                                     dns_resp_min_ttl(pkt, plen, 30, FWD_TTL_MIN_S, FWD_TTL_MAX_S), now_ms_, ue->load_gen);
+                    fwd_cache_store_resp(&s_fwd, ue->qhash, ue->qtype, pkt, plen,
+                                         dns_resp_min_ttl(pkt, plen, 30, FWD_TTL_MIN_S, FWD_TTL_MAX_S), now_ms_, ue->load_gen);
             }
             if (ue->hedged) s_cnt_hedged_done++;   /* (#69) see the counter's caveat */
             ue->in_use = false;
@@ -2137,8 +1894,8 @@ void DnsSinkServer::run_loop()
 
                 /* ── cache hit? ─────────────────────────────── */
                 s_cnt_cache_probe++;
-                CacheEntry *ce = (rw_pre || !cls_in) ? nullptr
-                                                     : cache_lookup(h, qtype, qn, qn_len, now_ms);
+                fwd_entry_t *ce = (rw_pre || !cls_in) ? nullptr
+                    : fwd_cache_lookup(&s_fwd, h, qtype, qn, qn_len, now_ms, blocklist_generation());
                 if (ce) {
                     s_cnt_cache_hit++;
                     if (ce->blocked && (paused_client || bypassed_client)) {
@@ -2183,16 +1940,16 @@ void DnsSinkServer::run_loop()
                  * The L2 path stays fresh-only: its miss falls through to
                  * here at ~1.8 ms, still invisible. */
                 if (cls_in && !rw_pre) {
-                    CacheEntry *se = cache_lookup_stale(h, qtype, qn, qn_len, now_ms);
+                    fwd_entry_t *se = fwd_cache_lookup_stale(&s_fwd, h, qtype, qn, qn_len, now_ms,
+                                                             blocklist_generation());
                     if (se && se->resp_len <= (int)sizeof(tx)) {
                         memcpy(tx, se->resp, se->resp_len);
                         tx[0] = rx[0]; tx[1] = rx[1];
-                        dns_rewrite_answer_ttls(tx, se->resp_len, STALE_TTL_S);
+                        dns_rewrite_answer_ttls(tx, se->resp_len, FWD_STALE_TTL_S);
                         sendto(csock, tx, se->resp_len, 0, (sockaddr *)&client_addr, clen);
                         s_cnt_stale++;
                         hist_record(&s_h_cached, esp_timer_get_time() - t_recv);
-                        if (now_ms >= se->refresh_after_ms) {
-                            se->refresh_after_ms = now_ms + UPSTREAM_TIMEOUT_MS;
+                        if (fwd_cache_refresh_arm(se, now_ms, UPSTREAM_TIMEOUT_MS)) {
                             /* Single-flight (#76): a real query for the same
                              * question is already in flight and its reply
                              * repopulates this entry, so the refresh has nothing
@@ -2216,7 +1973,7 @@ void DnsSinkServer::run_loop()
                                 ue->qtype        = qtype;
                                 ue->refresh_only = true;
                                 /* (#85) A refresh consults no verdict of its own —
-                                 * it re-stores what cache_lookup_stale already
+                                 * it re-stores what fwd_cache_lookup_stale already
                                  * matched against the current generation, so that
                                  * entry's own stamp is the authorising one. Copy
                                  * the value: se may be evicted before the reply. */
@@ -2236,7 +1993,7 @@ void DnsSinkServer::run_loop()
                                            (sockaddr *)&upstream_addr, sizeof(upstream_addr));
                                 }
                             } else {
-                                se->refresh_after_ms = 0;  /* table full — retry next hit */
+                                fwd_cache_refresh_disarm(se);  /* table full — retry next hit */
                             }
                         }
                         continue;
@@ -2288,7 +2045,7 @@ void DnsSinkServer::run_loop()
                          * nothing to record — but the query still isolates
                          * below in case the upstream answer CNAME-cloaks to a
                          * blocked target. */
-                        if (is_blk) cache_store_blocked(h, qtype, qn, qn_len,
+                        if (is_blk) fwd_cache_store_blocked(&s_fwd, h, qtype, qn, qn_len,
                                                         BLOCKED_TTL_S, now_ms, verdict_gen);
                         is_blk = false;
                     }
@@ -2300,7 +2057,7 @@ void DnsSinkServer::run_loop()
                             sendto(csock, tx, tlen, 0, (sockaddr *)&client_addr, clen);
                             hist_record(&s_h_sendto, esp_timer_get_time() - t_s0);
                         }
-                        cache_store_blocked(h, qtype, qn, qn_len, BLOCKED_TTL_S, now_ms, verdict_gen);
+                        fwd_cache_store_blocked(&s_fwd, h, qtype, qn, qn_len, BLOCKED_TTL_S, now_ms, verdict_gen);
                         hist_record(&s_h_blocked, esp_timer_get_time() - t_recv);
                         query_log_record(name, qtype,
                             ntohl(client_addr.sin_addr.s_addr), true, false);
@@ -2481,8 +2238,9 @@ void DnsSinkServer::run_loop()
                             /* (#100) Rewrite verdict before the cache, as on UDP. */
                             uint32_t rw_pre = (cls_in && qtype == 1) ? rewrite_lookup(name) : 0;
                             s_cnt_cache_probe++;
-                            CacheEntry *ce = (rw_pre || !cls_in) ? nullptr
-                                                                 : cache_lookup(h, qtype, qn, qn_len, now_ms);
+                            fwd_entry_t *ce = (rw_pre || !cls_in) ? nullptr
+                                : fwd_cache_lookup(&s_fwd, h, qtype, qn, qn_len, now_ms,
+                                                   blocklist_generation());
                             /* (#48/#74) A cached BLOCK is skipped for a paused or
                              * bypassed client: the verdict branch below re-derives
                              * it, stores it, and forwards this one delivery. */
@@ -2523,7 +2281,7 @@ void DnsSinkServer::run_loop()
                                      * name, so it must not be trusted to decide
                                      * whether to cache_store_blocked in that case
                                      * either. */
-                                    if (is_blk) cache_store_blocked(h, qtype, qn, qn_len,
+                                    if (is_blk) fwd_cache_store_blocked(&s_fwd, h, qtype, qn, qn_len,
                                                                     BLOCKED_TTL_S, now_ms, verdict_gen);
                                     is_blk = false;
                                 }
@@ -2533,7 +2291,7 @@ void DnsSinkServer::run_loop()
                                 } else if (is_blk) {
                                     s_cnt_blocked++;
                                     tlen = build_blocked_any(q, qend, qtype, tx, sizeof(tx));
-                                    cache_store_blocked(h, qtype, qn, qn_len, BLOCKED_TTL_S, now_ms, verdict_gen);
+                                    fwd_cache_store_blocked(&s_fwd, h, qtype, qn, qn_len, BLOCKED_TTL_S, now_ms, verdict_gen);
                                     query_log_record(name, qtype, tc.peer_ip, true, false);
                                     hist_record(&s_h_blocked, esp_timer_get_time() - t_recv);
                                 } else {
@@ -2674,7 +2432,7 @@ static void do_metrics_reset(void)
     s_cnt_total = s_cnt_blocked = s_cnt_forwarded = s_cnt_tcp = s_cnt_stale = 0;
     s_cnt_drop_table = s_cnt_mbox_pressure = s_cnt_upstream_to = 0;
     s_cnt_cache_probe = s_cnt_cache_hit = 0;
-    s_cnt_cache_evict = s_cnt_cache_toobig = 0;
+    s_fwd.evict = s_fwd.toobig = 0;
     s_cnt_coalesced = 0;
     s_cnt_hedges_sent = s_cnt_hedged_done = 0;   /* (#69); note the reset also empties
                                                     s_h_fwd_rtt, so the hedge delay falls
@@ -2800,7 +2558,7 @@ int dns_server_metrics_json(char *out, size_t cap)
         dns_sink_census_dropped(),
         s_cnt_case_mismatch,
         probes, hits, hitrate,
-        s_cnt_cache_evict, s_cnt_cache_toobig,
+        s_fwd.evict, s_fwd.toobig,
         s_cnt_stale,
         s_cnt_coalesced,
         s_cnt_hedges_sent, s_cnt_hedged_done,

@@ -12,3 +12,4 @@ metrics_prom_test: tests/metrics_prom_test.c main/metrics_prom.c
 dns_health_test: tests/dns_health_test.c main/dns_health.c
 pause_sched_test: tests/pause_sched_test.c main/pause_sched.c
 web_sched_form_test: tests/web_sched_form_test.c main/web_sched_form.c main/pause_sched.c main/web_parse.c
+fwd_cache_test: tests/fwd_cache_test.c main/fwd_cache.c main/domain.c main/murmur3.c
