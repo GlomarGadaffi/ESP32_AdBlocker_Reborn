@@ -36,11 +36,23 @@ jobs:
             sdkconfig_defaults: sdkconfig.defaults;sdkconfig.board.generic-s3-wifi
     container:
       image: espressif/idf:release-v6.0
-    env:
-      OTA_SIGNING_KEY_PEM: ${{ secrets.OTA_SIGNING_KEY_PEM }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      # Only commits reviewed into main may be signed with the release key. A
+      # tag on a side branch could carry an edited workflow or CMake.
+      - name: Check tag commit is on main
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git fetch --no-tags origin main
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main || {
+            echo "::error::Tag $GITHUB_REF_NAME is not on main; refusing to sign."
+            exit 1
+          }
 
       - name: Check tag matches version.txt
         run: |
@@ -51,6 +63,8 @@ jobs:
           fi
 
       - name: Install release signing key
+        env:
+          OTA_SIGNING_KEY_PEM: ${{ secrets.OTA_SIGNING_KEY_PEM }}
         run: |
           if [ -z "$OTA_SIGNING_KEY_PEM" ]; then
             echo "::error::Repository secret OTA_SIGNING_KEY_PEM is empty or missing. Add the real RSA-3072 OTA signing key (PEM) as that secret; see docs/releasing.md. Refusing to build a release with a throwaway key."
@@ -76,6 +90,12 @@ jobs:
         run: |
           test -s ${{ matrix.build_dir }}/dns-sink.bin
           test -s ${{ matrix.build_dir }}/flash_args
+          test -s ${{ matrix.build_dir }}/bootloader/bootloader.bin
+          test -s ${{ matrix.build_dir }}/partition_table/partition-table.bin
+          test -s ${{ matrix.build_dir }}/ota_data_initial.bin
+
+      - name: Check build (size headroom + sdkconfig invariants)
+        run: python3 tools/check_build.py --build-dir ${{ matrix.build_dir }} --board ${{ matrix.board }}
 
       - name: Upload build outputs
         uses: actions/upload-artifact@v4

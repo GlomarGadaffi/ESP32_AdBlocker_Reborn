@@ -24,12 +24,17 @@ pushed to `main` directly.
    section. The draft's notes are that section; the workflow fails if it is missing.
 3. Merge to `main`, then tag that commit and push the tag:
    `git tag v1.6.0 && git push origin v1.6.0`. The tag must equal
-   `v$(cat version.txt)` or the build fails.
+   `v$(cat version.txt)` or the build fails, and the tagged commit must be an
+   ancestor of `main` (a tag on a side branch is never signed).
 4. Wait for the Release workflow. Review the draft release (assets, notes,
    `SHA256SUMS`) and publish it.
 5. Merge the `release/firmware-<version>` PR so the browser flasher serves the
    new images. PRs created with the workflow token do not trigger CI; close and
    reopen the PR if you need checks to run.
+
+Anyone who can push a tag can run the workflow with the secret; keep tag
+creation restricted (Settings > Rules > tag rulesets) and consider moving the
+secret to a protected `release` environment with required reviewers.
 
 Re-running the workflow for the same tag fails at `gh release create` if the
 draft already exists; delete the draft first. The PR branch is force-updated.
@@ -42,7 +47,10 @@ It exits 1, before writing anything, if:
   (the 1.2.0 release leaked a home Wi-Fi PSK this way), or has no config files;
 - `version.txt` differs from `--version`;
 - an app image's embedded `esp_app_desc` version is not `<version>+<board>`;
-- a board's build is missing or `flash_args` names a file that does not exist.
+- a board's build is missing or `flash_args` names a file that does not exist
+  (or one outside the build dir);
+- `docs/firmware/<version>/` already exists and is not empty (published firmware
+  is never overwritten; `--replace` overrides, the workflow never passes it).
 
 Offsets, flash mode/freq/size are read from each build's `flash_args`, so the
 manifest follows the partition table. Run `python tools/stage_release.py -h`.

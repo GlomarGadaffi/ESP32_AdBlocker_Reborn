@@ -42,7 +42,11 @@ BOARDS = {
 
 # Files in <build>/config/ that can carry the Wi-Fi seed.
 CONFIG_FILES = ("sdkconfig", "sdkconfig.h", "sdkconfig.json", "sdkconfig.cmake")
-SEED_RE = re.compile(r'ADBLOCK_WIFI_(SSID|PASSWORD)\b"?\s*[=:]?\s*"([^"]+)"')
+# Key, mandatory separator (=, :, or space), then a NON-empty quoted value.
+# The separator must be mandatory: in sdkconfig.json an empty seed reads
+# "ADBLOCK_WIFI_SSID": "" and a lax pattern pairs the key's closing quote
+# with the next key's opening quote, refusing every real build.
+SEED_RE = re.compile(r'ADBLOCK_WIFI_(SSID|PASSWORD)\b"?(?:\s*[=:]\s*|\s+)"((?:[^"\\]|\\.)+)"')
 
 # esp_image_header_t (24) + first esp_image_segment_header_t (8) precede
 # esp_app_desc_t; its version[32] sits 16 bytes in (magic, secure_version,
@@ -145,8 +149,11 @@ def sha256(path):
 
 def stage(args):
     version = args.version
-    if not re.fullmatch(r"\d+\.\d+\.\d+", version):
+    if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version):
         raise Refuse("--version %r is not X.Y.Z" % version)
+
+    if args.date and not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", args.date):
+        raise Refuse("--date %r is not YYYY-MM-DD" % args.date)
 
     vfile = args.version_file or os.path.join(REPO_ROOT, "version.txt")
     with open(vfile, encoding="utf-8") as f:
@@ -176,6 +183,10 @@ def stage(args):
         plan = []
         for offset, source in parts:
             src = os.path.join(bdir, source.replace("/", os.sep))
+            root = os.path.realpath(bdir)
+            if os.path.commonpath([root, os.path.realpath(src)]) != root:
+                raise Refuse("%s: flash_args entry %r escapes the build dir"
+                             % (board, source))
             if not os.path.isfile(src):
                 raise Refuse("%s: flash_args references %s but %s is missing"
                              % (board, source, src))
@@ -193,6 +204,9 @@ def stage(args):
     fw_dir = os.path.join(out_root, "docs", "firmware")
     pages = os.path.join(fw_dir, version)
     bundle = os.path.join(out_root, "release")
+    if os.path.isdir(pages) and os.listdir(pages) and not args.replace:
+        raise Refuse("%s already exists and is not empty; published firmware "
+                     "is never overwritten (pass --replace to restage)" % pages)
     for d in (pages, bundle):
         if os.path.isdir(d):
             shutil.rmtree(d)
@@ -229,13 +243,18 @@ def stage(args):
     releases = []
     if os.path.isfile(index_path):
         with open(index_path, encoding="utf-8") as f:
-            releases = json.load(f).get("releases", [])
+            try:
+                releases = json.load(f).get("releases", [])
+            except (ValueError, AttributeError):
+                raise Refuse("%s is not valid index JSON; not overwriting" % index_path)
     old = next((r for r in releases if r.get("version") == version), None)
     date = args.date or (old or {}).get("date") or \
         datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
     entry = {"version": version, "tag": "v" + version, "date": date, "files": files}
     releases = [entry] + [r for r in releases if r.get("version") != version]
-    write_json(index_path, {"latest": version, "releases": releases})
+    tmp = index_path + ".tmp"
+    write_json(tmp, {"latest": version, "releases": releases})
+    os.replace(tmp, index_path)
 
     with open(os.path.join(bundle, "SHA256SUMS"), "w", encoding="utf-8", newline="\n") as f:
         for name in sorted(os.listdir(bundle)):
@@ -253,6 +272,8 @@ def main(argv=None):
     ap.add_argument("--builds", nargs="+", required=True, metavar="BOARD=BUILDDIR")
     ap.add_argument("--out-root", help="root holding docs/firmware and release/ (default: repo root)")
     ap.add_argument("--version-file", help="version.txt to check against (default: repo version.txt)")
+    ap.add_argument("--replace", action="store_true",
+                    help="allow restaging over an existing non-empty docs/firmware/<version>")
     ap.add_argument("--date", help="YYYY-MM-DD for a new index entry (default: today UTC)")
     args = ap.parse_args(argv)
     try:
