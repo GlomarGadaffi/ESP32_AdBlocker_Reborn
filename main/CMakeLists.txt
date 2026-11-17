@@ -5,6 +5,7 @@ idf_component_register(
         "blocklist.c"
         "bl_table.c"
         "bl_rank.c"
+        "bl_verdict.c"
         "rewrite.c"
         "localzone.c"
         "dot.c"

@@ -2,6 +2,7 @@
 #include "nvs_keys.h"     /* every NVS key this project owns, in one place (#111) */
 #include "bl_table.h"
 #include "bl_rank.h"
+#include "bl_verdict.h"
 #include "domain.h"
 #include "http_fetch.h"
 #include "esp_heap_caps.h"
@@ -231,7 +232,7 @@ static char s_custom_entries[CUSTOM_RULES_MAX][64];
 /* Per-entry rank + exactness (#117), parallel to s_custom_entries: bits
  * 0-1 are the rule's rank (rule_rank(), 0..3), bit 2 is RULE_EXACT. Kept
  * as a packed byte rather than a second struct member on s_custom_entries
- * so custom_probe_locked's scan touches only what it needs. */
+ * so custom_probe's scan touches only what it needs. */
 static uint8_t s_custom_flags[CUSTOM_RULES_MAX];
 static uint32_t s_custom_count = 0;
 /* Written only in custom_parse() under s_wl_mutex; read via atomic_load
@@ -344,7 +345,7 @@ size_t blocklist_custom_get(char *buf, size_t cap)
 
 /* blocklist_custom_is_blocked() is gone (#117): its bool-only contract is
  * exactly the defect this issue exists to close — a custom @@ rule cannot
- * be expressed through a boolean at all. custom_probe_locked() below is
+ * be expressed through a boolean at all. custom_probe() in bl_verdict.c is
  * its replacement, feeding the shared rank resolver rather than a second
  * standalone verdict. */
 
@@ -1015,7 +1016,7 @@ uint32_t blocklist_load_with_retry(const int *delay_s, size_t n, const char *wha
  * implementation next to the hand-copied ORs in dns_server.cpp/web_ui.cpp —
  * exactly the "fifth ladder" this issue exists to close. Its suffix walk
  * lives on as bl_rank_resolve()'s (bl_rank.c); blocklist_verdict{,_nb}()
- * below, defined once wl_contains_locked() is in scope, are what replace
+ * below (probes in bl_verdict.c) are what replace
  * it and blocklist_is_blocked{,_nb}() are now thin wrappers over those. */
 
 bool blocklist_is_paused(void)
@@ -1098,85 +1099,28 @@ bool blocklist_whitelist_remove(const char *domain)
     return found;
 }
 
-static bool IRAM_ATTR wl_contains_locked(const char *domain, size_t len)
-{
-    for (uint32_t i = 0; i < s_wl_count; i++) {
-        size_t wlen = strlen(s_whitelist[i]);
-        if (wlen == len && memcmp(s_whitelist[i], domain, len) == 0)
-            return true;
-    }
-    return false;
-}
-
 /* ── Rank-ordered verdict (#117) ──────────────────────────────────────
- * The shared resolver every verdict path now goes through: bl_rank.c's
- * pure suffix walk, fed the feed block table + feed exception table +
- * whitelist + custom rules as rank_source_t probes (#117 stage e-ii). */
+ * The ladder itself (the four probes and the walk) lives in bl_verdict.c,
+ * pure and host-tested. What stays here is state: the pause flag, the live
+ * snapshot pointer, s_wl_mutex and how long each path may wait for it. Both
+ * entry points below build a bl_view_t of the tables and call into the one
+ * implementation; they differ only in how they obtain it. */
 
-/* Probe: feed block table. Always rank 0: a FEED block entry has no spare
- * bit for $important (see issue #117 "PSRAM budget"). */
-static bool IRAM_ATTR feed_block_probe(void *ctx, const char *suffix, size_t len,
-                                       uint8_t depth, uint8_t *rank_out)
-{
-    (void)depth;
-    const uint8_t *img = (const uint8_t *)ctx;
-    if (!img) return false;
-    if (!bl_image_contains(img, bl_hash40(suffix, len))) return false;
-    *rank_out = 0;
-    return true;
-}
+_Static_assert(sizeof(s_whitelist[0]) == BL_ENTRY_BYTES, "whitelist entry width");
+_Static_assert(sizeof(s_custom_entries[0]) == BL_ENTRY_BYTES, "custom entry width");
 
-/* Probe: feed exception table (#117 stage e-ii). Binary-searched in PSRAM;
- * returns rank 1 (ALLOW) or rank 3 (ALLOW + $important). Exact-only entries
- * (RULE_EXACT) participate only at depth 0. */
-static bool IRAM_ATTR feed_exc_probe(void *ctx, const char *suffix, size_t len,
-                                     uint8_t depth, uint8_t *rank_out)
+/* Caller holds s_wl_mutex for as long as the view is used. */
+static bl_view_t IRAM_ATTR verdict_view_locked(const bl_snapshot_t *snap)
 {
-    const bl_snapshot_t *snap = (const bl_snapshot_t *)ctx;
-    if (!snap || snap->exc_count == 0) return false;
-    int32_t idx = bl_records_find(snap->exc_recs, snap->exc_count, bl_hash40(suffix, len));
-    if (idx < 0) return false;
-    uint8_t flags = snap->exc_flags[idx];
-    if (!rank_rule_applies(flags, depth)) return false;
-    *rank_out = rule_rank(RULE_ALLOW, flags);
-    return true;
-}
-
-/* Probe: NVS whitelist. Caller holds s_wl_mutex for the whole walk — this
- * does not take it. Always rank 1 (ALLOW), sub-inclusive. */
-static bool IRAM_ATTR wl_probe_locked(void *ctx, const char *suffix, size_t len,
-                                       uint8_t depth, uint8_t *rank_out)
-{
-    (void)ctx; (void)depth;
-    if (!s_wl_count) return false;
-    if (!wl_contains_locked(suffix, len)) return false;
-    *rank_out = 1;
-    return true;
-}
-
-/* Probe: custom rules. Caller holds s_wl_mutex for the whole walk — this
- * does not take it. s_custom_flags[i] packs rank (bits 0-1) and RULE_EXACT
- * (bit 2), set once at parse time by custom_parse(); rank_rule_applies()
- * gates an exact entry to depth 0 exactly as any other source's would. */
-static bool IRAM_ATTR custom_probe_locked(void *ctx, const char *suffix, size_t len,
-                                           uint8_t depth, uint8_t *rank_out)
-{
-    (void)ctx;
-    if (!s_custom_count) return false;
-    bool found = false;
-    uint8_t best = 0;
-    for (uint32_t i = 0; i < s_custom_count; i++) {
-        size_t elen = strlen(s_custom_entries[i]);
-        if (elen != len || memcmp(s_custom_entries[i], suffix, len) != 0) continue;
-        uint8_t flagbyte = s_custom_flags[i];
-        uint8_t exact_flag = (flagbyte & (1u << 2)) ? RULE_EXACT : 0;
-        if (!rank_rule_applies(exact_flag, depth)) continue;
-        uint8_t r = flagbyte & 0x3;
-        if (!found || r > best) { best = r; found = true; }
-    }
-    if (!found) return false;
-    *rank_out = best;
-    return true;
+    return (bl_view_t){
+        .snap            = snap,
+        .wl              = (const char (*)[BL_ENTRY_BYTES])s_whitelist,
+        .wl_count        = s_wl_count,
+        .custom          = (const char (*)[BL_ENTRY_BYTES])s_custom_entries,
+        .custom_flags    = s_custom_flags,
+        .custom_count    = s_custom_count,
+        .custom_max_rank = atomic_load_explicit(&s_custom_max_rank, memory_order_relaxed),
+    };
 }
 
 /* Socket path: bounded ~2ms take on the small tables. A busy take or NULL
@@ -1190,10 +1134,8 @@ bl_verdict_t blocklist_verdict(const char *name, size_t len)
 
     const bl_snapshot_t *snap = atomic_load_explicit(&s_live, memory_order_acquire);
     if (!snap) {
-        /* NULL during the ~2ms republish quiescence: query fails open and forwards
-         * upstream, but record unproven = 1 rather than claiming a proven NO_MATCH (#117). */
-        v.unproven = 1;
-        return v;
+        bl_view_t none = { .snap = NULL };
+        return bl_verdict_socket(&none, name, len);   /* unproven fail-open */
     }
 
     if (xSemaphoreTake(s_wl_mutex, pdMS_TO_TICKS(2)) != pdTRUE) {
@@ -1201,16 +1143,8 @@ bl_verdict_t blocklist_verdict(const char *name, size_t len)
         return v;   /* fail open: forward, don't cache — caller's job */
     }
 
-    rank_source_t srcs[4];
-    srcs[0] = (rank_source_t){ .probe = feed_block_probe, .ctx = (void *)snap->block_img, .max_rank = 0 };
-    srcs[1] = (rank_source_t){ .probe = feed_exc_probe,   .ctx = (void *)snap,
-                               .max_rank = snap->feed_max_rank };
-    srcs[2] = (rank_source_t){ .probe = wl_probe_locked,  .ctx = NULL,
-                               .max_rank = s_wl_count ? 1 : 0 };
-    srcs[3] = (rank_source_t){ .probe = custom_probe_locked, .ctx = NULL,
-                               .max_rank = atomic_load_explicit(&s_custom_max_rank, memory_order_relaxed) };
-
-    v = bl_rank_resolve(name, len, srcs, 4);
+    bl_view_t view = verdict_view_locked(snap);
+    v = bl_verdict_socket(&view, name, len);
     xSemaphoreGive(s_wl_mutex);
     return v;
 }
@@ -1230,17 +1164,10 @@ int IRAM_ATTR blocklist_verdict_nb(const char *name, size_t len, bl_verdict_t *o
 
     if (xSemaphoreTake(s_wl_mutex, 0) != pdTRUE) return BL_DEFER_LOCK_BUSY;
 
-    rank_source_t srcs[4];
-    srcs[0] = (rank_source_t){ .probe = feed_block_probe, .ctx = (void *)snap->block_img, .max_rank = 0 };
-    srcs[1] = (rank_source_t){ .probe = feed_exc_probe,   .ctx = (void *)snap,
-                               .max_rank = snap->feed_max_rank };
-    srcs[2] = (rank_source_t){ .probe = wl_probe_locked,  .ctx = NULL,
-                               .max_rank = s_wl_count ? 1 : 0 };
-    srcs[3] = (rank_source_t){ .probe = custom_probe_locked, .ctx = NULL,
-                               .max_rank = atomic_load_explicit(&s_custom_max_rank, memory_order_relaxed) };
-
-    *out = bl_rank_resolve(name, len, srcs, 4);
+    bl_view_t view = verdict_view_locked(snap);
+    int rc = bl_verdict_nb(&view, name, len, out);
     xSemaphoreGive(s_wl_mutex);
+    if (rc != 1) return rc;
 
     /* Defer condition 3 (#117 §5): a reload published underneath this
      * walk. The snapshot pointer read above could be stale by the time the

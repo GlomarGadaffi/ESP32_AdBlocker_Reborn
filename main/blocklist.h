@@ -7,6 +7,7 @@ extern "C" {
 #include <stdbool.h>
 #include <stddef.h>
 #include "bl_rank.h"
+#include "bl_verdict.h"
 #include "bl_table.h"   /* bl_verdict_t and friends, for blocklist_verdict{,_nb}() below */
 
 /* OISD big list URL (domainswild2 format) */
@@ -71,21 +72,8 @@ bool blocklist_init(void);
  */
 uint32_t blocklist_load(void);
 
-/*
- * Live blocklist snapshot descriptor (#117 stage e-ii).
- * Bundles the block image and exception table into one immutable descriptor
- * swapped by a single atomic store, guaranteeing that the block image and
- * exception table published to readers always come from the exact same reload.
- */
-typedef struct {
-    const uint8_t *block_img;      /* [ idx | 3-byte entries ] */
-    uint32_t       block_count;
-    const uint8_t *exc_recs;       /* sorted 5-byte records (BL_REC_BYTES each) */
-    const uint8_t *exc_flags;      /* parallel flag bytes (RULE_IMPORTANT, RULE_EXACT) */
-    uint32_t       exc_count;
-    uint8_t        feed_max_rank;  /* 0 if no exceptions loaded, else max rank (1 or 3) */
-} bl_snapshot_t;
-
+/* bl_snapshot_t, BL_DEFER_LOCK_BUSY and BL_DEFER_SNAPSHOT live in
+ * bl_verdict.h (pure, host-tested). */
 /*
  * The shared rank-ordered verdict (#117): feed block table, NVS whitelist,
  * and custom rules (both BLOCK and ALLOW/$important) resolved through one
@@ -98,12 +86,6 @@ typedef struct {
  */
 bl_verdict_t blocklist_verdict(const char *name, size_t len);
 
-/* blocklist_verdict_nb()'s two "must defer" outcomes, distinguished so the
- * caller can count each separately (dns_sink.cpp's l2_defer_lock_busy /
- * l2_defer_snapshot). Both negative — a caller that only needs "must I
- * defer" can just test the return value `< 0`. */
-#define BL_DEFER_LOCK_BUSY  (-1)   /* the zero-wait small-table take failed */
-#define BL_DEFER_SNAPSHOT   (-2)   /* a reload published underneath the walk */
 
 /*
  * L2 hook: never blocks. Returns 1 with *out filled (a proven verdict the
