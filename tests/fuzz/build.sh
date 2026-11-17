@@ -41,12 +41,19 @@ $CC $CFLAGS -I"$SRC/main" -DFUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION "$here/fuzz
 # shellcheck disable=SC2086
 $CC $CFLAGS -I"$SRC/main" -DFUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION "$here/fuzz_web_parse.c" "$SRC/main/web_parse.c" \
     "$@" -o "$OUT/fuzz_web_parse"
+# shellcheck disable=SC2086
+$CC $CFLAGS -I"$SRC/main" -DFUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION "$here/fuzz_metrics_prom.c" "$SRC/main/metrics_prom.c" \
+    "$@" -o "$OUT/fuzz_metrics_prom"
+# shellcheck disable=SC2086
+$CC $CFLAGS -I"$SRC/main" -DFUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION "$here/fuzz_fwd_cache_snap.c" \
+    "$SRC/main/fwd_cache.c" "$SRC/main/domain.c" "$SRC/main/murmur3.c" \
+    "$@" -o "$OUT/fuzz_fwd_cache_snap"
 
 # Seed corpora ship zipped for OSS-Fuzz-style runners; locally the plain dirs
 # under corpus/ are used directly.
 if command -v zip >/dev/null 2>&1; then
-    for t in rule_parse dns_wire web_parse; do
+    for t in rule_parse dns_wire web_parse metrics_prom fwd_cache_snap; do
         (cd "$here/corpus/$t" && zip -q -r "$OUT/fuzz_${t}_seed_corpus.zip" .) || true
     done
 fi
-echo "built: $OUT/fuzz_rule_parse $OUT/fuzz_dns_wire $OUT/fuzz_web_parse"
+echo "built: $OUT/fuzz_rule_parse $OUT/fuzz_dns_wire $OUT/fuzz_web_parse $OUT/fuzz_metrics_prom $OUT/fuzz_fwd_cache_snap"

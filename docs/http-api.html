@@ -41,6 +41,7 @@ curl -k -b cookies.txt -H "X-CSRF: $TOKEN" -X POST https://esp32adblock.local/re
 <tr><td><code>POST</code></td><td><code>/logout</code></td><td>Destroy active session and invalidate cookie.</td></tr>
 <tr><td><code>GET</code></td><td><code>/</code></td><td>Main switchboard status dashboard. Polls <code>/metrics</code> every 10s without full page reload.</td></tr>
 <tr><td><code>GET</code></td><td><code>/metrics</code></td><td>Raw JSON telemetry, counter states, and latency histograms.</td></tr>
+<tr><td><code>GET</code></td><td><code>/metrics/prom</code></td><td>The same metrics as Prometheus text exposition (<code>text/plain; version=0.0.4</code>). Same session requirement as <code>/metrics</code>.</td></tr>
 <tr><td><code>GET</code></td><td><code>/metrics/view</code></td><td>Rendered HTML dashboard covering all metrics with auto-refresh.</td></tr>
 <tr><td><code>POST</code></td><td><code>/metrics/reset</code></td><td>Reset volatile counters and histograms to zero.</td></tr>
 <tr><td><code>POST</code></td><td><code>/reload</code></td><td>Trigger immediate asynchronous blocklist re-download and index rebuild.</td></tr>
@@ -48,6 +49,8 @@ curl -k -b cookies.txt -H "X-CSRF: $TOKEN" -X POST https://esp32adblock.local/re
 <tr><td><code>POST</code></td><td><code>/pause</code></td><td>Set persistent global sinkhole pause (<code>on=1</code> allows all traffic, <code>on=0</code> resumes).</td></tr>
 <tr><td><code>POST</code></td><td><code>/pause/timed</code></td><td>Suspend blocking for <code>min</code> minutes (1–1440) for <code>scope=me</code>, <code>scope=host</code>, or <code>scope=all</code>.</td></tr>
 <tr><td><code>POST</code></td><td><code>/pause/resume</code></td><td>End an active timed pause early (<code>ip=&lt;IPv4&gt;</code>, <code>ip=all</code>, or <code>ip=every</code>).</td></tr>
+<tr><td><code>GET</code></td><td><code>/pause/schedule</code></td><td>Recurring pause schedule as JSON: <code>utc_offset_min</code>, <code>clock_synced</code>, <code>effective</code> (<code>none</code>, <code>manual</code> or <code>schedule</code>) and four <code>windows</code> entries <code>{slot, enabled, spec}</code> (<code>spec</code> is empty for an unset slot). Schedules stay inactive until the clock is NTP-synced.</td></tr>
+<tr><td><code>POST</code></td><td><code>/pause/schedule</code></td><td>Edit the schedule (persisted): <code>slot</code> (0–3) with <code>spec</code> such as <code>mon,tue 22:00-06:30</code> (empty clears the slot), or <code>utc_offset_min</code> (−720 to 840, no DST), not both. Returns the same JSON as the GET; a bad request (including a repeated field) is a 400 with a plain-text reason; a failed NVS write is a 500.</td></tr>
 <tr><td><code>POST</code></td><td><code>/check</code></td><td>Test domain against live engine: reports <code>BLOCKED</code>, <code>ALLOWED</code>, or <code>REWRITE &rarr; ip</code>.</td></tr>
 <tr><td><code>POST</code></td><td><code>/whitelist/add</code></td><td>Add a domain to the whitelist (takes effect on the next query).</td></tr>
 <tr><td><code>POST</code></td><td><code>/whitelist/remove</code></td><td>Remove a domain from the whitelist.</td></tr>
@@ -76,6 +79,9 @@ curl -k -b cookies.txt -H "X-CSRF: $TOKEN" -X POST https://esp32adblock.local/re
 <tr><td><code>queries_total</code></td><td>int</td><td>Total DNS queries received on standard socket paths.</td></tr>
 <tr><td><code>blocked</code></td><td>int</td><td>Total queries sinkholed on socket path.</td></tr>
 <tr><td><code>forwarded</code></td><td>int</td><td>Total queries forwarded to upstream resolver.</td></tr>
+<tr><td><code>up_rotations</code></td><td>int</td><td>Upstream source-port rotations completed.</td></tr>
+<tr><td><code>up_rotate_failures</code></td><td>int</td><td>Rotations abandoned (no socket or no free port).</td></tr>
+<tr><td><code>dns_health</code></td><td>object</td><td>DNS self-check: <code>probe_ok</code>, <code>probe_fail</code>, <code>probe_skipped</code> counters since boot and <code>last_action</code> (0 none, 1 warn, 2 reboot).</td></tr>
 <tr><td><code>l2_blocked</code></td><td>int</td><td>Queries blocked directly in L2 Ethernet frame hook (~1.8ms path).</td></tr>
 <tr><td><code>l2_cached</code></td><td>int</td><td>Forward-cache hits served directly in L2 Ethernet frame hook.</td></tr>
 <tr><td><code>cache_hit_rate</code></td><td>float</td><td>Cache hit percentage (<code>cache_hits / cache_probes * 100</code>).</td></tr>
@@ -86,6 +92,10 @@ curl -k -b cookies.txt -H "X-CSRF: $TOKEN" -X POST https://esp32adblock.local/re
 <tr><td><code>latency_us</code></td><td>object</td><td>Microsecond percentiles (p50, p99, max) for <code>blocked</code>, <code>cached</code>, and <code>forwarded</code>.</td></tr>
 </tbody>
 </table>
+
+<h2>Prometheus Metrics (<code>GET /metrics/prom</code>)</h2>
+<p>The <code>/metrics</code> document as Prometheus text exposition 0.0.4, converted from the same JSON. Numbers become <code>adblock_&lt;name&gt;</code> with nested keys joined by <code>_</code> (<code>latency_us.blocked.p99</code> becomes <code>adblock_latency_us_blocked_p99</code>), bools become <code>1</code>/<code>0</code>, and <code>upstream</code> and <code>clock_src</code> become labels on one <code>adblock_info</code> line. Other strings and <code>pause_list</code> are dropped.</p>
+<p><b>Auth:</b> the route is behind the same session gate as every other route. A scraper must <code>POST /login</code> once, keep the <code>sid</code> cookie (30 min idle, 12 h absolute, 4 sessions device-wide), and log in again when it receives a <code>303</code> to <code>/login</code>. The certificate is self-signed. Stock Prometheus has no login step, so the usual arrangement is a sidecar or a cron job that holds the session; see <code>docs/http-api.md</code> for a curl example.</p>
 
 <h2>Crash Flight Recorder (<code>GET /lastwords</code>)</h2>
 <p>Retrieves the RTC-persisted telemetry buffer recorded immediately before the previous system restart or crash:</p>

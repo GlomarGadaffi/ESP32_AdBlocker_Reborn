@@ -1,16 +1,19 @@
 idf_component_register(
     SRCS
         "dns_sink.cpp"
+        "net_bringup.cpp"
         "dns_server.cpp"
         "blocklist.c"
         "bl_table.c"
         "bl_rank.c"
+        "bl_verdict.c"
         "rewrite.c"
         "localzone.c"
         "dot.c"
         "acl.c"
         "bypass.c"
         "pause.c"
+        "pause_sched.c"
         "query_log.c"
         "census.c"
         "crashlog.c"
@@ -19,7 +22,12 @@ idf_component_register(
         "murmur3.c"
         "domain.c"
         "dns_wire.c"
+        "fwd_cache.c"
+        "dns_health.c"
+        "upstream_port.c"
         "web_parse.c"
+        "web_sched_form.c"
+        "metrics_prom.c"
         "console.c"
         "web_tls.c"
         "web_auth.c"
@@ -46,6 +54,7 @@ idf_component_register(
         freertos
         heap
         esp_psram
+        bootloader_support   # bootloader_random.h (dns_sink.cpp entropy source)
         sdmmc
         fatfs
         esp_driver_sdspi

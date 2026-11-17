@@ -49,6 +49,7 @@ metrics fields from `dns_server_metrics_json()` in `dns_server.cpp`.
 | POST | `/logout` | Destroy the current session and clear the cookie. |
 | GET | `/` | Status page (Dashboard + tabs). Polls `GET /metrics` every 10 s and patches the stat chips, the pause-countdown table, and the clock line in place — no full-page reload, so in-progress typing in the Check-domain / Whitelist boxes survives a tick (#105, #108, PR #134). |
 | GET | `/metrics` | JSON counters and latency histograms — see below. |
+| GET | `/metrics/prom` | The same metrics as Prometheus text exposition, for a scraper — see below. Same session requirement as `/metrics`. |
 | GET | `/metrics/view` | Rendered dashboard over `/metrics` (#126). Static page; the grouping lives in its JS and it polls `/metrics` every 10 s, pausing while the tab is hidden. Fields the grouping does not claim are still shown, under "Other (ungrouped)". |
 | GET | `/lastwords` | JSON crash flight recorder (#71) — see below. |
 | POST | `/metrics/reset` | Zero the counters and histograms. |
@@ -57,6 +58,8 @@ metrics fields from `dns_server_metrics_json()` in `dns_server.cpp`.
 | POST | `/pause` | Set global pause to `on=1` (allow every query without unloading anything) or `on=0`. An absolute set, not a toggle — a body without `on=` un-pauses. NVS-persisted, survives reboot. |
 | POST | `/pause/timed` | Suspend blocking for `min` minutes (1–1440, enforced server-side). `scope=me` (default) applies to the requesting connection's own IP, `scope=host` with `ip=<IPv4>` to another host, `scope=all` to every client. A global pause renders a confirmation page unless `confirm=1` is also sent. Never persisted: a reboot resumes blocking. |
 | POST | `/pause/resume` | End a timed pause early. `ip=<IPv4>` for one host, `ip=all` for the every-client entry, `ip=every` to clear the table. |
+| GET | `/pause/schedule` | The recurring pause schedule as JSON: `{"utc_offset_min":N,"clock_synced":bool,"effective":"none\|manual\|schedule","windows":[{"slot":0,"enabled":true,"spec":"mon,tue 22:00-06:30"}, …]}` — always four `windows` entries, `spec` is `""` for an unset slot. `effective` is why blocking is suspended for everyone right now (`manual` wins over `schedule`). `clock_synced` is false until NTP has set the clock, and schedules stay inactive until then. |
+| POST | `/pause/schedule` | Edit the schedule (NVS-persisted). Either `slot` (0–3) with `spec` (`mon,tue 22:00-06:30`, or `daily` / `weekdays` / `weekends` in place of day names; an empty `spec` clears the slot), or `utc_offset_min` (−720 to 840, fixed offset, no DST) — not both. Success answers 200 with the same JSON as the GET. Anything else (including a repeated field or an encoded NUL) is a 400 with a short `text/plain` reason; a failed NVS write is a 500. CSRF as for every POST. |
 | POST | `/check` | Test one domain against the shared verdict (#117): reports `BLOCKED`/`ALLOWED` plus which source decided it (`feed`, `whitelist`, `custom`), or `REWRITE -> ip` if a rewrite matched first (#103). |
 | POST | `/auth/set` | Change the admin account (`cur` = current password, `user`, `pass`). Drops every session. |
 | POST | `/whitelist/add` | Add a domain to the whitelist. |
@@ -116,6 +119,10 @@ A single JSON object. Field names are exactly as emitted.
 | `l2_defer_snapshot` | int | L2-hook queries that deferred because a blocklist reload published underneath the verdict walk (#117). Flat outside a reload window. |
 | `wd_restarts` | int | Times the socket-path watchdog (#77) recreated `csock`/`usock` because wire traffic was arriving with no query progress for ~2s. Not reset by `/metrics/reset` (same convention as the `l2_*` counters). |
 | `select_errors` | int | `select()` failures `dns_task` has survived (#152). Before this the first one ended the task for good — DNS dead, web UI up, no reboot. Not reset by `/metrics/reset`. |
+| `dns_health.probe_ok` | int | DNS self-check probes (the board resolving a name through its own DNS port) that were answered, since boot. |
+| `dns_health.probe_fail` | int | Self-check probes that got no valid answer, since boot. |
+| `dns_health.probe_skipped` | int | Probe cycles that stood down (blocklist reloading, OTA upload in progress, no address yet, or the client ACL excludes the board's own address). |
+| `dns_health.last_action` | int | The latest self-check decision: `0` none, `1` warn, `2` reboot. |
 | `dns_task_alive` | bool | `false` means `dns_task` has exited (#153); `dns_task_stack_hwm` reads 0 in that state and means nothing. |
 | `case_mismatch` | int | DNS 0x20 (#72): replies whose question section didn't echo the exact case we sent. Observability only — never rejected; see `process_reply()`'s H2 check for why a hard reject isn't safe without first proving this stays ~0 against the real configured upstream. |
 | `l2_log_dropped` | int | L2 query-log staging ring (#124) overflows: entries the L2 hook couldn't hand to `dns_task` before the next tick because the 32-slot ring was still full. Dropped, not blocked — the L2 hook never waits on the log. A nonzero count means a burst outran the drain rate for that window, not a bug; which specific queries were lost isn't recorded, only the count. |
@@ -129,6 +136,8 @@ A single JSON object. Field names are exactly as emitted.
 | `coalesced` | int | Duplicate in-flight queries folded into one upstream request. |
 | `hedges_sent` | int | Hedged retransmits issued. |
 | `hedged_completions` | int | Answers that came back from a hedge rather than the original. |
+| `up_rotations` | int | Upstream source-port rotations completed: a fresh UDP socket swapped in for the upstream queries while the old one drains. |
+| `up_rotate_failures` | int | Rotations abandoned because no socket or no free port could be had. Non-zero means the upstream source port is not rotating. |
 | `dropped.table_full` | int | Queries dropped because the upstream table had no free slot. |
 | `dropped.mbox_pressure` | int | Queries dropped at the UDP receive mailbox drain cap. |
 | `upstream_timeouts` | int | Upstream requests that never got an answer. |
@@ -159,15 +168,71 @@ A single JSON object. Field names are exactly as emitted.
 | `dns_task_stack_hwm` | int | `dns_task` stack headroom, **bytes** — ESP-IDF's `uxTaskGetStackHighWaterMark()` returns bytes, not the words stock FreeRTOS documents (`freertos/task.h`). It is a minimum-ever, so a freshly booted board reads high until the task has been exercised. |
 | `latency_us` | object | See below. |
 
+`dns_health` is a nested object: `"dns_health":{"probe_ok":N,"probe_fail":N,"probe_skipped":N,"last_action":N}`.
+
 `dropped` is a nested object: `"dropped":{"table_full":N,"mbox_pressure":N}`.
 
 `latency_us` is an object of seven categories — `blocked`, `cached`,
 `forwarded_total`, `forwarded_ourovh`, `forwarded_rtt`, `lookup`, `sendto` —
 each `{"p50":N,"p99":N,"max":N,"count":N}` in microseconds.
 
-The whole response is built into a fixed 2048 B buffer and clamped to it;
-worst case today is roughly 1,750 B (`pause_list` can add up to `PAUSE_MAX`
-(8) entries at ~50 B each — see the `F15` comment in `dns_server.cpp`).
+The whole response is built into a fixed 3072 B buffer and clamped to it;
+the strict worst case is roughly 2,860 B (`pause_list` can add up to
+`PAUSE_MAX` (8) entries at ~50 B each — see the `F15` comment in
+`dns_server.cpp`), and real values are far smaller.
+
+## `GET /metrics/prom`
+
+The `/metrics` document rendered as Prometheus text exposition format 0.0.4
+(`Content-Type: text/plain; version=0.0.4`). It is converted from the same
+JSON by `main/metrics_prom.c`, so every numeric field above is here with no
+separate list to maintain:
+
+- A number becomes `adblock_<name>`, with nested keys joined by `_`:
+  `queries_total` → `adblock_queries_total`, `dropped.table_full` →
+  `adblock_dropped_table_full`, `latency_us.blocked.p99` →
+  `adblock_latency_us_blocked_p99`. The number text is passed through as is.
+- A bool becomes `1` or `0` (`adblock_dns_task_alive`).
+- An array of numbers becomes `adblock_<name>{idx="N"}`. None exists today.
+- Strings are not metrics and are dropped, except four identity strings that
+  become labels on one line, `adblock_info{version="…",board="…",upstream="…",clock_src="…"} 1`.
+  Only the ones present in `/metrics` appear; today that is `upstream` and
+  `clock_src`. `pause_list` (an array of objects) is dropped.
+- No `# HELP` or `# TYPE` lines: every series is untyped. Counters that
+  `/metrics/reset` zeroes will look like a counter reset to `rate()`, which
+  handles that.
+
+If the metrics JSON was clamped to its buffer, or the text does not fit its
+6 KB buffer (a saturated worst-case document renders to about 3.4 KB), the route answers `500 metrics unavailable` rather than send a
+partial page.
+
+**What a scraper must send.** The route is behind the same `auth_wrap`
+session gate as every other route, and there is no token or basic-auth
+alternative: without a valid `sid` cookie it answers `303` to `/login`, which
+a scraper sees as a failed scrape. The session is a login cookie that expires
+after 30 minutes idle or 12 hours absolute, and the device keeps at most 4
+sessions at once, so the scraper must (1) `POST /login` with `user` and `pass`
+once, keep the `sid` cookie, (2) scrape at least every 30 minutes so it never
+idles out, and (3) log in again when it gets the `303`, no more often than
+that (every login takes a session slot a browser may need, and 5 failed logins
+lock out for 60 s). The certificate is self-signed, so the scraper must
+either trust it or skip verification. Stock Prometheus has no login step, so
+the usual arrangement is a small sidecar that holds the session and serves
+the text, or a cron job that fetches it with curl into a file for
+`node_exporter`'s textfile collector:
+
+```sh
+curl -sk -c jar -X POST -d 'user=U&pass=P' https://HOST/login -o /dev/null
+curl -sk -b jar https://HOST/metrics/prom
+```
+
+If your Prometheus supports sending a static `Cookie` header on scrapes, it
+could carry the session cookie itself. Check your version's documentation
+for the exact option name and syntax before relying on it: this has not been
+verified against a Prometheus release. The cookie value must be copied from
+the login by hand and replaced whenever it expires (30 min idle, 12 h
+absolute), so a sidecar or the textfile arrangement above is the more
+robust choice.
 
 ## `GET /lastwords`
 

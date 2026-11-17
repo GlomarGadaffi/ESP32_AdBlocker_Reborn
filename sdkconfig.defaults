@@ -119,10 +119,35 @@ CONFIG_SECURE_BOOT_SIGNING_KEY="secure_boot_signing_key.pem"
 # Ship a real release build, not the IDF default -Og debug build.
 # -O2 for speed; assertions off (defines NDEBUG) drops all the assert strings
 # (size) and their runtime checks (speed) — the main size lever here.
+# CONFIG_COMPILER_OPTIMIZATION_ASSERTIONS_SILENT is the better setting but needs a hardware soak first: an assert that fires today continues and would then reboot the resolver.
 # (IDF 6.0.1 has no clean kconfig for LTO; per-component -flto would hurt
 #  maintainability, so it's intentionally not used.)
 CONFIG_COMPILER_OPTIMIZATION_PERF=y
 CONFIG_COMPILER_OPTIMIZATION_ASSERTIONS_DISABLE=y
+
+# ── Crash evidence: ELF core dump to flash ────────────────────────────
+# Needs the "coredump" row in partitions.csv / partitions_wifi.csv. A board
+# that was OTA-updated keeps the partition table it was serially flashed with
+# (OTA never rewrites it) and so may not have that row; this still boots and
+# runs normally there. espcoredump/src/core_dump_flash.c: esp_core_dump_init()
+# -> esp_core_dump_partition_init() does esp_partition_find_first(DATA,
+# COREDUMP) (line 123), logs and RETURNS when it is NULL (lines 124-127); the
+# boot-time image check bails on the same missing partition (line 345-348);
+# and at panic time esp_core_dump_flash_hw_init() fails its config-CRC check
+# (lines 92-96), so no dump is attempted and the panic proceeds to reboot.
+# A dump that does not fit the 256K partition is dropped with an error
+# (line 217-220). Read one back with: idf.py coredump-info
+CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y
+# ELF format and SHA-256 checksum (not CRC32) are what ESP_COREDUMP_ENABLE
+# selects. Internal-DRAM cost: with PSRAM task stacks allowed
+# (FREERTOS_TASK_CREATE_ALLOW_EXT_MEM) IDF forces a dedicated dump stack,
+# ESP_COREDUMP_USE_STACK_SIZE, minimum 1792 B (ESP_COREDUMP_STACK_SIZE);
+# that is the one fixed internal-RAM cost of this option. The partition is
+# only needed at run time, not at build time.
+# The espcoredump log strings live in internal DRAM (~5 KB per the Kconfig
+# help), which this project cannot spare (CONTRIBUTING.md 3a); the dump itself
+# is unaffected.
+CONFIG_ESP_COREDUMP_LOGS=n
 # Bigger instruction cache cuts flash misses on the DNS task (runs from flash;
 # only lwIP is in IRAM).
 CONFIG_ESP32S3_INSTRUCTION_CACHE_32KB=y
@@ -160,6 +185,13 @@ CONFIG_MBEDTLS_PEM_WRITE_C=y
 # Posts a default-event-loop event on every TLS recv/send with a 2 s timeout;
 # nothing here listens, and the UI shouldn't depend on a shared queue.
 CONFIG_ESP_HTTPS_SERVER_EVENTS=n
+# Deterministic ECDSA (RFC 6979) for every signature the TLS server makes.
+# IDF's default is already y, but the "minimal" mbedTLS preset sets it n and
+# tf-psa-crypto warns its MBEDTLS_PK_ALG_ECDSA default "might change": with it
+# off, the PEM key esp-tls re-imports signs each handshake with a nonce from
+# esp_random(), which is only a TRNG while an entropy source runs (dns_sink.cpp
+# app_main). A weak nonce leaks the P-256 key. web_tls.c #errors if this is off.
+CONFIG_MBEDTLS_ECDSA_DETERMINISTIC=y
 # Login uses PSA PBKDF2-HMAC-SHA256 (web_auth.c). No Kconfig pins it: it comes
 # from TF-PSA-Crypto's default crypto_config.h (PSA_WANT_ALG_PBKDF2_HMAC). If
 # a future IDF gates it, login breaks at build time, not at runtime.

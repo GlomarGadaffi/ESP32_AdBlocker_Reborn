@@ -5,6 +5,7 @@ extern "C" {
 
 #include <stdint.h>
 #include <stdbool.h>
+#include "pause_sched.h"
 
 /* Timed, scoped "pause blocking" (#48 part 2).
  *
@@ -63,6 +64,46 @@ uint32_t pause_count(void);
  * dns_task and from the L2 RX hook. A concurrent update reads as "not
  * paused" for that one query. */
 bool     pause_active_for(uint32_t client_ip_hbo);
+
+/* ── Recurring schedule ───────────────────────────────────────────────
+ * Up to PAUSE_SCHED_MAX_WINDOWS windows of "do not block between these local
+ * times on these weekdays" (see pause_sched.h). While a window is active
+ * blocking is suspended for EVERY client, exactly as a PAUSE_IP_ALL entry
+ * would. Unlike the timed entries above, the schedule IS persisted (NVS key
+ * pause_sched) — it is a standing configuration, not an emergency override.
+ *
+ * Fails towards filtering: when the clock has not been NTP-synced the
+ * schedule is treated as inactive. A once-per-second timer recomputes the
+ * answer and folds it into the same atomic gate pause_active_for() already
+ * reads, so the per-query cost is unchanged.
+ *
+ * Local time: the firmware runs with TZ=UTC0 and has no timezone setting, so
+ * the schedule carries its own signed UTC offset in minutes (no DST rules —
+ * change it when the clocks change). */
+
+typedef enum {
+    PAUSE_REASON_NONE = 0,
+    PAUSE_REASON_MANUAL,      /* a timed pause entry, or the manual switch in blocklist.c */
+    PAUSE_REASON_SCHEDULE     /* a schedule window is active (and the clock is synced) */
+} pause_reason_t;
+
+/* Why blocking is suspended right now for "everyone". Manual wins over
+ * schedule. A per-client timed entry counts as MANUAL. */
+pause_reason_t pause_effective(void);
+
+/* Copy the whole schedule (windows + UTC offset). False before pause_init. */
+bool pause_schedule_get(pause_sched_t *out);
+
+/* Replace window `slot` (0 .. PAUSE_SCHED_MAX_WINDOWS-1) and persist. False on
+ * a bad slot or window, or when the NVS write fails (nothing changes then). */
+bool pause_schedule_set_window(int slot, const pause_sched_window_t *w);
+
+/* Empty window `slot` and persist. Same failure rules. */
+bool pause_schedule_clear_window(int slot);
+
+/* Set the UTC offset (PAUSE_SCHED_UTC_MIN_MIN .. PAUSE_SCHED_UTC_MAX_MIN) and
+ * persist. Same failure rules. */
+bool pause_schedule_set_utc_offset(int minutes);
 
 #ifdef __cplusplus
 }

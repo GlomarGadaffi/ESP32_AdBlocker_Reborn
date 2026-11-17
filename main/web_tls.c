@@ -16,6 +16,20 @@
 
 static const char *TAG = "web_tls";
 
+/* TLS handshakes must sign with DETERMINISTIC ECDSA (RFC 6979): a randomized
+ * nonce drawn from a weak RNG leaks the P-256 private key after a handful of
+ * captured signatures, and esp_random() is only a TRNG while an entropy
+ * source runs (see app_main). The key generated below is handed to
+ * esp_https_server as PEM; esp-tls re-imports it with
+ * MBEDTLS_PK_ALG_ECDSA(PSA_ALG_ANY_HASH) (tf-psa-crypto pk_ecc.c), and that
+ * macro is the deterministic variant only when PSA_WANT_ALG_DETERMINISTIC_ECDSA
+ * is defined — i.e. CONFIG_MBEDTLS_ECDSA_DETERMINISTIC=y, pinned in
+ * sdkconfig.defaults. Without it pk_wrap.c's ecdsa_sign_psa() silently falls
+ * back to randomized ECDSA for every handshake. Fail the build instead. */
+#if !defined(PSA_WANT_ALG_DETERMINISTIC_ECDSA)
+#error "web_tls.c: CONFIG_MBEDTLS_ECDSA_DETERMINISTIC must be y (RFC 6979 TLS signatures)"
+#endif
+
 /* Own namespace: the shared "dns_sink" namespace is the one blocklist.c warns
  * against erase_all()'ing; keeping TLS material apart also lets `cert-reset`
  * wipe exactly this and nothing else. */
@@ -25,8 +39,12 @@ static const char *TAG = "web_tls";
 #define KEY_FMT    NVSK_TLS_FMT_VER
 /* Bump when the certificate's contents change in a way existing devices
  * must pick up (a stored cert from an older format is regenerated at boot).
- * 2: EKU serverAuth + IP SAN + ≤2-year validity (Apple trust rules). */
-#define CERT_FMT   2
+ * 2: EKU serverAuth + IP SAN + ≤2-year validity (Apple trust rules).
+ * 3: same contents; bumped so every board mints a fresh key once with an
+ *    entropy source guaranteed on (app_main bootloader_random_enable). A key
+ *    generated on an earlier Wi-Fi-off boot came from a pseudo-random
+ *    esp_random(), and nothing on the board records which boot made it. */
+#define CERT_FMT   3
 
 /* Apple refuses to trust a TLS server cert with validity > 825 days or
  * without EKU serverAuth, even after the user installs it (HT210176), so the
@@ -126,7 +144,10 @@ static bool generate_identity(void)
     psa_set_key_type(&attr, PSA_KEY_TYPE_ECC_KEY_PAIR(PSA_ECC_FAMILY_SECP_R1));
     psa_set_key_bits(&attr, 256);
     psa_set_key_usage_flags(&attr, PSA_KEY_USAGE_SIGN_HASH | PSA_KEY_USAGE_EXPORT);
-    psa_set_key_algorithm(&attr, PSA_ALG_ECDSA(PSA_ALG_SHA_256));
+    /* Policy documents intent only: this key is exported to PEM right below
+     * and never signs through this handle. What makes the TLS server's
+     * signatures deterministic is the Kconfig pin checked at the top. */
+    psa_set_key_algorithm(&attr, PSA_ALG_DETERMINISTIC_ECDSA(PSA_ALG_SHA_256));
     if (psa_generate_key(&attr, &kid) != PSA_SUCCESS) { ESP_LOGE(TAG, "keygen failed"); goto out; }
     if (mbedtls_pk_copy_from_psa(kid, &pk) != 0) { ESP_LOGE(TAG, "pk copy failed"); goto out; }
 

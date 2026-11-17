@@ -7,6 +7,16 @@ firmware's `esp_app_desc` version string comes from `version.txt`.
 
 ### Fixed
 
+ - **The warm-boot cache survives the blocklist load (#79).** Responses
+   restored from the SD snapshot were stamped with blocklist generation 0, so
+   the boot-time blocklist load, which bumps the generation, made every one of
+   them a miss within seconds of boot. A restored response is now held
+   unverified and given a normal verdict (the name, then the stored answer's
+   CNAME chain) the first time it is asked for, and again after any generation
+   change; a name the current list blocks is dropped instead of served. Nothing
+   restored is served without that verdict. `fwd_entry_t` grows 4 bytes (8 KB
+   of PSRAM across the cache).
+
 - **`dns_task` no longer exits on a `select()` error (#152).** Any failure
   other than `EINTR` used to `break` out of the serve loop into the shutdown
   path — sockets closed, task deleted, nothing restarting it — so the board
@@ -31,6 +41,98 @@ firmware's `esp_app_desc` version string comes from `version.txt`.
   is now non-blocking and drained fully each wakeup; when all four slots are
   taken the idle connection nearest its deadline is evicted for the newcomer
   (a connection parked on an upstream flight never is). ~2.4 KB more .bss.
+- **`stop()` no longer closes the DNS task's sockets from another task.** It
+  clears the run flag and waits; the task closes its own sockets on exit.
+
+### Added
+
+- **DNS self-check.** A task sends a real query to the board's own listener
+  on 127.0.0.1 every 10 s and restarts the board after 6 consecutive failures
+  spanning at least 60 s. It never acts in the first 120 s of uptime, only
+  after at least one successful probe this boot, and stops after three
+  consecutive health reboots until ten probes succeed. A timeout while other
+  queries are still being counted, an OTA upload, a blocklist reload, a
+  missing address or an ACL that excludes loopback is skipped, so an upstream
+  outage cannot reboot the box. The probe exercises the socket path only, not
+  the Ethernet fast path. Reset reason reads `dns_health`; `/metrics` gains
+  `dns_health{probe_ok,probe_fail,probe_skipped,last_action}`.
+- **Core dumps to flash.** A 256K `coredump` partition is appended after
+  `bl_b` in both partition tables. No existing offset moves. A board updated
+  over the air keeps its old table, boots normally and writes no dump; a
+  serial reflash of the partition table is needed to get one.
+- **`GET /metrics/prom`.** The existing metrics as Prometheus text format
+  0.0.4, converted from the `/metrics` JSON by a host-tested, fuzzed
+  converter, behind the same session as `/metrics`. Stock Prometheus cannot
+  perform the form login; see `docs/http-api.md`.
+- **Recurring pause schedules.** Up to four weekday and time windows,
+  overnight windows included, during which blocking is suspended for all
+  clients. Inactive until the clock is NTP-synced; carries its own UTC offset
+  with no DST. Dashboard block, `GET`/`POST /pause/schedule`, and console
+  commands `sched`, `sched-set`, `sched-clear`, `sched-tz`.
+- **`tools/dnscheck`.** An on-wire correctness gate: a seeded query set over
+  UDP or TCP with every reply checked for txid, question echo including 0x20
+  case, size/TC/OPT rules, RCODE, compression pointers and reply source, a
+  same-name burst for single-flight, and a `/metrics` window that refuses to
+  judge a run contaminated by other traffic.
+- **Tag-triggered release workflow** and `tools/stage_release.py`. Pushing a
+  `v*` tag that sits on `main` builds and signs the three boards with the
+  `OTA_SIGNING_KEY_PEM` secret, creates a draft release and opens a pull
+  request for `docs/firmware/<version>`. See `docs/releasing.md`.
+- `SECURITY.md`, issue forms and Dependabot for GitHub Actions.
+
+### Changed
+
+- **`verdict_test` runs the shipped verdict ladder.** The ladder moved from
+  `blocklist.c` into pure `bl_verdict.c`; the test used to exercise two
+  hand-written copies of it.
+- **The forward cache lives in `fwd_cache.c`** and network bring-up in
+  `net_bringup.cpp`, both moved without behaviour change. The cache gains
+  host tests for store, stale, eviction, the seqlock read and the snapshot
+  codec.
+- **Host tests have one entry point**, `tests/run_host_tests.sh`, driven by
+  `tests/host_tests.txt`. CI adds a 60 s libFuzzer run per target, a nightly
+  20-minute fuzz workflow, and `tools/check_build.py`, which fails a board
+  build whose app exceeds 92% of `ota_0` or whose `sdkconfig.h` lacks a
+  required option or carries a Wi-Fi seed.
+- The `/metrics` response buffer grows from 2048 to 3072 bytes; the strict
+  worst case was already about 2.7 KB.
+- README: the Wi-Fi-only target does ship browser-flasher images (1.4.0 and
+  1.5.0); added a Security model section.
+
+### Security
+
+- **The upstream UDP source port is now random and rotated.** The upstream
+  socket was created once and never bound, so lwIP gave it one ephemeral port
+  for the whole uptime and only the transaction ID and the 0x20 case pattern
+  stood against a spoofed reply. Queries now leave from a random port in
+  49152-65535 that is replaced every 60 s or 2048 queries. A reply is
+  accepted only on the socket its query left on, the hedged retransmit reuses
+  that socket, and at most two upstream sockets exist at once. Metrics:
+  `up_rotations`, `up_rotate_failures`. DoT upstream is unaffected.
+- **`esp_random()` could be pseudo-random for the whole uptime.** ESP-IDF's
+  RNG is a true RNG only while an entropy source runs — the RF subsystem once
+  Wi-Fi starts, or the SAR ADC source the bootloader turns off before the app
+  runs — and nothing in the firmware ever turned one on. On an Ethernet board
+  booted with Wi-Fi disabled (Network tab or console `wifi-off`) every
+  security-relevant number came from the fallback PRNG: the TLS private key
+  if it was (re)generated on such a boot, ECDHE ephemeral keys and server
+  randoms, session and CSRF tokens, PBKDF2 salts, DNS transaction IDs and
+  0x20 bits. Default (Wi-Fi-on) boots were covered by RF from before the first
+  draw. Now `app_main` enables the SAR ADC source first thing and leaves it on;
+  a Wi-Fi-on boot hands over to RF just before `esp_wifi_init()`. Two
+  `[boot] entropy:` log lines show the state on the serial console.
+  Handshake signatures were never the leak: the TLS server already signs with
+  deterministic ECDSA (RFC 6979) by IDF Kconfig default, but nothing pinned
+  that — `CONFIG_MBEDTLS_ECDSA_DETERMINISTIC=y` is now in `sdkconfig.defaults`
+  and `web_tls.c` refuses to build without it.
+  **Every board mints a new TLS key and certificate on the first boot of this
+  release** (stored-identity format 2→3), because the firmware cannot tell
+  which boot generated the current one. Expect one browser certificate
+  warning with a new fingerprint; compare it against console `cert` before
+  accepting. Sessions are RAM-only and are cleared by the OTA reboot; the
+  admin password is unaffected. The boot log should say "stored certificate
+  is format 2, want 3 — regenerating"; if it says "loaded stored TLS
+  identity" instead, console `cert-reset` + reboot forces the same thing.
 
 ## [1.5.0] — 2026-10-13
 
