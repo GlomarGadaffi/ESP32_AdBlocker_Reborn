@@ -234,7 +234,11 @@ static void test_ms_wrap(void)
     mk_resp(r, 100, "example.com", &qn);
     const uint64_t t0 = 0xFFFFFF00ull;                    /* 256 ms before 2^32 */
     fwd_cache_store_resp(&C, H, 1, r, 100, 10, t0, 0);
-    CHECK(C.e[0].valid || 1, "stored");
+    {
+        int live = 0;
+        for (uint32_t i = 0; i < C.entries; i++) live += C.e[i].valid;
+        CHECK(live == 1, "exactly one entry stored, got %d", live);
+    }
     uint64_t past = 0x100000000ull + 5;                   /* 2^32 + 5, inside the 10 s TTL */
     CHECK(fwd_cache_lookup(&C, H, 1, r + 12, qn, past, 0) != NULL, "still fresh past 2^32");
     CHECK(fwd_cache_lookup(&C, H, 1, r + 12, qn, t0 + 10000, 0) == NULL, "expires on the 64-bit deadline");
@@ -345,8 +349,137 @@ static void test_codec(void)
     CHECK(fwd_cache_rec_decode(rec, sizeof(rec), &h, &qt, &rl) && rl == FWD_RESP_MAX, "resp_len == max accepted");
 }
 
+/* Layout / format constants. PSRAM sizing (2048 x sizeof) and the SD snapshot
+ * of firmware 1.5.0 depend on these; values are those of the pre-move
+ * dns_server.cpp (CACHE_WAYS 4, CACHE_SETS 512, FWD_RESP_MAX 512, magic
+ * 0xFDCACE01, 12-byte header, 8-byte record). */
+static void test_layout(void)
+{
+    printf("layout and format constants\n");
+    CHECK(FWD_CACHE_WAYS == 4 && FWD_CACHE_SETS == 512 && FWD_CACHE_ENTRIES == 2048, "ways/sets");
+    CHECK(FWD_RESP_MAX == 512 && FWD_TTL_MIN_S == 10u && FWD_TTL_MAX_S == 3600u, "resp max / ttl clamps");
+    CHECK(FWD_STALE_MAX_S == 86400u && FWD_STALE_TTL_S == 30u, "stale window / ttl");
+    CHECK(FWD_SNAP_MAGIC == 0xFDCACE01u && FWD_SNAP_HDR_SZ == 12 && FWD_SNAP_REC_SZ == 8, "snapshot format");
+    CHECK(offsetof(fwd_entry_t, key_hash) < offsetof(fwd_entry_t, ttl_deadline_ms) &&
+          offsetof(fwd_entry_t, ttl_deadline_ms) < offsetof(fwd_entry_t, valid) &&
+          offsetof(fwd_entry_t, valid) < offsetof(fwd_entry_t, blocked) &&
+          offsetof(fwd_entry_t, blocked) < offsetof(fwd_entry_t, qtype) &&
+          offsetof(fwd_entry_t, qtype) < offsetof(fwd_entry_t, resp_len) &&
+          offsetof(fwd_entry_t, resp_len) < offsetof(fwd_entry_t, qn_len) &&
+          offsetof(fwd_entry_t, qn_len) < offsetof(fwd_entry_t, refresh_after_ms) &&
+          offsetof(fwd_entry_t, refresh_after_ms) < offsetof(fwd_entry_t, load_gen) &&
+          offsetof(fwd_entry_t, load_gen) < offsetof(fwd_entry_t, resp), "field order");
+    CHECK(offsetof(fwd_entry_t, valid) == 12 || sizeof(void *) == 8, "ILP32: valid right after the u64 at 4");
+    /* The firmware log line says 544 B per entry (2048 x 544 B); that is the
+     * ILP32 layout (u64 aligned to 4). 64-bit hosts pad to 552. */
+    if (sizeof(void *) == 4)
+        CHECK(sizeof(fwd_entry_t) == 544, "ILP32 sizeof(fwd_entry_t)=%zu", sizeof(fwd_entry_t));
+    else
+        CHECK(sizeof(fwd_entry_t) == 552, "LP64 sizeof(fwd_entry_t)=%zu", sizeof(fwd_entry_t));
+}
+
+/* A snapshot written by the pre-move firmware (bytes below produced by hand
+ * from the old fc_put_* code: magic, count 2, entry_max 512, rsv 0; then
+ * key_hash 0x11223344 qtype 28 resp_len 5) must still decode. */
+static void test_old_snapshot_bytes(void)
+{
+    printf("pre-move snapshot bytes decode\n");
+    static const uint8_t old_hdr[12] = { 0x01, 0xCE, 0xCA, 0xFD, 2, 0, 0, 0, 0x00, 0x02, 0, 0 };
+    static const uint8_t old_rec[8] = { 0x44, 0x33, 0x22, 0x11, 28, 0, 5, 0 };
+    uint32_t count = 0, magic = 0, h = 0; uint16_t emax = 0, qt = 0, rl = 0;
+    CHECK(fwd_cache_hdr_decode(old_hdr, sizeof(old_hdr), FWD_CACHE_ENTRIES, &count, &magic, &emax) &&
+          count == 2 && emax == 512, "old header");
+    CHECK(fwd_cache_rec_decode(old_rec, sizeof(old_rec), &h, &qt, &rl) &&
+          h == 0x11223344u && qt == 28 && rl == 5, "old record");
+    uint8_t enc[8]; fwd_cache_rec_encode(enc, h, qt, rl);
+    CHECK(memcmp(enc, old_rec, 8) == 0, "encode reproduces old bytes");
+    uint8_t henc[12]; fwd_cache_hdr_encode(henc, 2);
+    CHECK(memcmp(henc, old_hdr, 12) == 0, "header encode reproduces old bytes");
+}
+
+/* Concurrent seqlock: one writer (the dns_task role) alternates two entries
+ * for the SAME key with different lengths and bytes; readers (L2 role) must
+ * only ever see exactly one of the two, or a miss. glibc >= 2.34 has pthread
+ * in libc, so this links with plain gcc; elsewhere it is skipped. */
+#if defined(__linux__) && defined(__GLIBC__) && (__GLIBC__ > 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ >= 34))
+#include <pthread.h>
+#include <sched.h>
+#include <time.h>
+#define HAVE_PTHREAD_TEST 1
+#endif
+
+#ifdef HAVE_PTHREAD_TEST
+#define LEN_A 100
+#define LEN_B 300
+static uint8_t T_A[LEN_A], T_B[LEN_B];
+static int T_qn;
+static int T_stop;   /* accessed with __atomic only */
+static unsigned long T_ok[4], T_torn[4], T_miss[4];
+
+static void *writer_main(void *arg)
+{
+    (void)arg;
+    unsigned long n = 0;
+    while (!__atomic_load_n(&T_stop, __ATOMIC_RELAXED)) {
+        if (n & 1) fwd_cache_store_resp(&C, H, 1, T_B, LEN_B, 3000, 0, 0);
+        else       fwd_cache_store_resp(&C, H, 1, T_A, LEN_A, 3000, 0, 0);
+        n++;
+        if ((n & 7) == 0) sched_yield();   /* let readers land between writes */
+    }
+    return NULL;
+}
+static void *reader_main(void *arg)
+{
+    long id = (long)arg;
+    uint8_t out[FWD_RESP_MAX];
+    while (!__atomic_load_n(&T_stop, __ATOMIC_RELAXED)) {
+        memset(out, 0, sizeof(out));
+        int n = fwd_cache_l2_get(&C, H, 1, T_A + 12, T_qn, 1, 0, out, sizeof(out));
+        if (n < 0) { T_miss[id]++; continue; }
+        if ((n == LEN_A && memcmp(out, T_A, LEN_A) == 0) ||
+            (n == LEN_B && memcmp(out, T_B, LEN_B) == 0)) T_ok[id]++;
+        else T_torn[id]++;
+    }
+    return NULL;
+}
+
+static void test_concurrent_seqlock(void)
+{
+    printf("concurrent seqlock: every successful read is exactly one of two entries\n");
+    fresh();
+    mk_resp(T_A, LEN_A, "race.example.com", &T_qn);
+    memset(T_A + 12 + T_qn + 4, 0xA1, LEN_A - (12 + T_qn + 4));
+    mk_resp(T_B, LEN_B, "race.example.com", &T_qn);
+    memset(T_B + 12 + T_qn + 4, 0xB2, LEN_B - (12 + T_qn + 4));
+    fwd_cache_store_resp(&C, H, 1, T_A, LEN_A, 3000, 0, 0);
+    __atomic_store_n(&T_stop, 0, __ATOMIC_RELAXED);
+    memset(T_ok, 0, sizeof(T_ok)); memset(T_torn, 0, sizeof(T_torn)); memset(T_miss, 0, sizeof(T_miss));
+    pthread_t w, r[4];
+    pthread_create(&w, NULL, writer_main, NULL);
+    for (long i = 0; i < 4; i++) pthread_create(&r[i], NULL, reader_main, (void *)i);
+    struct timespec ts = { 0, 200 * 1000 * 1000 };
+    nanosleep(&ts, NULL);
+    __atomic_store_n(&T_stop, 1, __ATOMIC_RELAXED);
+    for (int i = 0; i < 4; i++) pthread_join(r[i], NULL);
+    pthread_join(w, NULL);
+    unsigned long ok = 0, torn = 0, miss = 0;
+    for (int i = 0; i < 4; i++) { ok += T_ok[i]; torn += T_torn[i]; miss += T_miss[i]; }
+    printf("  reads ok=%lu miss=%lu torn=%lu seq=%u\n", ok, miss, torn, (unsigned)C.seq);
+    CHECK(torn == 0, "%lu torn reads", torn);
+    CHECK(ok > 0, "no successful read at all: the test proved nothing");
+    CHECK((C.seq & 1u) == 0, "seq even at rest");
+}
+#endif
+
 int main(void)
 {
+    test_layout();
+    test_old_snapshot_bytes();
+#ifdef HAVE_PTHREAD_TEST
+    test_concurrent_seqlock();
+#else
+    printf("concurrent seqlock: skipped (needs glibc >= 2.34)\n");
+#endif
     test_store_get_identical();
     test_qtype_separate();
     test_case_insensitive_key_hit();

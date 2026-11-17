@@ -34,7 +34,7 @@ void fwd_cache_write_end(fwd_cache_t *c)
 
 /* First entry of the set that (h, qtype) maps to; its WAYS are contiguous.
  * qtype folded in as before, so A and AAAA live in separate sets. */
-static inline fwd_entry_t *fwd_set(const fwd_cache_t *c, uint32_t h, uint16_t qtype)
+static inline IRAM_ATTR fwd_entry_t *fwd_set(const fwd_cache_t *c, uint32_t h, uint16_t qtype)
 {
     return &c->e[((h ^ ((uint32_t)qtype << 1)) & c->set_mask) * FWD_CACHE_WAYS];
 }

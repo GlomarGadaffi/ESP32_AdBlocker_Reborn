@@ -32,12 +32,13 @@ jobs:
           ./tests/fuzz/out/fuzz_rule_parse tests/fuzz/corpus/rule_parse
           ./tests/fuzz/out/fuzz_web_parse tests/fuzz/corpus/web_parse
           ./tests/fuzz/out/fuzz_metrics_prom tests/fuzz/corpus/metrics_prom
+          ./tests/fuzz/out/fuzz_fwd_cache_snap tests/fuzz/corpus/fwd_cache_snap
 
       - name: libFuzzer smoke (60 s per target)
         run: |
           mkdir -p tests/fuzz/crashes tests/fuzz/work
           CC=clang sh tests/fuzz/build.sh
-          for spec in dns_wire:1500 rule_parse:512 web_parse:512 metrics_prom:4096; do
+          for spec in dns_wire:1500 rule_parse:512 web_parse:512 metrics_prom:4096 fwd_cache_snap:4096; do
             t=${spec%%:*}; len=${spec##*:}
             # Work on a copy so new finds never touch the tracked corpus.
             cp -r tests/fuzz/corpus/$t tests/fuzz/work/$t
