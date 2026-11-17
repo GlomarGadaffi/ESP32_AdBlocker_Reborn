@@ -34,9 +34,20 @@ typedef struct {
  * struct keeps moving. */
 static RTC_NOINIT_ATTR CrashlogState s_live;
 
+/* Why the last deliberate restart happened. A separate word rather than a new
+ * field in CrashlogState: after an OTA the RTC memory still holds the OLD
+ * image's struct, and growing it would make this image read a field that the
+ * old one never wrote. A word of its own holds either this exact value or
+ * (after power-on, brownout, or an image that never wrote it) something else,
+ * and anything else reads as "no mark". Cleared as soon as it is read, so it
+ * describes one reset only. */
+#define CRASHLOG_DNS_HEALTH_MARK 0x44484C54u   /* "DHLT" */
+static RTC_NOINIT_ATTR uint32_t s_restart_mark;
+
 static CrashlogState       s_prev;
 static bool                s_prev_valid = false;
 static esp_reset_reason_t  s_prev_reason;
+static bool                s_prev_dns_health = false;
 
 static const char *reason_str(esp_reset_reason_t r)
 {
@@ -60,6 +71,12 @@ void crashlog_init(void)
 {
     s_prev_reason = esp_reset_reason();
 
+    /* The mark only means something if the reset really was a software
+     * restart; a power cycle leaves random bits in RTC_NOINIT memory. */
+    s_prev_dns_health = (s_restart_mark == CRASHLOG_DNS_HEALTH_MARK &&
+                         s_prev_reason == ESP_RST_SW);
+    s_restart_mark = 0;
+
     if (s_live.magic == CRASHLOG_MAGIC) {
         s_prev = s_live;   /* small struct copy — captures the pre-reset state */
         s_prev_valid = true;
@@ -71,7 +88,18 @@ void crashlog_init(void)
         s_live.magic = CRASHLOG_MAGIC;
     }
     ESP_LOGI(TAG, "reset reason: %s (last-words %s)",
-             reason_str(s_prev_reason), s_prev_valid ? "available" : "none");
+             s_prev_dns_health ? "dns_health" : reason_str(s_prev_reason),
+             s_prev_valid ? "available" : "none");
+}
+
+void crashlog_mark_dns_health_reboot(void)
+{
+    s_restart_mark = CRASHLOG_DNS_HEALTH_MARK;
+}
+
+bool crashlog_last_reset_was_dns_health(void)
+{
+    return s_prev_dns_health;
 }
 
 void crashlog_record(const char *domain, uint16_t qtype, bool blocked)
@@ -93,15 +121,15 @@ void crashlog_record(const char *domain, uint16_t qtype, bool blocked)
 
 int crashlog_json(char *out, size_t cap)
 {
+    const char *why = s_prev_dns_health ? "dns_health" : reason_str(s_prev_reason);
     if (!s_prev_valid) {
-        return snprintf(out, cap, "{\"available\":false,\"reset_reason\":\"%s\"}",
-                         reason_str(s_prev_reason));
+        return snprintf(out, cap, "{\"available\":false,\"reset_reason\":\"%s\"}", why);
     }
 
     int n = snprintf(out, cap,
         "{\"available\":true,\"reset_reason\":\"%s\","
         "\"queries_total\":%" PRIu32 ",\"heap_free_min\":%" PRIu32 ",\"queries\":[",
-        reason_str(s_prev_reason), s_prev.queries_total, s_prev.heap_free_min);
+        why, s_prev.queries_total, s_prev.heap_free_min);
     if (n < 0) return 0;
 
     /* Newest first, same convention as query_log_snapshot(). */

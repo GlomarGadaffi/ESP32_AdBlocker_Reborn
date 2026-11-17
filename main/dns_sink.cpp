@@ -36,6 +36,9 @@
 #include "esp_timer.h"
 #include "esp_attr.h"
 #include "lwip/inet.h"
+#include "lwip/sockets.h"
+#include "dns_health.h"
+#include <errno.h>
 
 #include "driver/gpio.h"
 #include "driver/spi_master.h"
@@ -1944,6 +1947,197 @@ static void halt_or_rollback(const char *reason)
     for (;;) vTaskDelay(portMAX_DELAY);
 }
 
+/* ── DNS self-health probe ───────────────────────────────────────────────
+ * After app_main marks the image valid nothing used to check that port 53
+ * still answers: the web UI could be up, the L2 watchdog quiet, and every
+ * client resolving nothing. This task asks the board's own resolver one real
+ * question every DNS_HEALTH_PROBE_INTERVAL_MS and hands the outcome to the
+ * pure state machine in dns_health.c, which decides when a reboot is due.
+ *
+ * Which name: no name is guaranteed to be answered without upstream (a rewrite
+ * or a blocklist entry is user data, and "localzone" names are forwarded). So
+ * the probe asks for "selfcheck.invalid", which resolvers answer NXDOMAIN
+ * themselves; dns_task caches that, and from then on the forward cache's
+ * stale-serve path replays it even with the upstream down. For the window
+ * before it is first cached, and for a cache that evicted it, an upstream
+ * outage is told apart from a dead task by dns_task's own query counter: the
+ * counter is bumped when a datagram is read off port 53, before any upstream
+ * work, so "no reply AND the counter did not move" is the only timeout that
+ * counts as a failure. Any well-formed response with our txid is a pass,
+ * including SERVFAIL and REFUSED.
+ *
+ * The probe is an ordinary client of the board's own address, so it goes
+ * through the client ACL like any other. If the ACL would drop it, the probe
+ * is SKIPPED (counted, logged once) rather than failed: with an allow-list
+ * configured the self-check is off, which is safer than a reboot loop. The
+ * query lands in the query log as a normal client query from the board.
+ *
+ * What a reboot goes through is the same esp_restart() the L2 watchdog and
+ * the select() recovery use (dns_sink_reboot); crashlog marks it first so the
+ * next boot can say why. */
+#define HEALTH_PROBE_TIMEOUT_MS 2000
+#define HEALTH_RX_ATTEMPTS      4        /* stray datagrams tolerated per probe */
+#define HEALTH_TASK_STACK       4096
+#define HEALTH_TASK_PRIO        3
+/* "\x09selfcheck\x07invalid\x00", QTYPE A, QCLASS IN. */
+static const uint8_t HEALTH_QUESTION[] = {
+    9, 's','e','l','f','c','h','e','c','k', 7, 'i','n','v','a','l','i','d', 0,
+    0x00, 0x01, 0x00, 0x01 };
+
+static std::atomic<bool>     s_health_ota_busy{false};
+static std::atomic<uint32_t> s_health_ok{0};
+static std::atomic<uint32_t> s_health_fail{0};
+static std::atomic<uint32_t> s_health_skipped{0};
+static std::atomic<uint32_t> s_health_last_action{0};   /* dns_health_action_t */
+static bool                  s_health_acl_logged = false;
+
+/* Called from web_ui.cpp around an OTA upload so the probe stands down. */
+extern "C" void dns_sink_health_ota_busy(bool busy)
+{
+    s_health_ota_busy.store(busy, std::memory_order_relaxed);
+}
+
+extern "C" uint32_t dns_sink_health_probe_ok(void)      { return s_health_ok.load(std::memory_order_relaxed); }
+extern "C" uint32_t dns_sink_health_probe_fail(void)    { return s_health_fail.load(std::memory_order_relaxed); }
+extern "C" uint32_t dns_sink_health_probe_skipped(void) { return s_health_skipped.load(std::memory_order_relaxed); }
+/* 0 none, 1 warn, 2 reboot — the dns_health_action_t value of the latest decision. */
+extern "C" uint32_t dns_sink_health_last_action(void)   { return s_health_last_action.load(std::memory_order_relaxed); }
+
+/* The address DNS clients reach us on: Ethernet if it has one, else Wi-Fi.
+ * Network byte order; 0 = none yet. */
+static uint32_t health_own_ip_nbo(void)
+{
+    uint32_t ip = s_eth_ip_nbo.load(std::memory_order_relaxed);
+#if CONFIG_ADBLOCK_NET_WIFI
+    if (ip == 0) {
+        char buf[16];
+        memcpy(buf, s_wifi_ip, sizeof(buf));
+        buf[sizeof(buf) - 1] = '\0';
+        if (buf[0] != '\0') {
+            struct in_addr a;
+            if (inet_aton(buf, &a)) ip = a.s_addr;
+        }
+    }
+#endif
+    return ip;
+}
+
+/* A response to our question: QR set, standard opcode, our txid. The RCODE is
+ * deliberately not checked. */
+static bool health_reply_ok(const uint8_t *r, int n, uint16_t txid)
+{
+    if (n < 12) return false;
+    if ((uint16_t)((r[0] << 8) | r[1]) != txid) return false;
+    if ((r[2] & 0x80) == 0) return false;
+    if ((r[2] & 0x78) != 0) return false;
+    return true;
+}
+
+static dns_health_result_t health_probe_once(void)
+{
+    if (s_health_ota_busy.load(std::memory_order_relaxed)) return DNS_HEALTH_SKIPPED;
+    if (blocklist_is_loading()) return DNS_HEALTH_SKIPPED;
+    const uint32_t ip_nbo = health_own_ip_nbo();
+    if (ip_nbo == 0) return DNS_HEALTH_SKIPPED;
+    if (!acl_permits(ntohl(ip_nbo))) {
+        if (!s_health_acl_logged) {
+            s_health_acl_logged = true;
+            ESP_LOGW(TAG, "DNS health probe off: the client ACL does not list this board's own address");
+        }
+        return DNS_HEALTH_SKIPPED;
+    }
+
+    int fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (fd < 0) {
+        ESP_LOGW(TAG, "DNS health probe: socket() failed (%d), skipping", errno);
+        return DNS_HEALTH_SKIPPED;
+    }
+    struct timeval tv;
+    tv.tv_sec  = HEALTH_PROBE_TIMEOUT_MS / 1000;
+    tv.tv_usec = (HEALTH_PROBE_TIMEOUT_MS % 1000) * 1000;
+    if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) != 0) {
+        ESP_LOGW(TAG, "DNS health probe: SO_RCVTIMEO failed (%d), skipping", errno);
+        close(fd);
+        return DNS_HEALTH_SKIPPED;
+    }
+
+    uint8_t q[12 + sizeof(HEALTH_QUESTION)];
+    const uint16_t txid = (uint16_t)(esp_random() & 0xFFFFu);
+    memset(q, 0, 12);
+    q[0] = (uint8_t)(txid >> 8);
+    q[1] = (uint8_t)(txid & 0xFF);
+    q[2] = 0x01;                       /* RD */
+    q[5] = 0x01;                       /* QDCOUNT = 1 */
+    memcpy(q + 12, HEALTH_QUESTION, sizeof(HEALTH_QUESTION));
+
+    struct sockaddr_in to;
+    memset(&to, 0, sizeof(to));
+    to.sin_family      = AF_INET;
+    to.sin_port        = htons(53);
+    to.sin_addr.s_addr = ip_nbo;
+
+    const uint64_t served_before = s_dns.queries_total();
+    const int64_t  t_start_us    = esp_timer_get_time();
+    if (sendto(fd, q, sizeof(q), 0, (struct sockaddr *)&to, sizeof(to)) != (int)sizeof(q)) {
+        ESP_LOGW(TAG, "DNS health probe: sendto failed (%d), skipping", errno);
+        close(fd);
+        return DNS_HEALTH_SKIPPED;
+    }
+
+    dns_health_result_t res = DNS_HEALTH_TIMEOUT;
+    bool got_anything = false;
+    for (int i = 0; i < HEALTH_RX_ATTEMPTS; i++) {
+        uint8_t rx[512];
+        struct sockaddr_in from;
+        socklen_t fl = sizeof(from);
+        int n = recvfrom(fd, rx, sizeof(rx), 0, (struct sockaddr *)&from, &fl);
+        if (n < 0) break;                       /* timeout or error: nothing more is coming */
+        got_anything = true;
+        if (from.sin_addr.s_addr == ip_nbo && from.sin_port == htons(53) &&
+            health_reply_ok(rx, n, txid)) {
+            res = DNS_HEALTH_OK;
+            break;
+        }
+        if ((esp_timer_get_time() - t_start_us) >= (int64_t)HEALTH_PROBE_TIMEOUT_MS * 1000) break;
+    }
+    close(fd);
+
+    if (res == DNS_HEALTH_OK) return res;
+    if (got_anything) return DNS_HEALTH_BAD_REPLY;
+
+    /* No reply. If dns_task read anything off port 53 meanwhile it is alive
+     * and the silence is upstream's, which must never cause a reboot. */
+    if (s_dns.queries_total() != served_before) return DNS_HEALTH_SKIPPED;
+    return DNS_HEALTH_TIMEOUT;
+}
+
+static void dns_health_task(void *)
+{
+    dns_health_t hs;
+    dns_health_init(&hs, nullptr);
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(DNS_HEALTH_PROBE_INTERVAL_MS));
+        const dns_health_result_t res = health_probe_once();
+        switch (res) {
+        case DNS_HEALTH_OK:      s_health_ok.fetch_add(1, std::memory_order_relaxed); break;
+        case DNS_HEALTH_SKIPPED: s_health_skipped.fetch_add(1, std::memory_order_relaxed); break;
+        default:                 s_health_fail.fetch_add(1, std::memory_order_relaxed); break;
+        }
+        const dns_health_action_t act =
+            dns_health_step(&hs, res, (uint32_t)(esp_timer_get_time() / 1000));
+        s_health_last_action.store((uint32_t)act, std::memory_order_relaxed);
+        if (act == DNS_HEALTH_ACT_WARN) {
+            ESP_LOGW(TAG, "DNS health probe failed (%s), %" PRIu32 " in a row",
+                     res == DNS_HEALTH_TIMEOUT ? "no reply" : "bad reply", hs.streak);
+        } else if (act == DNS_HEALTH_ACT_REBOOT) {
+            ESP_LOGE(TAG, "DNS has not answered for %" PRIu32 " probes in a row — restarting", hs.streak);
+            crashlog_mark_dns_health_reboot();
+            vTaskDelay(pdMS_TO_TICKS(100));   /* let the log line leave the UART */
+            dns_sink_reboot();
+        }
+    }
+}
+
 /* ── app_main ────────────────────────────────────────────────────── */
 extern "C" void app_main(void)
 {
@@ -2219,6 +2413,12 @@ extern "C" void app_main(void)
     } else {
         esp_ota_mark_app_valid_cancel_rollback();
     }
+
+    /* Self-check of port 53 from here on; created once, fixed stack. Started
+     * after the rollback decision above so it can never interfere with it. */
+    if (xTaskCreate(dns_health_task, "dns_health", HEALTH_TASK_STACK, nullptr,
+                    HEALTH_TASK_PRIO, nullptr) != pdPASS)
+        ESP_LOGE(TAG, "dns_health task failed to start — no DNS self-check this boot");
 
     /* mDNS: advertise the per-board hostname and expose the HTTP service (#20) */
     if (mdns_init() == ESP_OK) {

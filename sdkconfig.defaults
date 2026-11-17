@@ -117,12 +117,37 @@ CONFIG_SECURE_BOOT_SIGNING_KEY="secure_boot_signing_key.pem"
 
 # ── Release performance + size ───────────────────────────────────────
 # Ship a real release build, not the IDF default -Og debug build.
-# -O2 for speed; assertions off (defines NDEBUG) drops all the assert strings
-# (size) and their runtime checks (speed) — the main size lever here.
+# -O2 for speed. Assertions were DISABLE (-DNDEBUG), chosen to drop the assert
+# strings (size) and the runtime checks (speed). SILENT keeps the checks but
+# not the strings (a failed assert just abort()s; the address resolves to the
+# line with the ELF coredump below), so the size reason still holds. The
+# trade: a failed internal invariant now reboots the board instead of running
+# on in an undefined state, and the coredump records it. If a build overflows
+# IRAM/flash or a field crash loop is traced to an assert, set this back to
+# CONFIG_COMPILER_OPTIMIZATION_ASSERTIONS_DISABLE=y.
 # (IDF 6.0.1 has no clean kconfig for LTO; per-component -flto would hurt
 #  maintainability, so it's intentionally not used.)
 CONFIG_COMPILER_OPTIMIZATION_PERF=y
-CONFIG_COMPILER_OPTIMIZATION_ASSERTIONS_DISABLE=y
+CONFIG_COMPILER_OPTIMIZATION_ASSERTIONS_SILENT=y
+
+# ── Crash evidence: ELF core dump to flash ────────────────────────────
+# Needs the "coredump" row in partitions.csv / partitions_wifi.csv. A board
+# that was OTA-updated keeps the partition table it was serially flashed with
+# (OTA never rewrites it) and so may not have that row; this still boots and
+# runs normally there. espcoredump/src/core_dump_flash.c: esp_core_dump_init()
+# -> esp_core_dump_partition_init() does esp_partition_find_first(DATA,
+# COREDUMP) (line 123), logs and RETURNS when it is NULL (lines 124-127); the
+# boot-time image check bails on the same missing partition (line 345-348);
+# and at panic time esp_core_dump_flash_hw_init() fails its config-CRC check
+# (lines 92-96), so no dump is attempted and the panic proceeds to reboot.
+# A dump that does not fit the 256K partition is dropped with an error
+# (line 217-220). Read one back with: idf.py coredump-info
+CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y
+# ELF format and SHA-256 checksum are what ESP_COREDUMP_ENABLE selects.
+# The espcoredump log strings live in internal DRAM (~5 KB per the Kconfig
+# help), which this project cannot spare (CONTRIBUTING.md 3a); the dump itself
+# is unaffected.
+CONFIG_ESP_COREDUMP_LOGS=n
 # Bigger instruction cache cuts flash misses on the DNS task (runs from flash;
 # only lwIP is in IRAM).
 CONFIG_ESP32S3_INSTRUCTION_CACHE_32KB=y

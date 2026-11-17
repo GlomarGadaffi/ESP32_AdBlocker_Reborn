@@ -18,7 +18,8 @@ extern "C" {
  * cycled"). There is no panic hook: ESP-IDF's esp_panic_handler() has no
  * general user-code extension point (verified against esp-idf's own
  * panic.c — the only hook is CONFIG_ESP_COREDUMP_ENABLE's esp_core_dump_write,
- * which this project does not enable). Instead, the struct is simply always
+ * which writes an ELF dump to the coredump partition when the board's
+ * partition table has one, and is a no-op otherwise). Instead, the struct is simply always
  * current — updated on the DNS hot path during normal execution — so it
  * happens to already hold the right data whenever a reset of interest occurs.
  */
@@ -34,6 +35,15 @@ void crashlog_init(void);
 /* Record one query (called from dns_task; cheap — a few RTC-memory writes,
  * no flash I/O, no allocation). */
 void crashlog_record(const char *domain, uint16_t qtype, bool blocked);
+
+/* Call immediately before esp_restart() when the DNS health check decides to
+ * reboot (dns_sink.cpp). The next boot's crashlog_init() sees the mark, and
+ * crashlog_json() then reports reset_reason "dns_health" instead of the plain
+ * "sw" a software restart would show. One word of RTC memory, no heap. */
+void crashlog_mark_dns_health_reboot(void);
+
+/* True when the reset that started this boot was a DNS health reboot. */
+bool crashlog_last_reset_was_dns_health(void);
 
 /* Render the previous boot's last-words snapshot as JSON, matching the
  * dns_server_metrics_json()/handle_metrics style: flat snprintf, no library.

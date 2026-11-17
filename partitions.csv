@@ -15,6 +15,14 @@
 # addressed by NAME, not subtype; the tail of a 16 MB chip has ~12.4 MB free,
 # so 5.4 MB for both slots combined is not a tight fit.
 #
+# coredump: ELF crash dump (CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH), appended AFTER
+# bl_b so no existing offset moves. Space: bl_b ends at 0x8bf000, the chip ends
+# at 0x1000000, so 0x741000 (7.25 MB) was free before this row and 0x701000
+# remains. A board OTA-updated from an image without this row keeps its old
+# partition table (OTA never rewrites it) and runs normally: IDF's core dump
+# init finds no partition and returns, and no dump is attempted at panic time
+# (see sdkconfig.defaults for the source lines).
+#
 # Name,     Type, SubType,  Offset,   Size,   Flags
 nvs,        data, nvs,      0x9000,   0x6000,
 otadata,    data, ota,      0xf000,   0x2000,
@@ -23,3 +31,4 @@ ota_0,      app,  ota_0,    0x20000,  1700K,
 ota_1,      app,  ota_1,    0x1d0000, 1700K,
 bl_a,       data, 0x40,     ,         2700K,
 bl_b,       data, 0x40,     ,         2700K,
+coredump,   data, coredump, ,         256K,
