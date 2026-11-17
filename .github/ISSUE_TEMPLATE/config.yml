@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/GlomarGadaffi/ESP32_AdBlocker_Reborn/security/advisories/new
+    about: Do not file exploit details in a public issue. Use the private advisory form.

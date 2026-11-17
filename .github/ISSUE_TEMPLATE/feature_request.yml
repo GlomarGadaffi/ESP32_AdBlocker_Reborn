@@ -1,0 +1,23 @@
+name: Feature request
+description: Suggest a change or addition.
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem are you trying to solve?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed change
+  - type: dropdown
+    id: board
+    attributes:
+      label: Boards affected
+      multiple: true
+      options:
+        - LilyGO T-ETH-Elite
+        - Waveshare ESP32-S3-ETH
+        - Generic ESP32-S3 (Wi-Fi only)

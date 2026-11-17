@@ -1,0 +1,188 @@
+name: Release
+
+# Tag-triggered, reproducible release. Builds the three boards in the same
+# container as ci.yml but signs with the real OTA key (secret
+# OTA_SIGNING_KEY_PEM), stages the artifacts with tools/stage_release.py,
+# creates a DRAFT GitHub release, and opens a PR adding docs/firmware/<ver>.
+# See docs/releasing.md.
+
+on:
+  push:
+    tags: [ 'v*' ]
+
+permissions: {}
+
+jobs:
+  build:
+    name: Build (${{ matrix.board }})
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - board: t-eth-elite
+            build_dir: build
+            sdkconfig: sdkconfig
+            sdkconfig_defaults: sdkconfig.defaults
+          - board: waveshare-s3-eth
+            build_dir: build-waveshare
+            sdkconfig: sdkconfig.waveshare
+            sdkconfig_defaults: sdkconfig.defaults;sdkconfig.board.waveshare-s3-eth
+          - board: generic-s3-wifi
+            build_dir: build-wifi
+            sdkconfig: sdkconfig.wifi
+            sdkconfig_defaults: sdkconfig.defaults;sdkconfig.board.generic-s3-wifi
+    container:
+      image: espressif/idf:release-v6.0
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      # Only commits reviewed into main may be signed with the release key. A
+      # tag on a side branch could carry an edited workflow or CMake.
+      - name: Check tag commit is on main
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git fetch --no-tags origin main
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main || {
+            echo "::error::Tag $GITHUB_REF_NAME is not on main; refusing to sign."
+            exit 1
+          }
+
+      - name: Check tag matches version.txt
+        run: |
+          want="v$(head -n1 version.txt | tr -d '[:space:]')"
+          if [ "$GITHUB_REF_NAME" != "$want" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match version.txt ($want). Fix version.txt or re-tag."
+            exit 1
+          fi
+
+      - name: Install release signing key
+        env:
+          OTA_SIGNING_KEY_PEM: ${{ secrets.OTA_SIGNING_KEY_PEM }}
+        run: |
+          if [ -z "$OTA_SIGNING_KEY_PEM" ]; then
+            echo "::error::Repository secret OTA_SIGNING_KEY_PEM is empty or missing. Add the real RSA-3072 OTA signing key (PEM) as that secret; see docs/releasing.md. Refusing to build a release with a throwaway key."
+            exit 1
+          fi
+          umask 077
+          printf '%s\n' "$OTA_SIGNING_KEY_PEM" > secure_boot_signing_key.pem
+
+      - name: Build firmware (${{ matrix.board }})
+        run: |
+          . /opt/esp/entrypoint.sh
+          idf.py -B ${{ matrix.build_dir }} \
+            -DIDF_TARGET=esp32s3 \
+            -DSDKCONFIG=${{ matrix.sdkconfig }} \
+            "-DSDKCONFIG_DEFAULTS=${{ matrix.sdkconfig_defaults }}" \
+            build
+
+      - name: Delete signing key
+        if: always()
+        run: rm -f secure_boot_signing_key.pem
+
+      - name: Verify build artifacts
+        run: |
+          test -s ${{ matrix.build_dir }}/dns-sink.bin
+          test -s ${{ matrix.build_dir }}/flash_args
+          test -s ${{ matrix.build_dir }}/bootloader/bootloader.bin
+          test -s ${{ matrix.build_dir }}/partition_table/partition-table.bin
+          test -s ${{ matrix.build_dir }}/ota_data_initial.bin
+
+      - name: Check build (size headroom + sdkconfig invariants)
+        run: python3 tools/check_build.py --build-dir ${{ matrix.build_dir }} --board ${{ matrix.board }}
+
+      - name: Upload build outputs
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-build-${{ matrix.board }}
+          retention-days: 7
+          if-no-files-found: error
+          path: |
+            ${{ matrix.build_dir }}/dns-sink.bin
+            ${{ matrix.build_dir }}/ota_data_initial.bin
+            ${{ matrix.build_dir }}/bootloader/bootloader.bin
+            ${{ matrix.build_dir }}/partition_table/partition-table.bin
+            ${{ matrix.build_dir }}/flash_args
+            ${{ matrix.build_dir }}/config/sdkconfig.h
+            ${{ matrix.build_dir }}/config/sdkconfig.json
+            ${{ matrix.build_dir }}/config/sdkconfig.cmake
+
+  publish:
+    name: Stage, draft release, firmware PR
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write        # push the firmware branch, create the draft release
+      pull-requests: write   # open the firmware PR
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          # Tag checkout is detached; the PR branch is created below from main.
+          fetch-depth: 0
+
+      - name: Download build outputs
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-build-*
+          path: builds
+
+      - name: Stage release
+        run: |
+          VERSION="$(head -n1 version.txt | tr -d '[:space:]')"
+          [ "$GITHUB_REF_NAME" = "v$VERSION" ] || { echo "::error::tag/version.txt mismatch"; exit 1; }
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          cp version.txt "$RUNNER_TEMP/version.txt"
+          python3 tools/stage_release.py --version "$VERSION" \
+            --out-root "$RUNNER_TEMP/stage" --builds \
+            t-eth-elite=builds/release-build-t-eth-elite \
+            waveshare-s3-eth=builds/release-build-waveshare-s3-eth \
+            generic-s3-wifi=builds/release-build-generic-s3-wifi
+
+      - name: Extract release notes from CHANGELOG.md
+        run: |
+          awk -v v="$VERSION" '
+            /^## \[/ { if (on) exit; on = (index($0, "## [" v "]") == 1); next }
+            on { print }
+          ' CHANGELOG.md > release-notes.md
+          if [ ! -s release-notes.md ]; then
+            echo "::error::No '## [$VERSION]' section (or it is empty) in CHANGELOG.md."
+            exit 1
+          fi
+
+      - name: Create draft GitHub release
+        run: |
+          gh release create "$GITHUB_REF_NAME" "$RUNNER_TEMP"/stage/release/* \
+            --draft --verify-tag \
+            --title "$GITHUB_REF_NAME" \
+            --notes-file release-notes.md
+
+      - name: Open firmware PR
+        run: |
+          branch="release/firmware-$VERSION"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin main
+          git checkout -B "$branch" origin/main
+          # Re-stage onto main's docs/firmware so index.json merges with main's
+          # release list, not the tagged commit's. version.txt on main may
+          # differ from the tag, so check against the tag's copy.
+          python3 tools/stage_release.py --version "$VERSION" \
+            --version-file "$RUNNER_TEMP/version.txt" --builds \
+            t-eth-elite=builds/release-build-t-eth-elite \
+            waveshare-s3-eth=builds/release-build-waveshare-s3-eth \
+            generic-s3-wifi=builds/release-build-generic-s3-wifi
+          git add docs/firmware
+          git commit -m "firmware: add $VERSION to the browser flasher"
+          git push --force origin "$branch"
+          gh pr create --base main --head "$branch" \
+            --title "firmware: add $VERSION to the browser flasher" \
+            --body "Adds docs/firmware/$VERSION and updates docs/firmware/index.json for $GITHUB_REF_NAME. Staged by tools/stage_release.py from the tagged CI build. Merge after verifying the draft release."

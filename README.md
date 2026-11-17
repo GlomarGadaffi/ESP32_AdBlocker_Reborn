@@ -17,7 +17,7 @@ Running on smaller, cheaper hardware doesn't mean running slower. Unlike typical
 You don't need to compile any code or install development tools to get started.
 
 ### 1. What You Need
-* A supported board: **LilyGO T-ETH-Elite** or **Waveshare ESP32-S3-ETH**.
+* A supported board: **LilyGO T-ETH-Elite**, **Waveshare ESP32-S3-ETH**, or any ESP32-S3 board with PSRAM for the Wi-Fi-only build (see [Hardware Support](#hardware-support)).
 * A USB-C cable for power and flashing.
 * An Ethernet cable connecting the board to your home router or network switch.
 * *(Recommended)* A MicroSD card (FAT32 formatted, any size $\ge$ 1 GB) so the board reloads its blocklist in seconds rather than minutes after a power outage.
@@ -128,6 +128,9 @@ Upgrades do not require a USB cable or toolchain:
 
 > **Upgrading to 1.3.0:** the SD snapshot format changed, so the first boot on 1.3.0 rejects any pre-1.3.0 snapshot by design and re-downloads the whole blocklist (measured at 459 s on a four-feed configuration). The device fails open and forwards unfiltered for that window. Every boot after that is warm again (~21 s).
 
+### Security model
+The device is built for a trusted LAN: HTTPS-only web UI with login sessions and CSRF tokens, and, from 1.5.0, signed OTA images. There is **no Secure Boot and no flash encryption**, so anyone with USB or physical access can read NVS (Wi-Fi password, admin password hash, TLS key) and reflash the board. See [`SECURITY.md`](SECURITY.md) for the full threat model and how to report a vulnerability privately.
+
 ### Emergency USB Recovery Console
 If you forget your admin password, lose network access, or enter invalid IP settings:
 1. Connect the board to your PC via USB-C.
@@ -179,7 +182,7 @@ Two boards use the **ESP32-S3** with 16 MB flash, 8 MB Octal PSRAM, and a W5500 
 
 > **Note on the Wi-Fi-only build:** it runs the same DNS engine, blocklist, cache, whitelist, rewrites, ACL, DoT, web UI and OTA as the Ethernet boards. Two things differ. There is no **Layer 2 fast path**, because that hook is an `esp_eth` feature with no Wi-Fi equivalent, so blocked and cached answers take the normal socket path at roughly 1.8 ms instead of 0.4 ms. And with no SD card the blocklist is downloaded on every cold boot, which means the first few minutes after power-up forward unfiltered. Blocklist capacity adapts to the PSRAM actually fitted, so a 2 MB quad-PSRAM module holds proportionally fewer domains instead of failing to start.
 >
-> **This target isn't in a tagged release's browser-flasher manifest yet** — it shows up in the [Web Flasher](https://glomargadaffi.github.io/ESP32_AdBlocker_Reborn/flasher/)'s board picker, but selecting it just disables the Flash button ("the latest release has no build for" it) until a release ships its images. For now, build and flash it from source — see [Building from Source](#building-from-source) below.
+> **Flashing it:** the Wi-Fi-only target ships in the browser-flasher manifests for 1.4.0 and 1.5.0 (`docs/firmware/1.4.0/manifest.json`, `docs/firmware/1.5.0/manifest.json`, both with `generic-s3-wifi` images), so pick it in the [Web Flasher](https://glomargadaffi.github.io/ESP32_AdBlocker_Reborn/flasher/)'s board picker. It can also be built from source — see [Building from Source](#building-from-source) below.
 
 > **Note on MicroSD Cards:** A MicroSD card is optional but strongly recommended. Without a card, the device re-downloads the blocklist over HTTPS on every boot — minutes, and up to 459 s on a four-feed configuration — instead of restoring it from an SD snapshot in ~21 seconds. It forwards unfiltered until the list is live.
 

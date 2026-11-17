@@ -1,0 +1,52 @@
+name: Fuzz Nightly
+
+on:
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    name: libFuzzer (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: dns_wire
+            max_len: 1500
+          - target: rule_parse
+            max_len: 512
+          - target: web_parse
+            max_len: 512
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang zip
+
+      - name: Build fuzz targets
+        run: CC=clang sh tests/fuzz/build.sh
+
+      - name: Fuzz for 20 minutes
+        run: |
+          mkdir -p tests/fuzz/crashes tests/fuzz/work
+          cp -r tests/fuzz/corpus/${{ matrix.target }} tests/fuzz/work/${{ matrix.target }}
+          ./tests/fuzz/out/fuzz_${{ matrix.target }} tests/fuzz/work/${{ matrix.target }} \
+            -max_len=${{ matrix.max_len }} -max_total_time=1200 \
+            -artifact_prefix=tests/fuzz/crashes/
+
+      - name: Upload crashes
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashes-${{ matrix.target }}
+          retention-days: 30
+          if-no-files-found: ignore
+          path: tests/fuzz/crashes/
