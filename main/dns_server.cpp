@@ -980,7 +980,7 @@ static bool cname_chain_is_blocked(const uint8_t *pkt, int len, int qend)
  * stamp instead of asking the blocklist. So before the cache is consulted for
  * a name, any restored entry for it that is not yet adopted under `gen` gets
  * the verdict a cold query would get: the name itself, then the stored
- * answer's CNAME chain (#74). Allowed -> stamped with `gen` and the ordinary
+ * answer's CNAME chain (#74, walked strictly). Allowed -> stamped with `gen` and the ordinary
  * serve-stale path below takes it from there. Blocked -> dropped, and the
  * query falls through to the normal verdict branch. A generation bump (the
  * boot-time blocklist load, a reload, a pause flip) makes it pending again,
@@ -989,6 +989,43 @@ static bool cname_chain_is_blocked(const uint8_t *pkt, int len, int qend)
  * `gen` must be the generation read BEFORE this call (#144). An unproven
  * verdict (busy small-table take) decides nothing: the entry stays pending
  * and is simply not served this time. */
+/* cname_chain_is_blocked() fails toward availability: a busy verdict or an
+ * answer that does not parse reads as "not cloaked". That is right for a live
+ * reply somebody is waiting on and wrong for a restored one, which nobody has
+ * vouched for. Same walk, strict: 0 = every name proven not blocked, 1 = a
+ * name is blocked or the answer cannot be walked (drop it), -1 = a verdict was
+ * unproven (decide nothing). */
+static int restored_chain_verdict(const uint8_t *pkt, int len, int qend)
+{
+    if (len < 12 || qend > len) return 1;
+    int ancount = (pkt[6] << 8) | pkt[7];
+    int off = qend;
+    for (int i = 0; i < ancount; i++) {
+        char name[256]; size_t nlen = 0;
+        if (!dns_decompress_name(pkt, len, &off, name, sizeof(name), &nlen)) return 1;
+        if (off + 10 > len) return 1;
+        uint16_t rtype = ((uint16_t)pkt[off] << 8) | pkt[off + 1];
+        uint16_t rdlen = ((uint16_t)pkt[off + 8] << 8) | pkt[off + 9];
+        int rdata_off = off + 10;
+        off = rdata_off + rdlen;
+        if (off > len) return 1;
+
+        bl_verdict_t v = blocklist_verdict(name, nlen);
+        if (v.unproven) return -1;
+        if (v.state == BL_BLOCK) return 1;
+
+        if (rtype == 5 /* CNAME */) {
+            char target[256]; size_t tlen = 0;
+            int roff = rdata_off;
+            if (!dns_decompress_name(pkt, len, &roff, target, sizeof(target), &tlen)) return 1;
+            v = blocklist_verdict(target, tlen);
+            if (v.unproven) return -1;
+            if (v.state == BL_BLOCK) return 1;
+        }
+    }
+    return 0;
+}
+
 static void restored_recheck(uint32_t h, uint16_t qtype, const uint8_t *qn, int qn_len,
                              const char *name, size_t nlen, uint64_t now_ms, uint32_t gen)
 {
@@ -998,9 +1035,12 @@ static void restored_recheck(uint32_t h, uint16_t qtype, const uint8_t *qn, int 
     if (v.unproven) return;
     bool blocked = v.state == BL_BLOCK;
     /* (#117) An explicit ALLOW exempts the CNAME chain, as in process_reply. */
-    if (!blocked && v.state != BL_ALLOW)
-        blocked = cname_chain_is_blocked(e->resp, e->resp_len,
-                                         (int)sizeof(DnsHeader) + qn_len + 4);
+    if (!blocked && v.state != BL_ALLOW) {
+        int cv = restored_chain_verdict(e->resp, e->resp_len,
+                                        (int)sizeof(DnsHeader) + qn_len + 4);
+        if (cv < 0) return;
+        blocked = cv != 0;
+    }
     if (blocked) fwd_cache_restored_drop(&s_fwd, e);
     else         fwd_cache_restored_adopt(&s_fwd, e, gen);
 }

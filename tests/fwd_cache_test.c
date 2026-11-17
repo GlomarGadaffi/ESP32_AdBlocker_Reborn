@@ -310,7 +310,7 @@ static void test_snap_and_load(void)
           "restored entry is not served before a verdict");
     CHECK(fwd_cache_l2_get(&C, H, 1, r + 12, qn, 778, 7, snap, sizeof(snap)) == -1 &&
           fwd_cache_l2_get(&C, H, 1, r + 12, qn, 778, 6, snap, sizeof(snap)) == -1,
-          "restored entry never served from L2");
+          "restored entry not served from L2 (expired; L2 is fresh-only)");
     fwd_entry_t *e = fwd_cache_restored_pending(&C, H, 1, r + 12, qn, 778, 7);
     CHECK(e && e->ttl_deadline_ms == 1 && e->refresh_after_ms == 0 && e->resp_len == 100 &&
           !e->blocked && e->restored && e->load_gen != 7, "restored pending, gate open");
@@ -349,6 +349,11 @@ static void test_snap_and_load(void)
         if (fwd_cache_snap_read(&C, i, 2000, snap, &h, &qt, &rl)) found++;
     CHECK(found == 0, "dropped entry is not snapshotted");
     fwd_cache_store_blocked(&C, H, 1, r + 12, qn, 10, 1000, 0);
+    CHECK(fwd_cache_restored_pending(&C, H, 1, r + 12, qn, 1001, 1) == NULL,
+          "a blocked store clears restored");
+    /* Force the flag back on: the !blocked clause must hold on its own. */
+    for (uint32_t i = 0; i < C.entries; i++)
+        if (C.e[i].valid) C.e[i].restored = true;
     CHECK(fwd_cache_restored_pending(&C, H, 1, r + 12, qn, 1001, 1) == NULL,
           "blocked entries are never pending");
     uint8_t bad[40]; memset(bad, 0, sizeof(bad)); bad[12] = 0xC0;
