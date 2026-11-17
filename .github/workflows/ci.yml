@@ -20,34 +20,7 @@ jobs:
           sudo apt-get install -y build-essential clang zip
 
       - name: Run Host Unit Tests (ASan + UBSan)
-        run: |
-          echo "=== 1/7 bl_table_test ==="
-          gcc -O2 -fsanitize=address,undefined -I main -o bl_table_test tests/bl_table_test.c main/bl_table.c
-          ./bl_table_test
-
-          echo "=== 2/7 dns_wire_test ==="
-          gcc -O2 -fsanitize=address,undefined -I main -o dns_wire_test tests/dns_wire_test.c main/dns_wire.c main/domain.c main/murmur3.c
-          ./dns_wire_test
-
-          echo "=== 3/7 l2_finish_reply_test ==="
-          gcc -O2 -fsanitize=address,undefined -o l2_finish_reply_test tests/l2_finish_reply_test.c
-          ./l2_finish_reply_test
-
-          echo "=== 4/7 qname_case_scrub_test ==="
-          gcc -O2 -fsanitize=address,undefined -I main -o qname_case_scrub_test tests/qname_case_scrub_test.c main/domain.c
-          ./qname_case_scrub_test
-
-          echo "=== 5/7 rule_parse_test ==="
-          gcc -O2 -fsanitize=address,undefined -I main -o rule_parse_test tests/rule_parse_test.c main/domain.c
-          ./rule_parse_test
-
-          echo "=== 6/7 web_parse_test ==="
-          gcc -O2 -fsanitize=address,undefined -I main -o web_parse_test tests/web_parse_test.c main/web_parse.c
-          ./web_parse_test
-
-          echo "=== 7/7 verdict_test ==="
-          gcc -O2 -fsanitize=address,undefined -I main -o verdict_test tests/verdict_test.c main/bl_rank.c main/domain.c
-          ./verdict_test
+        run: sh tests/run_host_tests.sh
 
       - name: Build & Run Standalone Fuzz Replay (ASan + UBSan)
         run: |
@@ -55,6 +28,26 @@ jobs:
           ./tests/fuzz/out/fuzz_dns_wire tests/fuzz/corpus/dns_wire
           ./tests/fuzz/out/fuzz_rule_parse tests/fuzz/corpus/rule_parse
           ./tests/fuzz/out/fuzz_web_parse tests/fuzz/corpus/web_parse
+
+      - name: libFuzzer smoke (60 s per target)
+        run: |
+          mkdir -p tests/fuzz/crashes tests/fuzz/work
+          CC=clang sh tests/fuzz/build.sh
+          for spec in dns_wire:1500 rule_parse:512 web_parse:512; do
+            t=${spec%%:*}; len=${spec##*:}
+            # Work on a copy so new finds never touch the tracked corpus.
+            cp -r tests/fuzz/corpus/$t tests/fuzz/work/$t
+            ./tests/fuzz/out/fuzz_$t tests/fuzz/work/$t -max_len=$len -max_total_time=60               -artifact_prefix=tests/fuzz/crashes/
+          done
+
+      - name: Upload fuzz crashes
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashes
+          retention-days: 14
+          if-no-files-found: ignore
+          path: tests/fuzz/crashes/
 
   build-firmware:
     name: Build Firmware (${{ matrix.board }})
@@ -107,6 +100,9 @@ jobs:
           test -f ${{ matrix.build_dir }}/dns-sink.bin
           test -s ${{ matrix.build_dir }}/dns-sink.bin
           ls -lh ${{ matrix.build_dir }}/dns-sink.bin
+
+      - name: Check build (size headroom + sdkconfig invariants)
+        run: python3 tools/check_build.py --build-dir ${{ matrix.build_dir }} --board ${{ matrix.board }}
 
       # Signed with the throwaway key generated above, not the release key. A
       # board serial-flashed with this image only accepts OTA images signed by
