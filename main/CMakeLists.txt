@@ -46,6 +46,7 @@ idf_component_register(
         freertos
         heap
         esp_psram
+        bootloader_support   # bootloader_random.h (dns_sink.cpp entropy source)
         sdmmc
         fatfs
         esp_driver_sdspi

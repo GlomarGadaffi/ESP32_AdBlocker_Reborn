@@ -32,6 +32,7 @@
 #include "esp_ota_ops.h"
 #include "esp_mac.h"
 #include "esp_random.h"
+#include "bootloader_random.h"
 #include "esp_timer.h"
 #include "esp_attr.h"
 #include "lwip/inet.h"
@@ -904,6 +905,12 @@ static void wifi_init_sta(void)
      * ESP32 on the LAN. Matches the mDNS hostname (dns_sink_hostname()) so
      * there's one name to look for either way. */
     esp_netif_set_hostname(wifi_netif, MDNS_HOSTNAME);
+
+    /* Hand entropy over to RF (see app_main): random.rst requires the SAR ADC
+     * source off before the RF subsystem is used. Nothing draws between here
+     * and esp_wifi_start() below, after which RF is the entropy source. */
+    bootloader_random_disable();
+    ESP_LOGI(TAG, "[boot] entropy: SAR ADC source off — RF takes over at esp_wifi_start()");
 
     wifi_init_config_t init_cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&init_cfg));
@@ -1944,6 +1951,22 @@ extern "C" void app_main(void)
      * about the RTC-memory breadcrumb: snapshot whatever the last boot left
      * behind and classify why we're here. Needs no NVS, no PSRAM, no clock. */
     crashlog_init();
+
+    /* Entropy. esp_random()/esp_fill_random() are only a true RNG while an
+     * entropy source runs: the RF subsystem once esp_wifi_start() is called,
+     * or the SAR ADC source bootloader_random_enable() turns on (IDF
+     * random.rst). The 2nd-stage bootloader turns the ADC source OFF before
+     * handing over, so from here until Wi-Fi starts every draw is
+     * pseudo-random — and on an Ethernet board booted with Wi-Fi disabled
+     * (Network tab / `wifi-off`) Wi-Fi never starts, so that was the whole
+     * uptime: the TLS key (web_tls.c), ECDHE and server randoms, session and
+     * CSRF tokens (web_auth.c), PBKDF2 salts, DNS txids and 0x20 bits
+     * (dns_server.cpp). Enabled BEFORE anything can draw, and left on; the
+     * Wi-Fi-on path hands over to RF in wifi_init_sta() (the ADC source and
+     * RF conflict). Nothing here uses the ADC or the temperature sensor, so
+     * leaving it on is otherwise free; whoever adds one must disable it first. */
+    bootloader_random_enable();
+    ESP_LOGI(TAG, "[boot] entropy: SAR ADC source on — esp_random() is a TRNG until RF takes over");
 
     /* NVS */
     esp_err_t r = nvs_flash_init();
