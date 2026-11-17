@@ -43,7 +43,7 @@ $CC $CFLAGS -I"$SRC/main" -DFUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION "$here/fuzz
     "$@" -o "$OUT/fuzz_web_parse"
 # shellcheck disable=SC2086
 $CC $CFLAGS -I"$SRC/main" -DFUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION "$here/fuzz_metrics_prom.c" "$SRC/main/metrics_prom.c" \
-    "$@" -o "$OUT/fuzz_metrics_prom $OUT/fuzz_fwd_cache_snap"
+    "$@" -o "$OUT/fuzz_metrics_prom"
 # shellcheck disable=SC2086
 $CC $CFLAGS -I"$SRC/main" -DFUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION "$here/fuzz_fwd_cache_snap.c" \
     "$SRC/main/fwd_cache.c" "$SRC/main/domain.c" "$SRC/main/murmur3.c" \
