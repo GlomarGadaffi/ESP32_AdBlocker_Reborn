@@ -117,18 +117,13 @@ CONFIG_SECURE_BOOT_SIGNING_KEY="secure_boot_signing_key.pem"
 
 # ── Release performance + size ───────────────────────────────────────
 # Ship a real release build, not the IDF default -Og debug build.
-# -O2 for speed. Assertions were DISABLE (-DNDEBUG), chosen to drop the assert
-# strings (size) and the runtime checks (speed). SILENT keeps the checks but
-# not the strings (a failed assert just abort()s; the address resolves to the
-# line with the ELF coredump below), so the size reason still holds. The
-# trade: a failed internal invariant now reboots the board instead of running
-# on in an undefined state, and the coredump records it. If a build overflows
-# IRAM/flash or a field crash loop is traced to an assert, set this back to
-# CONFIG_COMPILER_OPTIMIZATION_ASSERTIONS_DISABLE=y.
+# -O2 for speed; assertions off (defines NDEBUG) drops all the assert strings
+# (size) and their runtime checks (speed) — the main size lever here.
+# CONFIG_COMPILER_OPTIMIZATION_ASSERTIONS_SILENT is the better setting but needs a hardware soak first: an assert that fires today continues and would then reboot the resolver.
 # (IDF 6.0.1 has no clean kconfig for LTO; per-component -flto would hurt
 #  maintainability, so it's intentionally not used.)
 CONFIG_COMPILER_OPTIMIZATION_PERF=y
-CONFIG_COMPILER_OPTIMIZATION_ASSERTIONS_SILENT=y
+CONFIG_COMPILER_OPTIMIZATION_ASSERTIONS_DISABLE=y
 
 # ── Crash evidence: ELF core dump to flash ────────────────────────────
 # Needs the "coredump" row in partitions.csv / partitions_wifi.csv. A board
@@ -143,7 +138,12 @@ CONFIG_COMPILER_OPTIMIZATION_ASSERTIONS_SILENT=y
 # A dump that does not fit the 256K partition is dropped with an error
 # (line 217-220). Read one back with: idf.py coredump-info
 CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y
-# ELF format and SHA-256 checksum are what ESP_COREDUMP_ENABLE selects.
+# ELF format and SHA-256 checksum (not CRC32) are what ESP_COREDUMP_ENABLE
+# selects. Internal-DRAM cost: with PSRAM task stacks allowed
+# (FREERTOS_TASK_CREATE_ALLOW_EXT_MEM) IDF forces a dedicated dump stack,
+# ESP_COREDUMP_USE_STACK_SIZE, minimum 1792 B (ESP_COREDUMP_STACK_SIZE);
+# that is the one fixed internal-RAM cost of this option. The partition is
+# only needed at run time, not at build time.
 # The espcoredump log strings live in internal DRAM (~5 KB per the Kconfig
 # help), which this project cannot spare (CONTRIBUTING.md 3a); the dump itself
 # is unaffected.

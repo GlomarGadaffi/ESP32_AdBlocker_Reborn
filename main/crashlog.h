@@ -42,6 +42,12 @@ void crashlog_record(const char *domain, uint16_t qtype, bool blocked);
  * "sw" a software restart would show. One word of RTC memory, no heap. */
 void crashlog_mark_dns_health_reboot(void);
 
+/* Consecutive dns_health reboots so far (0 if the RTC words are not valid,
+ * e.g. after power-on). mark_dns_health_reboot() increments it (saturating). */
+uint32_t crashlog_dns_health_reboots(void);
+/* Zero it: called after a healthy period. */
+void crashlog_dns_health_reboots_clear(void);
+
 /* True when the reset that started this boot was a DNS health reboot. */
 bool crashlog_last_reset_was_dns_health(void);
 

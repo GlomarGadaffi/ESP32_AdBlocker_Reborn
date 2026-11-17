@@ -1,3 +1,4 @@
+#include "dns_health.h"
 #include "crashlog.h"
 #include "esp_attr.h"
 #include "esp_system.h"
@@ -43,6 +44,13 @@ static RTC_NOINIT_ATTR CrashlogState s_live;
  * describes one reset only. */
 #define CRASHLOG_DNS_HEALTH_MARK 0x44484C54u   /* "DHLT" */
 static RTC_NOINIT_ATTR uint32_t s_restart_mark;
+
+/* Consecutive dns_health reboots (reboot-loop guard). Two words of their own:
+ * the count and count ^ magic, decoded by dns_health_reboots_decode(), so
+ * power-on garbage reads as zero. Survives reboots and OTA; cleared by the
+ * health task after a healthy period. */
+static RTC_NOINIT_ATTR uint32_t s_dh_reboots;
+static RTC_NOINIT_ATTR uint32_t s_dh_reboots_chk;
 
 static CrashlogState       s_prev;
 static bool                s_prev_valid = false;
@@ -95,6 +103,20 @@ void crashlog_init(void)
 void crashlog_mark_dns_health_reboot(void)
 {
     s_restart_mark = CRASHLOG_DNS_HEALTH_MARK;
+    uint32_t n = dns_health_reboots_next(crashlog_dns_health_reboots());
+    s_dh_reboots     = n;
+    s_dh_reboots_chk = dns_health_reboots_check(n);
+}
+
+uint32_t crashlog_dns_health_reboots(void)
+{
+    return dns_health_reboots_decode(s_dh_reboots, s_dh_reboots_chk);
+}
+
+void crashlog_dns_health_reboots_clear(void)
+{
+    s_dh_reboots     = 0;
+    s_dh_reboots_chk = dns_health_reboots_check(0);
 }
 
 bool crashlog_last_reset_was_dns_health(void)

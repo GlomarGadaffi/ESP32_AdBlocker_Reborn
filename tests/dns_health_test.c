@@ -65,8 +65,9 @@ static void test_span_not_count_gates_reboot(void)
 static void test_first_120s_never_reboots(void)
 {
     fresh();
-    /* Failures from the very first step: WARN only, however many. */
-    for (uint32_t t = 0; t < DNS_HEALTH_GRACE_MS; t += STEP) {
+    CHECK(dns_health_step(&H, DNS_HEALTH_OK, 0) == DNS_HEALTH_ACT_NONE);
+    /* Failures right after the first step: WARN only, however many. */
+    for (uint32_t t = STEP; t < DNS_HEALTH_GRACE_MS; t += STEP) {
         dns_health_action_t a = dns_health_step(&H, F, t);
         CHECK(a == DNS_HEALTH_ACT_NONE || a == DNS_HEALTH_ACT_WARN);
     }
@@ -158,14 +159,121 @@ static void test_custom_cfg_and_null_safety(void)
 {
     dns_health_cfg_t c = { .fail_threshold = 2, .min_span_ms = 5000, .grace_ms = 0 };
     dns_health_init(&H, &c);
+    CHECK(dns_health_step(&H, DNS_HEALTH_OK, 0) == DNS_HEALTH_ACT_NONE);
     CHECK(dns_health_step(&H, F, 100) == DNS_HEALTH_ACT_WARN);
     CHECK(dns_health_step(&H, F, 5100) == DNS_HEALTH_ACT_REBOOT);
     CHECK(dns_health_step(NULL, F, 0) == DNS_HEALTH_ACT_NONE);
     dns_health_init(NULL, NULL);
 }
 
+/* Drive a full failing streak after a first OK; returns the last action. */
+static dns_health_action_t fail_streak(uint32_t t0)
+{
+    dns_health_action_t a = DNS_HEALTH_ACT_NONE;
+    for (int i = 0; i <= 6; i++) a = dns_health_step(&H, F, t0 + (uint32_t)i * STEP);
+    return a;
+}
+
+static void test_never_ok_never_reboots(void)
+{
+    fresh();
+    uint32_t t = DNS_HEALTH_GRACE_MS + STEP;
+    dns_health_action_t a = DNS_HEALTH_ACT_NONE;
+    for (int i = 0; i < 50; i++, t += STEP) {
+        a = dns_health_step(&H, F, t);
+        CHECK(a != DNS_HEALTH_ACT_REBOOT);
+    }
+    CHECK(a == DNS_HEALTH_ACT_WARN);
+    CHECK(dns_health_take_note(&H) == DNS_HEALTH_NOTE_NEVER_OK);
+    CHECK(dns_health_take_note(&H) == DNS_HEALTH_NOTE_NONE);   /* once */
+    /* One OK arms it. */
+    CHECK(dns_health_step(&H, DNS_HEALTH_OK, t) == DNS_HEALTH_ACT_NONE);
+    t += STEP;
+    CHECK(fail_streak(t) == DNS_HEALTH_ACT_REBOOT);
+}
+
+static void test_three_reboots_then_suppressed(void)
+{
+    for (uint32_t prior = 0; prior < 5; prior++) {
+        fresh();
+        dns_health_set_prior_reboots(&H, prior);
+        uint32_t t0 = settle(0);
+        dns_health_action_t a = fail_streak(t0);
+        if (prior < DNS_HEALTH_MAX_CONSEC_REBOOTS) {
+            CHECK(a == DNS_HEALTH_ACT_REBOOT);
+        } else {
+            CHECK(a == DNS_HEALTH_ACT_WARN);
+            CHECK(dns_health_take_note(&H) == DNS_HEALTH_NOTE_LOOP_GUARD);
+            CHECK(dns_health_take_note(&H) == DNS_HEALTH_NOTE_NONE);
+            /* Keeps probing and counting, never reboots. */
+            for (int i = 7; i < 40; i++)
+                CHECK(dns_health_step(&H, F, t0 + (uint32_t)i * STEP) == DNS_HEALTH_ACT_WARN);
+            CHECK(H.streak >= 30);
+        }
+    }
+}
+
+static void test_ten_oks_clear_counter(void)
+{
+    fresh();
+    dns_health_set_prior_reboots(&H, 3);
+    uint32_t t = settle(0);   /* 1 OK */
+    for (int i = 0; i < 8; i++, t += STEP)   /* 9 OKs total */
+        CHECK(dns_health_step(&H, DNS_HEALTH_OK, t) == DNS_HEALTH_ACT_NONE);
+    CHECK(!dns_health_take_clear(&H));
+    CHECK(H.prior_reboots == 3);
+    CHECK(dns_health_step(&H, DNS_HEALTH_OK, t) == DNS_HEALTH_ACT_NONE);   /* 10th */
+    t += STEP;
+    CHECK(dns_health_take_clear(&H));
+    CHECK(!dns_health_take_clear(&H));
+    CHECK(H.prior_reboots == 0);
+    CHECK(fail_streak(t) == DNS_HEALTH_ACT_REBOOT);
+}
+
+static void test_ok_run_broken_by_failure_not_by_skip(void)
+{
+    fresh();
+    dns_health_set_prior_reboots(&H, 3);
+    uint32_t t = DNS_HEALTH_GRACE_MS + STEP;
+    for (int i = 0; i < 9; i++, t += STEP) dns_health_step(&H, DNS_HEALTH_OK, t);
+    dns_health_step(&H, DNS_HEALTH_SKIPPED, t); t += STEP;
+    CHECK(H.prior_reboots == 3);
+    dns_health_step(&H, F, t); t += STEP;          /* breaks the run */
+    for (int i = 0; i < 9; i++, t += STEP) dns_health_step(&H, DNS_HEALTH_OK, t);
+    CHECK(H.prior_reboots == 3 && !dns_health_take_clear(&H));
+    dns_health_step(&H, DNS_HEALTH_SKIPPED, t); t += STEP;
+    dns_health_step(&H, DNS_HEALTH_OK, t);          /* 10th since the failure */
+    CHECK(H.prior_reboots == 0 && dns_health_take_clear(&H));
+}
+
+static void test_rtc_encoding(void)
+{
+    CHECK(dns_health_reboots_decode(2, dns_health_reboots_check(2)) == 2);
+    CHECK(dns_health_reboots_decode(0, dns_health_reboots_check(0)) == 0);
+    /* Garbage (power-on RTC contents) reads as zero. */
+    CHECK(dns_health_reboots_decode(3, 0) == 0);
+    CHECK(dns_health_reboots_decode(0xDEADBEEFu, 0x12345678u) == 0);
+    CHECK(dns_health_reboots_decode(0, 0) == 0);             /* all-zero RAM */
+    CHECK(dns_health_reboots_decode(0xFFFFFFFFu, 0xFFFFFFFFu) == 0);
+    /* Saturates, no wrap. */
+    CHECK(dns_health_reboots_next(0) == 1);
+    CHECK(dns_health_reboots_next(2) == 3);
+    CHECK(dns_health_reboots_next(UINT32_MAX - 1) == UINT32_MAX);
+    CHECK(dns_health_reboots_next(UINT32_MAX) == UINT32_MAX);
+    /* A saturated count suppresses reboots. */
+    fresh();
+    dns_health_set_prior_reboots(&H, UINT32_MAX);
+    uint32_t t0 = settle(0);
+    CHECK(fail_streak(t0) == DNS_HEALTH_ACT_WARN);
+}
+
 int main(void)
 {
+    test_never_ok_never_reboots();
+    test_three_reboots_then_suppressed();
+    test_ten_oks_clear_counter();
+    test_ok_run_broken_by_failure_not_by_skip();
+    test_rtc_encoding();
     test_five_failures_then_ok_never_reboots();
     test_six_failures_over_50s_not_yet_seventh_at_60s();
     test_span_not_count_gates_reboot();

@@ -1966,18 +1966,40 @@ static void halt_or_rollback(const char *reason)
  * counts as a failure. Any well-formed response with our txid is a pass,
  * including SERVFAIL and REFUSED.
  *
- * The probe is an ordinary client of the board's own address, so it goes
- * through the client ACL like any other. If the ACL would drop it, the probe
- * is SKIPPED (counted, logged once) rather than failed: with an allow-list
- * configured the self-check is off, which is safer than a reboot loop. The
- * query lands in the query log as a normal client query from the board.
+ * The probe goes to 127.0.0.1, not the board's LAN address. dns_task's socket
+ * is bound to INADDR_ANY, and lwIP delivers loopback in-stack: sdkconfig has
+ * CONFIG_LWIP_NETIF_LOOPBACK=y (components/lwip/Kconfig:569-572, default y),
+ * which sets LWIP_HAVE_LOOPIF=1 (port/include/lwipopts.h:804-805) so a real
+ * 127.0.0.1 netif exists; ip4_output_if() hands a packet to a netif's own
+ * address to netif_loop_output() (ip4.c:1060-1070), which queues it and
+ * schedules netif_poll() on the tcpip thread via tcpip_try_callback()
+ * (netif.c:1218-1227; LWIP_NETIF_LOOPBACK_MULTITHREADING = !NO_SYS). Using
+ * 127.0.0.1 also means the destination never depends on which interface holds
+ * the LAN address (Wi-Fi/Ethernet failover, two netifs on one subnet routing
+ * the own-address packet out the wrong one) so nothing is re-read mid-probe.
+ * LIMIT: a loopback probe exercises lwIP + the UDP socket + dns_task only. It
+ * never touches the Ethernet driver or the L2 fast path (l2_input_cb), so a
+ * dead W5500 RX path or a broken L2 hook is NOT detected here; the L2
+ * watchdog covers the driver side.
+ *
+ * The probe is an ordinary client (source 127.0.0.1), so it goes through the
+ * client ACL like any other. If the ACL would drop it, the probe is SKIPPED
+ * (logged once) rather than failed: with an allow-list that omits loopback
+ * the self-check is off, which is safer than a reboot loop. Pause and bypass
+ * are per client IP and never match 127.0.0.1. Every probe is one more count
+ * in queries_total and one query-log line from 127.0.0.1 (query_log.c would
+ * have to drop that source to hide it; it is outside this file).
+ *
+ * Reboot gating beyond dns_health.c's streak: never before one OK this boot,
+ * and at most DNS_HEALTH_MAX_CONSEC_REBOOTS in a row (RTC counter in
+ * crashlog, cleared after 10 consecutive OKs).
  *
  * What a reboot goes through is the same esp_restart() the L2 watchdog and
  * the select() recovery use (dns_sink_reboot); crashlog marks it first so the
  * next boot can say why. */
 #define HEALTH_PROBE_TIMEOUT_MS 2000
 #define HEALTH_RX_ATTEMPTS      4        /* stray datagrams tolerated per probe */
-#define HEALTH_TASK_STACK       4096
+#define HEALTH_TASK_STACK       4096     /* rx is 64 B on the stack; socket/sendto/recvfrom/ESP_LOG fit well inside */
 #define HEALTH_TASK_PRIO        3
 /* "\x09selfcheck\x07invalid\x00", QTYPE A, QCLASS IN. */
 static const uint8_t HEALTH_QUESTION[] = {
@@ -2039,10 +2061,10 @@ static dns_health_result_t health_probe_once(void)
     if (blocklist_is_loading()) return DNS_HEALTH_SKIPPED;
     const uint32_t ip_nbo = health_own_ip_nbo();
     if (ip_nbo == 0) return DNS_HEALTH_SKIPPED;
-    if (!acl_permits(ntohl(ip_nbo))) {
+    if (!acl_permits(INADDR_LOOPBACK)) {
         if (!s_health_acl_logged) {
             s_health_acl_logged = true;
-            ESP_LOGW(TAG, "DNS health probe off: the client ACL does not list this board's own address");
+            ESP_LOGW(TAG, "DNS health probe off: the client ACL does not list 127.0.0.1");
         }
         return DNS_HEALTH_SKIPPED;
     }
@@ -2074,7 +2096,7 @@ static dns_health_result_t health_probe_once(void)
     memset(&to, 0, sizeof(to));
     to.sin_family      = AF_INET;
     to.sin_port        = htons(53);
-    to.sin_addr.s_addr = ip_nbo;
+    to.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
 
     const uint64_t served_before = s_dns.queries_total();
     const int64_t  t_start_us    = esp_timer_get_time();
@@ -2087,13 +2109,13 @@ static dns_health_result_t health_probe_once(void)
     dns_health_result_t res = DNS_HEALTH_TIMEOUT;
     bool got_anything = false;
     for (int i = 0; i < HEALTH_RX_ATTEMPTS; i++) {
-        uint8_t rx[512];
+        uint8_t rx[64];   /* only the header is read; a longer datagram is truncated */
         struct sockaddr_in from;
         socklen_t fl = sizeof(from);
         int n = recvfrom(fd, rx, sizeof(rx), 0, (struct sockaddr *)&from, &fl);
         if (n < 0) break;                       /* timeout or error: nothing more is coming */
         got_anything = true;
-        if (from.sin_addr.s_addr == ip_nbo && from.sin_port == htons(53) &&
+        if (from.sin_addr.s_addr == htonl(INADDR_LOOPBACK) && from.sin_port == htons(53) &&
             health_reply_ok(rx, n, txid)) {
             res = DNS_HEALTH_OK;
             break;
@@ -2115,6 +2137,7 @@ static void dns_health_task(void *)
 {
     dns_health_t hs;
     dns_health_init(&hs, nullptr);
+    dns_health_set_prior_reboots(&hs, crashlog_dns_health_reboots());
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(DNS_HEALTH_PROBE_INTERVAL_MS));
         const dns_health_result_t res = health_probe_once();
@@ -2126,6 +2149,13 @@ static void dns_health_task(void *)
         const dns_health_action_t act =
             dns_health_step(&hs, res, (uint32_t)(esp_timer_get_time() / 1000));
         s_health_last_action.store((uint32_t)act, std::memory_order_relaxed);
+        if (dns_health_take_clear(&hs)) crashlog_dns_health_reboots_clear();
+        const dns_health_note_t note = dns_health_take_note(&hs);
+        if (note == DNS_HEALTH_NOTE_NEVER_OK)
+            ESP_LOGW(TAG, "DNS health probe has never succeeded this boot: reboots disabled (probe unable to reach port 53?)");
+        else if (note == DNS_HEALTH_NOTE_LOOP_GUARD)
+            ESP_LOGW(TAG, "DNS health: %u consecutive health reboots without a healthy period: reboots disabled this boot",
+                     (unsigned)DNS_HEALTH_MAX_CONSEC_REBOOTS);
         if (act == DNS_HEALTH_ACT_WARN) {
             ESP_LOGW(TAG, "DNS health probe failed (%s), %" PRIu32 " in a row",
                      res == DNS_HEALTH_TIMEOUT ? "no reply" : "bad reply", hs.streak);
