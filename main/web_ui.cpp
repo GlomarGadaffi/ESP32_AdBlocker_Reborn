@@ -8,6 +8,7 @@
 #include "acl.h"
 #include "bypass.h"
 #include "pause.h"
+#include "web_sched_form.h"
 #include "dot.h"
 #include "localzone.h"
 #include "query_log.h"
@@ -1054,12 +1055,12 @@ static const char STATUS_HEAD_2[] =
         "var degraded=(m.blocklist_dropped>0)||(m.blocklist_feed_failures>0)||(m.exceptions_dropped>0);"
         "var cls=m.blocklist_loading?'warn':(m.blocklist_paused?'ok':(degraded?'warn':'ok'));"
         "var txt=m.blocklist_loading?'Reloading':(m.blocklist_paused?'Paused':(degraded?'Degraded':'Active'));"
-        "var st=document.getElementById('st-status');"
-        "st.className='st '+cls;st.textContent=txt;"
+        "PS_CLS=cls;PS_TXT=txt;psChip();"
         "var sl=document.getElementById('stop-load-form');"
         "if(sl)sl.hidden=!m.blocklist_loading;"
         "renderPause(m.pause_list||[]);"
         "renderClock(m.clock,m.clock_src,m.clock_epoch);"
+        "psLoad();"
         "DASH_FAILS=0;"
         "}else{DASH_FAILS++;}"
         "markStale();DASH_BUSY=false;schedRefresh();"
@@ -1110,6 +1111,7 @@ static const char STATUS_HEAD_2[] =
          * reflects the floor date while unsynced, matching what this line
          * has always shown, not a new value. */
         "function renderClock(clock,src,epoch){"
+        "PS_EPOCH=epoch;psClock();"
         "var c=document.getElementById('clock-status');if(!c)return;"
         "var d=new Date(epoch*1000);"
         "if(clock=='synced'){"
@@ -1121,6 +1123,76 @@ static const char STATUS_HEAD_2[] =
         "'\\u2014 good enough for TLS certificate dates, not for timestamps, '+"
         "'so the log shows uptime until synced.';"
         "}"
+        "}"
+        /* Recurring pause schedule (GET/POST /pause/schedule). State lives in
+         * PS_* globals so the status chip, the clock line and the rows each
+         * have exactly one writer. Everything server-provided goes in through
+         * textContent / .value, never innerHTML. The chip is the one place the
+         * schedule and /metrics meet: /metrics only knows the manual switch,
+         * so "Paused (schedule)" is layered over an Active/Degraded base. */
+        "var PS_OFF=0,PS_SYNCED=false,PS_EFF='none',PS_EPOCH=0,PS_CLS='',PS_TXT='';"
+        "function psChip(){"
+        "var st=document.getElementById('st-status');if(!st||!PS_TXT)return;"
+        "var sched=PS_EFF=='schedule'&&(PS_TXT=='Active'||PS_TXT=='Degraded');"
+        "st.className='st '+(sched?'ok':PS_CLS);"
+        "st.textContent=sched?'Paused (schedule)':PS_TXT;"
+        "}"
+        "function psMsg(t,bad){"
+        "var m=document.getElementById('sched-msg');if(!m)return;"
+        "m.textContent=t||'';m.className=bad?'warn':'';"
+        "}"
+        "function psClock(){"
+        "var e=document.getElementById('sched-clock');if(!e)return;"
+        "if(!PS_SYNCED||!PS_EPOCH){"
+        "e.textContent='Board local time: unknown \\u2014 the clock is not NTP-synced, so schedules stay inactive (blocking continues).';"
+        "return;}"
+        "var d=new Date((PS_EPOCH+PS_OFF*60)*1000);"
+        "e.textContent='Board local time: '+d.toISOString().slice(0,16).replace('T',' ')+"
+        "' (UTC'+(PS_OFF<0?'-':'+')+Math.abs(PS_OFF)+' min), NTP synced.';"
+        "}"
+        "function psBuild(){"
+        "var c=document.getElementById('sched-rows');if(!c||c.firstChild)return;"
+        "for(var i=0;i<4;i++){(function(i){"
+        "var d=document.createElement('div');"
+        "var t=document.createElement('input');t.type='text';t.id='sched-spec-'+i;"
+        "t.size=30;t.maxLength=64;t.placeholder='mon,tue 22:00-06:30';"
+        "var s=document.createElement('button');s.type='button';s.textContent='Save';"
+        "s.onclick=function(){psPost('slot='+i+'&spec='+encodeURIComponent(t.value));};"
+        "var x=document.createElement('button');x.type='button';x.textContent='Clear';"
+        "x.onclick=function(){psPost('slot='+i+'&spec=');};"
+        "d.appendChild(t);d.appendChild(document.createTextNode(' '));"
+        "d.appendChild(s);d.appendChild(document.createTextNode(' '));d.appendChild(x);"
+        "c.appendChild(d);})(i);}"
+        "var ob=document.getElementById('sched-off-save');"
+        "if(ob)ob.onclick=function(){var o=document.getElementById('sched-off');"
+        "psPost('utc_offset_min='+encodeURIComponent(o?o.value:''));};"
+        "}"
+        "function psRender(j,force){"
+        "PS_OFF=j.utc_offset_min;PS_SYNCED=!!j.clock_synced;PS_EFF=j.effective;"
+        "psBuild();"
+        "var o=document.getElementById('sched-off');"
+        "if(o&&(force||document.activeElement!==o))o.value=j.utc_offset_min;"
+        "var w=j.windows||[];"
+        "for(var i=0;i<w.length;i++){"
+        "var t=document.getElementById('sched-spec-'+w[i].slot);"
+        "if(t&&(force||document.activeElement!==t))t.value=w[i].spec;}"
+        "psChip();psClock();"
+        "}"
+        "function psLoad(){"
+        "if(!document.getElementById('sched-rows'))return;"
+        "fetch('/pause/schedule',{cache:'no-store'}).then(function(r){"
+        "if(r.redirected){location.reload();return null;}return r.json();"
+        "}).then(function(j){if(j)psRender(j,false);}).catch(function(){});"
+        "}"
+        "function psPost(body){"
+        "psMsg('Saving\\u2026',false);"
+        "fetch('/pause/schedule',{method:'POST',"
+        "headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body}).then(function(r){"
+        "if(r.redirected){location.reload();return null;}"
+        "if(!r.ok)return r.text().then(function(t){psMsg(t||'Rejected',true);return null;});"
+        "return r.json();"
+        "}).then(function(j){if(j){psMsg('Saved.',false);psRender(j,true);}})"
+        ".catch(function(){psMsg('Request failed',true);});"
         "}"
         "document.addEventListener('visibilitychange',function(){"
         "if(!document.hidden){var a=document.querySelector('.tab.active');"
@@ -1212,8 +1284,16 @@ static esp_err_t handle_status(httpd_req_t *r)
      * incidental condition, so it should never be silently masked by a stale
      * "Degraded" chip left over from before blocking was paused. Loading still
      * wins over both — it's transient and self-clears. */
-    const char *status_cls = loading ? "warn" : (paused ? "ok" : (degraded ? "warn" : "ok"));
-    const char *status_txt = loading ? "Reloading" : (paused ? "Paused" : (degraded ? "Degraded" : "Active"));
+    /* A schedule window in force reads "Paused (schedule)", ranked like a
+     * manual pause (above Degraded); pause_effective() already puts manual
+     * first and reports the schedule only when the clock is synced. The head
+     * script's psChip() applies the same rule on every refresh. */
+    bool sched_paused = (pause_effective() == PAUSE_REASON_SCHEDULE);
+    const char *status_cls = loading ? "warn" : ((paused || sched_paused) ? "ok" : (degraded ? "warn" : "ok"));
+    const char *status_txt = loading ? "Reloading"
+                           : (paused ? "Paused"
+                           : (sched_paused ? "Paused (schedule)"
+                           : (degraded ? "Degraded" : "Active")));
     pb.appendf(
         "<div class=stats>"
         "<fieldset class=stat><legend>Domains</legend><div class=readrow><div class=val id=st-domains>%" PRIu32 "</div><span class=unit>domains</span></div></fieldset>"
@@ -1326,6 +1406,25 @@ static esp_err_t handle_status(httpd_req_t *r)
         }
         pb.appendf("]);</script>");
     }
+
+    /* Recurring pause schedule. Static skeleton only: psBuild()/psRender()
+     * (head script) create the four rows and fill them from GET
+     * /pause/schedule, which refreshDash() re-polls with /metrics, so first
+     * paint and every refresh go through one renderer. */
+    pb.appendf(
+        "<h3>Pause schedule</h3>"
+        "<div id=sched-rows></div>"
+        "<p><label>UTC offset <input id=sched-off type=number min=%d max=%d value=0 style='width:6em'></label> minutes "
+        "<button type=button id=sched-off-save>Save</button></p>"
+        "<p><small id=sched-clock></small></p>"
+        "<p><small id=sched-msg></small></p>"
+        "<p><small>Format: <span class=mono>mon,tue 22:00-06:30</span>, or "
+        "<span class=mono>daily</span> / <span class=mono>weekdays</span> / <span class=mono>weekends</span> "
+        "instead of day names. Times are local to the offset above (no daylight saving: "
+        "change it when the clocks do). Blocking is suspended for every device while a window "
+        "is active, and only once the clock is NTP-synced.</small></p>"
+        "<script>psLoad();</script>",
+        PAUSE_SCHED_UTC_MIN_MIN, PAUSE_SCHED_UTC_MAX_MIN);
 
     /* Clock status (NTP). (#105/#108 follow-up) Single renderer, same fix as
      * the pause table above: renderClock() (head script) builds this from
@@ -2276,6 +2375,96 @@ static esp_err_t handle_pause_resume(httpd_req_t *r)
     return ESP_OK;
 }
 
+/* ── GET/POST /pause/schedule — recurring pause windows ─────────────
+ * GET returns the whole schedule as JSON; POST takes `slot` (0-3) + `spec`
+ * (empty = clear) or `utc_offset_min` (see web_sched_form.h, host-tested) and
+ * answers with the same JSON so the page re-renders from one source. Written
+ * into a fixed PSRAM buffer: no allocation in the handler. */
+static EXT_RAM_BSS_ATTR char s_sched_json[640];
+
+static esp_err_t send_sched_json(httpd_req_t *r)
+{
+    pause_sched_t s;
+    if (!pause_schedule_get(&s)) {
+        httpd_resp_send_err(r, HTTPD_500_INTERNAL_SERVER_ERROR, "schedule unavailable");
+        return ESP_FAIL;
+    }
+    static const char *const REASON[] = { "none", "manual", "schedule" };
+    int reason = (int)pause_effective();
+    if (reason < 0 || reason > 2) reason = 0;
+    size_t pos = 0;
+    int n = snprintf(s_sched_json, sizeof(s_sched_json),
+                     "{\"utc_offset_min\":%d,\"clock_synced\":%s,\"effective\":\"%s\",\"windows\":[",
+                     (int)s.utc_offset_min, timesync_is_synced() ? "true" : "false", REASON[reason]);
+    if (n < 0 || (size_t)n >= sizeof(s_sched_json)) goto too_big;
+    pos = (size_t)n;
+    for (int i = 0; i < PAUSE_SCHED_MAX_WINDOWS; i++) {
+        char spec[PAUSE_SCHED_SPEC_MAX] = "";
+        bool on = s.win[i].enabled && pause_sched_format(&s.win[i], spec, sizeof(spec)) == 0;
+        if (!on) spec[0] = '\0';
+        n = snprintf(s_sched_json + pos, sizeof(s_sched_json) - pos,
+                     "%s{\"slot\":%d,\"enabled\":%s,\"spec\":\"%s\"}",
+                     i ? "," : "", i, on ? "true" : "false", spec);
+        if (n < 0 || (size_t)n >= sizeof(s_sched_json) - pos) goto too_big;
+        pos += (size_t)n;
+    }
+    n = snprintf(s_sched_json + pos, sizeof(s_sched_json) - pos, "]}");
+    if (n < 0 || (size_t)n >= sizeof(s_sched_json) - pos) goto too_big;
+    pos += (size_t)n;
+    httpd_resp_set_type(r, "application/json");
+    httpd_resp_set_hdr(r, "Cache-Control", "no-store");
+    httpd_resp_send(r, s_sched_json, (ssize_t)pos);
+    return ESP_OK;
+too_big:
+    httpd_resp_send_err(r, HTTPD_500_INTERNAL_SERVER_ERROR, "schedule too large");
+    return ESP_FAIL;
+}
+
+static esp_err_t sched_reject(httpd_req_t *r, const char *status, const char *why)
+{
+    httpd_resp_set_status(r, status);
+    httpd_resp_set_type(r, "text/plain");
+    httpd_resp_send(r, why, HTTPD_RESP_USE_STRLEN);
+    return ESP_FAIL;
+}
+
+static esp_err_t handle_pause_schedule_get(httpd_req_t *r)
+{
+    return send_sched_json(r);
+}
+
+static esp_err_t handle_pause_schedule_post(httpd_req_t *r)
+{
+    if (!csrf_ok(r)) {
+        httpd_resp_send_err(r, HTTPD_403_FORBIDDEN, "CSRF"); return ESP_FAIL;
+    }
+    char body[256] = {};
+    if (r->content_len >= sizeof(body))
+        return sched_reject(r, "400 Bad Request", "Request body too large");
+    size_t got = 0;
+    while (got < r->content_len) {     /* each pass reads >= 1 byte or exits */
+        int rc = httpd_req_recv(r, body + got, r->content_len - got);
+        if (rc <= 0) return sched_reject(r, "400 Bad Request", "Could not read request body");
+        got += (size_t)rc;
+    }
+    body[got] = '\0';
+
+    web_sched_form_t f;
+    if (!web_sched_form_parse(body, &f))
+        return sched_reject(r, "400 Bad Request", f.err ? f.err : "Bad request");
+
+    bool ok = false;
+    switch (f.kind) {
+    case WSF_SET_WINDOW:   ok = pause_schedule_set_window(f.slot, &f.win);   break;
+    case WSF_CLEAR_WINDOW: ok = pause_schedule_clear_window(f.slot);         break;
+    case WSF_SET_OFFSET:   ok = pause_schedule_set_utc_offset(f.utc_offset_min); break;
+    default:               break;
+    }
+    if (!ok)
+        return sched_reject(r, "500 Internal Server Error", "Could not save the schedule");
+    return send_sched_json(r);
+}
+
 /* ── POST /auth/set — change the admin account (#1, #89) ──────────
  * Requires the current password: a session cookie left in a browser must
  * not be enough to take the account over. Success drops every session
@@ -3206,7 +3395,7 @@ bool web_ui_start(DnsSinkServer *dns)
     cfg.prvtkey_pem      = (const uint8_t *)key;
     cfg.prvtkey_len      = key_len;
     cfg.port_secure      = 443;
-    cfg.httpd.max_uri_handlers = 54;   /* 48 registered with /metrics/prom (47 with /alarms, 44 as of #73) — headroom for the pause-schedule routes */
+    cfg.httpd.max_uri_handlers = 54;   /* 50 registered with the two /pause/schedule routes (48 before, 47 with /alarms, 44 as of #73) */
     cfg.httpd.max_resp_headers = 16;   /* 5 hardening headers + cookie + Location + type */
     cfg.httpd.stack_size       = 16384;
     /* Recycle the least-recently-used connection instead of refusing new ones
@@ -3254,6 +3443,8 @@ bool web_ui_start(DnsSinkServer *dns)
         { "/pause",               HTTP_POST, H(handle_pause)         },
         { "/pause/timed",         HTTP_POST, H(handle_pause_timed)   },
         { "/pause/resume",        HTTP_POST, H(handle_pause_resume)  },
+        { "/pause/schedule",      HTTP_GET,  H(handle_pause_schedule_get)  },
+        { "/pause/schedule",      HTTP_POST, H(handle_pause_schedule_post) },
         { "/check",               HTTP_POST, H(handle_check)         },
         { "/auth/set",            HTTP_POST, H(handle_auth_set)      },
         { "/whitelist/add",       HTTP_POST, H(handle_wl_add)        },

@@ -24,6 +24,7 @@ idf_component_register(
         "dns_health.c"
         "upstream_port.c"
         "web_parse.c"
+        "web_sched_form.c"
         "metrics_prom.c"
         "console.c"
         "web_tls.c"

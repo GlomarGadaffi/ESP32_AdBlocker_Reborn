@@ -11,3 +11,4 @@ upstream_port_test: tests/upstream_port_test.c main/upstream_port.c
 metrics_prom_test: tests/metrics_prom_test.c main/metrics_prom.c
 dns_health_test: tests/dns_health_test.c main/dns_health.c
 pause_sched_test: tests/pause_sched_test.c main/pause_sched.c
+web_sched_form_test: tests/web_sched_form_test.c main/web_sched_form.c main/pause_sched.c main/web_parse.c

@@ -168,6 +168,8 @@ The Dashboard has a **Pause blocking for a while** panel for the case where a si
 
 A paused client's queries are forwarded and the answers are never written to the shared cache, so nothing a paused device resolves can leak to anyone else, and blocking snaps back the instant the pause ends.
 
+**Schedules.** For a standing "don't block between these times" rule, the Dashboard's **Pause schedule** block holds up to four recurring windows. A window is a spec such as `mon,tue 22:00-06:30`, or `daily` / `weekdays` / `weekends` in place of day names; the end is exclusive, and a window that ends before it starts runs past midnight and belongs to the day it starts on. While one is active, blocking is suspended for every device and the status chip reads **Paused (schedule)**. Times are local to a fixed **UTC offset** in minutes (−720 to 840) that you set yourself; there is no daylight-saving handling, so change it when the clocks change. Unlike a timed pause, the schedule is saved to flash, but it stays **inactive until the clock is NTP-synced**, so an unsynced board keeps filtering. The same settings are on the USB console: `sched` (list), `sched-set <slot> <spec>`, `sched-clear <slot>` and `sched-tz <minutes>`; over HTTP see `GET`/`POST /pause/schedule` in `docs/http-api.md`.
+
 ---
 
 ## 🛠️ Hardware Support
