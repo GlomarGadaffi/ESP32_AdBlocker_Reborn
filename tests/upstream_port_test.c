@@ -58,6 +58,47 @@ static void test_port_mapping(void)
     CHECK(up_port_from_random(0xFFFFFFFFu) <= UP_PORT_MAX, "r=max above range");
 }
 
+static void test_spec_numbers(void)
+{
+    CHECK(UP_ROTATE_QUERIES == 2048u, "query threshold is not the specified 2048");
+    CHECK(UP_ROTATE_MS == 60000u, "time threshold is not the specified 60 s");
+    CHECK(UP_PORT_MIN == 49152u && UP_PORT_MAX == 65535u, "port range is not 49152-65535");
+    CHECK(UP_DRAIN_MAX_MS >= 3000u, "drain cap below the 3 s flight timeout");
+    /* exact bounds, low bits select the port, high bits are ignored */
+    CHECK(up_port_from_random(0) == 49152u, "r=0 -> %u", (unsigned)up_port_from_random(0));
+    CHECK(up_port_from_random(0x3FFFu) == 65535u, "r=0x3FFF not the top port");
+    CHECK(up_port_from_random(0x4000u) == 49152u, "r=0x4000 does not wrap to the bottom");
+    CHECK(up_port_from_random(0xABCD0001u) == 49153u, "high bits leaked into the port");
+    /* every one of the 16384 ports is reachable exactly once per cycle */
+    static uint8_t seen[16384];
+    for (uint32_t r = 0; r < 16384u; r++) seen[up_port_from_random(r) - UP_PORT_MIN]++;
+    for (uint32_t i = 0; i < 16384u; i++) if (seen[i] != 1) { CHECK(0, "port offset %u hit %u times", (unsigned)i, (unsigned)seen[i]); break; }
+    /* a due rotation is not offered one tick early at either threshold, and the
+     * 2048th forward is counted by the caller once per upstream_alloc */
+    up_state_t st;
+    up_init(&st, 0);
+    for (int i = 0; i < 2047; i++) up_note_forward(&st);
+    CHECK(!up_rotate_due(&st, 59999u), "due before 2048 queries and 60 s");
+}
+
+static void test_drain_hard_deadline(void)
+{
+    up_state_t st;
+    up_init(&st, 1000);
+    uint8_t g;
+    CHECK(up_begin_rotate(&st, 2000, &g), "rotate refused");
+    CHECK(!up_drain_poll(&st, 5, 2000 + UP_DRAIN_MAX_MS - 1), "drain cap fired early");
+    CHECK(up_draining(&st), "drain ended early");
+    CHECK(up_drain_poll(&st, 5, 2000 + UP_DRAIN_MAX_MS), "stuck flights held the drain past the cap");
+    CHECK(!up_draining(&st), "still draining after the cap");
+    CHECK(up_rotate_due(&st, 2000 + UP_ROTATE_MS), "no rotation after a forced drain end");
+    /* cap is wrap-safe */
+    up_init(&st, 0xFFFFFFFFu - 100u);
+    CHECK(up_begin_rotate(&st, 0xFFFFFFFFu - 100u, &g), "rotate refused (wrap)");
+    CHECK(!up_drain_poll(&st, 1, (uint32_t)(0xFFFFFFFFu - 100u + UP_DRAIN_MAX_MS - 1)), "wrap: cap early");
+    CHECK(up_drain_poll(&st, 1, (uint32_t)(0xFFFFFFFFu - 100u + UP_DRAIN_MAX_MS)), "wrap: cap missed");
+}
+
 static void test_generation_tag(void)
 {
     up_state_t st;
@@ -81,12 +122,12 @@ static void test_drain_completes_only_at_zero(void)
     CHECK(!up_draining(&st), "draining before any rotation");
     CHECK(up_begin_rotate(&st, 10, &g1), "rotate refused");
     CHECK(up_draining(&st), "not draining after rotation");
-    CHECK(!up_drain_poll(&st, 3), "drain done with 3 flights");
-    CHECK(!up_drain_poll(&st, 1), "drain done with 1 flight");
+    CHECK(!up_drain_poll(&st, 3, 10), "drain done with 3 flights");
+    CHECK(!up_drain_poll(&st, 1, 10), "drain done with 1 flight");
     CHECK(up_draining(&st), "drain flag lost early");
-    CHECK(up_drain_poll(&st, 0), "drain not done at zero flights");
+    CHECK(up_drain_poll(&st, 0, 10), "drain not done at zero flights");
     CHECK(!up_draining(&st), "still draining after completion");
-    CHECK(!up_drain_poll(&st, 0), "completion reported twice");
+    CHECK(!up_drain_poll(&st, 0, 10), "completion reported twice");
 }
 
 static void test_no_third_socket(void)
@@ -102,7 +143,7 @@ static void test_no_third_socket(void)
     CHECK(!up_begin_rotate(&st, UP_ROTATE_MS * 2, &g2), "third socket allowed");
     CHECK(st.cur_gen == before, "generation moved on a refused rotate");
     /* Deferred, not lost: due again the moment the drain finishes. */
-    CHECK(up_drain_poll(&st, 0), "drain should finish");
+    CHECK(up_drain_poll(&st, 0, 0), "drain should finish");
     CHECK(up_rotate_due(&st, UP_ROTATE_MS * 2), "deferred rotation lost");
     CHECK(up_begin_rotate(&st, UP_ROTATE_MS * 2, &g2), "rotate refused after drain");
     CHECK(g2 != g1, "generation reused");
@@ -116,7 +157,7 @@ static void test_rotate_resets_and_failure_backoff(void)
     uint8_t g;
     CHECK(up_begin_rotate(&st, 500, &g), "rotate refused");
     CHECK(st.queries == 0, "query counter not reset");
-    CHECK(up_drain_poll(&st, 0), "drain should finish");
+    CHECK(up_drain_poll(&st, 0, 0), "drain should finish");
     CHECK(!up_rotate_due(&st, 500 + UP_ROTATE_MS - 1), "due early after rotation");
     /* A failed bind restarts both clocks so the task does not retry every tick. */
     for (uint32_t i = 0; i < UP_ROTATE_QUERIES; i++) up_note_forward(&st);
@@ -130,13 +171,15 @@ static void test_rotate_resets_and_failure_backoff(void)
         uint8_t prev = st.cur_gen, ng;
         CHECK(up_begin_rotate(&st, 0, &ng), "rotate %d refused", i);
         CHECK(!up_reply_ok(prev, ng), "wrap: old gen accepted on new socket");
-        CHECK(up_drain_poll(&st, 0), "wrap: drain stuck");
+        CHECK(up_drain_poll(&st, 0, 0), "wrap: drain stuck");
     }
 }
 
 int main(void)
 {
     test_query_threshold();
+    test_spec_numbers();
+    test_drain_hard_deadline();
     test_time_threshold_and_wrap();
     test_port_mapping();
     test_generation_tag();

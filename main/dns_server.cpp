@@ -1723,16 +1723,19 @@ void DnsSinkServer::run_loop()
              * flights that left on either are lost with them and simply time
              * out, and a fresh generation keeps their tags from ever matching
              * the new socket. */
+            /* The draining socket goes FIRST: opening the replacement while both
+             * old sockets are still open would briefly make three. */
+            if (s_drain_fd >= 0) { close(s_drain_fd); s_drain_fd = -1; }
             int newu = open_upstream_sock();
             if (newu >= 0) {
                 close(usock);
                 usock = newu;
                 _upstream_fd.store(usock, std::memory_order_release);
-                if (s_drain_fd >= 0) { close(s_drain_fd); s_drain_fd = -1; }
-                (void)up_drain_poll(&s_up, 0);          /* clear any draining state */
+                uint32_t t32 = (uint32_t)(esp_timer_get_time() / 1000);
+                (void)up_drain_poll(&s_up, 0, t32);     /* clear any draining state */
                 uint8_t ng;
-                if (up_begin_rotate(&s_up, (uint32_t)(esp_timer_get_time() / 1000), &ng))
-                    (void)up_drain_poll(&s_up, 0);      /* nothing left to drain */
+                if (up_begin_rotate(&s_up, t32, &ng))
+                    (void)up_drain_poll(&s_up, 0, t32); /* nothing left to drain */
             } else {
                 ESP_LOGE(TAG, "%s: usock create failed (%d)", who, errno);
             }
@@ -1917,7 +1920,8 @@ void DnsSinkServer::run_loop()
              * flight is gone, then open a new generation if one is due. After
              * the reply drain so finished flights are already out of the table. */
             if (up_draining(&s_up)) {
-                if (up_drain_poll(&s_up, upstream_flights_on(up_drain_gen(&s_up))) &&
+                if (up_drain_poll(&s_up, upstream_flights_on(up_drain_gen(&s_up)),
+                                  (uint32_t)now_ms) &&
                     s_drain_fd >= 0) {
                     close(s_drain_fd);
                     s_drain_fd = -1;
@@ -2041,7 +2045,7 @@ void DnsSinkServer::run_loop()
                      * the reply is only accepted back on that socket, and the
                      * drain rule keeps it open while this flight lives. */
                     int hedge_fd = usock_for(he->up_gen);
-                    if (hedge_fd < 0) continue;
+                    if (hedge_fd < 0) { he->hedged = true; continue; }   /* socket retired: no retry each tick */
                     sendto(hedge_fd, s_hedge_q + (size_t)i * HEDGE_QMAX,
                            he->hedge_qlen, 0,
                            (sockaddr *)&upstream_addr, sizeof(upstream_addr));
@@ -2854,7 +2858,7 @@ int dns_server_metrics_json(char *out, size_t cap)
      * handle_metrics() then does httpd_resp_send(r, json, n) against a fixed
      * 2048 B buffer, so an unclamped n ships whatever .bss sits after json[]
      * to an unauthenticated client as unterminated JSON. Unreachable today —
-     * worst case is now ~1,750 B (was ~1,323 B before #105/#108's
+     * worst case is now ~1,810 B (incl. up_rotations/up_rotate_failures) (was ~1,323 B before #105/#108's
      * pause_list/clock_epoch additions: PAUSE_MAX=8 entries at ~50 B each is
      * the largest single addition) — against a 2048 B cap, less headroom
      * than the old estimate implied. Re-check this number the next time

@@ -8,6 +8,7 @@ void up_init(up_state_t *st, uint32_t now_ms)
     st->draining   = false;
     st->queries    = 0;
     st->rotated_ms = now_ms;
+    st->drain_start_ms = now_ms;
 }
 
 uint16_t up_port_from_random(uint32_t r)
@@ -36,6 +37,7 @@ bool up_begin_rotate(up_state_t *st, uint32_t now_ms, uint8_t *new_gen)
     st->draining   = true;
     st->queries    = 0;
     st->rotated_ms = now_ms;
+    st->drain_start_ms = now_ms;
     *new_gen = st->cur_gen;
     return true;
 }
@@ -57,9 +59,11 @@ uint8_t up_drain_gen(const up_state_t *st)
     return st ? (uint8_t)(st->cur_gen - 1u) : 0;
 }
 
-bool up_drain_poll(up_state_t *st, uint32_t drain_flights)
+bool up_drain_poll(up_state_t *st, uint32_t drain_flights, uint32_t now_ms)
 {
-    if (!st || !st->draining || drain_flights != 0) return false;
+    if (!st || !st->draining) return false;
+    if (drain_flights != 0 && (uint32_t)(now_ms - st->drain_start_ms) < UP_DRAIN_MAX_MS)
+        return false;
     st->draining = false;
     return true;
 }

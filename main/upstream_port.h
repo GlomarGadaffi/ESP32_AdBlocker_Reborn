@@ -20,12 +20,14 @@ extern "C" {
 #define UP_ROTATE_QUERIES  2048u    /* forwards on one socket before rotating */
 #define UP_ROTATE_MS       60000u   /* or this long, whichever comes first */
 #define UP_BIND_ATTEMPTS   8        /* bind retries per rotation (port collision) */
+#define UP_DRAIN_MAX_MS    5000u    /* hard cap on a drain: above the 3000 ms flight timeout */
 
 typedef struct {
     uint8_t  cur_gen;      /* generation of the current socket */
     bool     draining;     /* the previous generation's socket is still open */
     uint32_t queries;      /* forwards sent on the current socket */
     uint32_t rotated_ms;   /* when the current socket was opened (wrap-safe) */
+    uint32_t drain_start_ms; /* when the draining socket began draining */
 } up_state_t;
 
 void     up_init(up_state_t *st, uint32_t now_ms);
@@ -54,8 +56,10 @@ bool     up_draining(const up_state_t *st);
 uint8_t  up_drain_gen(const up_state_t *st);
 
 /* Report how many flights still belong to the draining generation. Returns
- * true exactly once, when that count is zero: the caller closes the socket. */
-bool     up_drain_poll(up_state_t *st, uint32_t drain_flights);
+ * true exactly once, when that count is zero OR the drain has lasted
+ * UP_DRAIN_MAX_MS: the caller closes the socket. Leftover flights then simply
+ * time out; they can no longer match any live socket. */
+bool     up_drain_poll(up_state_t *st, uint32_t drain_flights, uint32_t now_ms);
 
 /* A reply read from the socket of generation rx_gen belongs to a flight tagged
  * flight_gen only if they match. */
