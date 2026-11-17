@@ -17,8 +17,9 @@
  *  - every entry load_insert leaves valid is allowed (not blocked), has
  *    resp_len in range, qn_len == dns_qname_wire_len(resp), deadline 1 and an
  *    open refresh gate
- *  - such an entry is found by lookup_stale at now=2 under generation 0, and
- *    is NOT found fresh
+ *  - such an entry is restored and NOT served (fresh or stale) under the
+ *    load-time generation until restored_adopt; after adopt, lookup_stale
+ *    finds it and it is still not fresh
  *  - snap_read of it returns the same key/len/bytes, and re-encoding that as a
  *    record then decoding gives the same triple (codec round trip)
  */
@@ -56,7 +57,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
             uint8_t *resp = (uint8_t *)malloc(rl);
             memcpy(resp, in + pos, rl);
             pos += rl;
-            (void)fwd_cache_load_insert(&c, h, qt, resp, rl, 5);
+            (void)fwd_cache_load_insert(&c, h, qt, resp, rl, 5, 0);
             free(resp);
         }
         fwd_cache_write_end(&c);
@@ -64,11 +65,21 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 
         uint8_t snap[FWD_RESP_MAX];
         for (uint32_t i = 0; i < c.entries; i++) {
-            const fwd_entry_t *e = &c.e[i];
+            fwd_entry_t *e = &c.e[i];
             if (!e->valid) continue;
+            assert(e->restored && e->load_gen != 0);
             assert(!e->blocked && e->resp_len >= 1 && e->resp_len <= FWD_RESP_MAX);
             assert(e->ttl_deadline_ms == 1 && e->refresh_after_ms == 0);
             assert(e->qn_len > 0 && e->qn_len <= (uint16_t)(e->resp_len - FWD_DNS_HDR_LEN));
+            assert(fwd_cache_lookup(&c, e->key_hash, e->qtype, e->resp + FWD_DNS_HDR_LEN,
+                                    e->qn_len, 2, 0) == NULL);
+            assert(fwd_cache_lookup_stale(&c, e->key_hash, e->qtype, e->resp + FWD_DNS_HDR_LEN,
+                                          e->qn_len, 2, 0) == NULL);
+            assert(fwd_cache_restored_pending(&c, e->key_hash, e->qtype,
+                                              e->resp + FWD_DNS_HDR_LEN, e->qn_len, 2, 0) == e);
+            fwd_cache_restored_adopt(&c, e, 0);
+            assert(fwd_cache_restored_pending(&c, e->key_hash, e->qtype,
+                                              e->resp + FWD_DNS_HDR_LEN, e->qn_len, 2, 0) == NULL);
             assert(fwd_cache_lookup(&c, e->key_hash, e->qtype, e->resp + FWD_DNS_HDR_LEN,
                                     e->qn_len, 2, 0) == NULL);
             assert(fwd_cache_lookup_stale(&c, e->key_hash, e->qtype, e->resp + FWD_DNS_HDR_LEN,

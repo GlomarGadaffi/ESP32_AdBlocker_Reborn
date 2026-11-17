@@ -169,7 +169,8 @@ static constexpr int      TCP_QUERY_MAX    = 768;
  * evicted each other forever — a hit-rate ceiling no slot count fixes for the
  * colliding pair. Four ways per set ends that, and 512 sets doubles capacity
  * on top (256 direct slots gave ~4% on diverse home traffic; 1024 was better).
- * Budget: 2048 × 544 B leaves ~490 KB PSRAM free measured post-boot — the old
+ * Budget: 2048 × 548 B (544 B when the ~490 KB free figure was measured, before
+ * the `restored` flag added 8 KB) leaves ~480 KB PSRAM free post-boot — the old
  * "4 MB free" note here was stale. Every other PSRAM consumer allocates at
  * boot, so that headroom is steady-state; don't grow WAYS/SETS/FWD_RESP_MAX
  * without re-measuring. Storing raw wire bytes per entry — rather than parsed
@@ -266,6 +267,7 @@ static void cache_load_sd(void)
     fwd_cache_write_begin(&s_fwd);
     uint32_t loaded = 0;
     const uint64_t now_ms = (uint64_t)(esp_timer_get_time() / 1000);
+    const uint32_t gen_now = blocklist_generation();
     for (uint32_t i = 0; i < count; i++) {
         uint8_t rec[FWD_SNAP_REC_SZ];
         if (fread(rec, 1, sizeof(rec), f) != sizeof(rec)) break;   /* truncated */
@@ -282,7 +284,7 @@ static void cache_load_sd(void)
          * own question name, the same full key a live store uses. */
         static EXT_RAM_BSS_ATTR uint8_t s_ld[FWD_RESP_MAX];   /* boot-only, cold */
         if (fread(s_ld, 1, resp_len, f) != resp_len) break;         /* truncated */
-        if (!fwd_cache_load_insert(&s_fwd, h, qtype, s_ld, resp_len, now_ms))
+        if (!fwd_cache_load_insert(&s_fwd, h, qtype, s_ld, resp_len, now_ms, gen_now))
             continue;                                               /* skip, keep going */
         loaded++;
     }
@@ -973,6 +975,36 @@ static bool cname_chain_is_blocked(const uint8_t *pkt, int len, int qend)
     return false;
 }
 
+/* Warm-boot entries (#79) come from another boot's blocklist and carry no
+ * verdict, while serve-stale and its refresh trust the entry's generation
+ * stamp instead of asking the blocklist. So before the cache is consulted for
+ * a name, any restored entry for it that is not yet adopted under `gen` gets
+ * the verdict a cold query would get: the name itself, then the stored
+ * answer's CNAME chain (#74). Allowed -> stamped with `gen` and the ordinary
+ * serve-stale path below takes it from there. Blocked -> dropped, and the
+ * query falls through to the normal verdict branch. A generation bump (the
+ * boot-time blocklist load, a reload, a pause flip) makes it pending again,
+ * which is the point: the old code stamped every restored entry 0 and lost
+ * the whole warm set at the first bump.
+ * `gen` must be the generation read BEFORE this call (#144). An unproven
+ * verdict (busy small-table take) decides nothing: the entry stays pending
+ * and is simply not served this time. */
+static void restored_recheck(uint32_t h, uint16_t qtype, const uint8_t *qn, int qn_len,
+                             const char *name, size_t nlen, uint64_t now_ms, uint32_t gen)
+{
+    fwd_entry_t *e = fwd_cache_restored_pending(&s_fwd, h, qtype, qn, qn_len, now_ms, gen);
+    if (!e) return;
+    bl_verdict_t v = blocklist_verdict(name, nlen);
+    if (v.unproven) return;
+    bool blocked = v.state == BL_BLOCK;
+    /* (#117) An explicit ALLOW exempts the CNAME chain, as in process_reply. */
+    if (!blocked && v.state != BL_ALLOW)
+        blocked = cname_chain_is_blocked(e->resp, e->resp_len,
+                                         (int)sizeof(DnsHeader) + qn_len + 4);
+    if (blocked) fwd_cache_restored_drop(&s_fwd, e);
+    else         fwd_cache_restored_adopt(&s_fwd, e, gen);
+}
+
 /* (#72) normalize_qname_case() above only scrubs the question section —
  * the one place a compression pointer can't reach, since RFC 1035 §4.1.4
  * pointers must point strictly backward and the question comes first. An
@@ -1126,7 +1158,8 @@ void DnsSinkServer::run_loop()
     if (!s_hedge_q)
         ESP_LOGW(TAG, "hedge stash alloc failed — hedged retransmits disabled (#69)");
 
-    cache_load_sd();   /* #79: restore the previous working set, all stale */
+    cache_load_sd();   /* #79: restore the previous working set, all stale and
+                          unverified - see restored_recheck() */
 
     /* ── Open client socket ─────────────────────────────────────── */
     int lsock = -1;   /* TCP/53 listener; created below, -1 = UDP-only */
@@ -1892,6 +1925,10 @@ void DnsSinkServer::run_loop()
                  * below, so there is only one build_rewrite_a call site. */
                 uint32_t rw_pre = (cls_in && qtype == 1) ? rewrite_lookup(name) : 0;
 
+                /* (#79) Give a warm-boot entry for this name its verdict first. */
+                if (cls_in && !rw_pre)
+                    restored_recheck(h, qtype, qn, qn_len, name, nlen, now_ms, verdict_gen);
+
                 /* ── cache hit? ─────────────────────────────── */
                 s_cnt_cache_probe++;
                 fwd_entry_t *ce = (rw_pre || !cls_in) ? nullptr
@@ -2237,6 +2274,9 @@ void DnsSinkServer::run_loop()
 
                             /* (#100) Rewrite verdict before the cache, as on UDP. */
                             uint32_t rw_pre = (cls_in && qtype == 1) ? rewrite_lookup(name) : 0;
+                            /* (#79) Warm-boot entry verdict, as on UDP. */
+                            if (cls_in && !rw_pre)
+                                restored_recheck(h, qtype, qn, qn_len, name, nlen, now_ms, verdict_gen);
                             s_cnt_cache_probe++;
                             fwd_entry_t *ce = (rw_pre || !cls_in) ? nullptr
                                 : fwd_cache_lookup(&s_fwd, h, qtype, qn, qn_len, now_ms,

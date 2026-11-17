@@ -303,13 +303,56 @@ static void test_snap_and_load(void)
     CHECK(found == 1, "blocked entries are not snapshotted");
 
     fresh();
-    CHECK(fwd_cache_load_insert(&C, H, 1, r, 100, 777), "load insert ok");
-    CHECK(fwd_cache_lookup(&C, H, 1, r + 12, qn, 778, 0) == NULL, "restored entry is not fresh");
-    fwd_entry_t *e = fwd_cache_lookup_stale(&C, H, 1, r + 12, qn, 778, 0);
+    /* Restored at generation 7 (the blocklist had already loaded). */
+    CHECK(fwd_cache_load_insert(&C, H, 1, r, 100, 777, 7), "load insert ok");
+    CHECK(fwd_cache_lookup(&C, H, 1, r + 12, qn, 778, 7) == NULL, "restored entry is not fresh");
+    CHECK(fwd_cache_lookup_stale(&C, H, 1, r + 12, qn, 778, 7) == NULL,
+          "restored entry is not served before a verdict");
+    CHECK(fwd_cache_l2_get(&C, H, 1, r + 12, qn, 778, 7, snap, sizeof(snap)) == -1 &&
+          fwd_cache_l2_get(&C, H, 1, r + 12, qn, 778, 6, snap, sizeof(snap)) == -1,
+          "restored entry never served from L2");
+    fwd_entry_t *e = fwd_cache_restored_pending(&C, H, 1, r + 12, qn, 778, 7);
     CHECK(e && e->ttl_deadline_ms == 1 && e->refresh_after_ms == 0 && e->resp_len == 100 &&
-          !e->blocked && e->load_gen == 0, "restored stale, gate open, generation 0");
+          !e->blocked && e->restored && e->load_gen != 7, "restored pending, gate open");
+    fwd_cache_restored_adopt(&C, e, 7);
+    CHECK(fwd_cache_lookup_stale(&C, H, 1, r + 12, qn, 778, 7) == e, "adopted: served stale");
+    CHECK(fwd_cache_restored_pending(&C, H, 1, r + 12, qn, 778, 7) == NULL,
+          "adopted: not pending under the same generation");
+    /* The regression: a generation bump used to strand the whole warm set. */
+    CHECK(fwd_cache_lookup_stale(&C, H, 1, r + 12, qn, 778, 8) == NULL,
+          "bump: adopted stamp no longer authorises it");
+    CHECK(fwd_cache_restored_pending(&C, H, 1, r + 12, qn, 778, 8) == e,
+          "bump: pending again, so it is re-checked instead of lost");
+    fwd_cache_restored_adopt(&C, e, 8);
+    CHECK(fwd_cache_lookup_stale(&C, H, 1, r + 12, qn, 778, 8) == e, "re-adopted after bump");
+    CHECK(fwd_cache_restored_pending(&C, H, 1, r + 12, qn,
+                                     1 + (uint64_t)FWD_STALE_MAX_S * 1000u, 9) == NULL,
+          "past the stale window: not pending");
+    /* A live store takes the way over: ordinary entry from then on. */
+    fwd_cache_store_resp(&C, H, 1, r, 100, 60, 1000, 8);
+    CHECK(!e->restored && fwd_cache_restored_pending(&C, H, 1, r + 12, qn, 1001, 9) == NULL,
+          "live store clears restored");
+    /* Blocked verdict: dropped, gone for every lookup. */
+    fresh();
+    CHECK(fwd_cache_load_insert(&C, H, 1, r, 100, 777, 0), "load insert at generation 0");
+    CHECK(fwd_cache_lookup_stale(&C, H, 1, r + 12, qn, 778, 0) == NULL,
+          "generation 0 is not a free pass");
+    e = fwd_cache_restored_pending(&C, H, 1, r + 12, qn, 778, 0);
+    CHECK(e != NULL, "pending at generation 0");
+    if (e) fwd_cache_restored_drop(&C, e);
+    CHECK(fwd_cache_restored_pending(&C, H, 1, r + 12, qn, 778, 0) == NULL &&
+          fwd_cache_lookup_stale(&C, H, 1, r + 12, qn, 778, 0) == NULL &&
+          fwd_cache_lookup_stale(&C, H, 1, r + 12, qn, 778, 0xFFFFFFFFu) == NULL,
+          "dropped entry is gone");
+    found = 0;
+    for (uint32_t i = 0; i < C.entries; i++)
+        if (fwd_cache_snap_read(&C, i, 2000, snap, &h, &qt, &rl)) found++;
+    CHECK(found == 0, "dropped entry is not snapshotted");
+    fwd_cache_store_blocked(&C, H, 1, r + 12, qn, 10, 1000, 0);
+    CHECK(fwd_cache_restored_pending(&C, H, 1, r + 12, qn, 1001, 1) == NULL,
+          "blocked entries are never pending");
     uint8_t bad[40]; memset(bad, 0, sizeof(bad)); bad[12] = 0xC0;
-    CHECK(!fwd_cache_load_insert(&C, 0x1, 1, bad, 40, 777), "unparsable qname skipped");
+    CHECK(!fwd_cache_load_insert(&C, 0x1, 1, bad, 40, 777, 0), "unparsable qname skipped");
 }
 
 static void test_codec(void)
@@ -368,12 +411,13 @@ static void test_layout(void)
           offsetof(fwd_entry_t, resp_len) < offsetof(fwd_entry_t, qn_len) &&
           offsetof(fwd_entry_t, qn_len) < offsetof(fwd_entry_t, refresh_after_ms) &&
           offsetof(fwd_entry_t, refresh_after_ms) < offsetof(fwd_entry_t, load_gen) &&
-          offsetof(fwd_entry_t, load_gen) < offsetof(fwd_entry_t, resp), "field order");
+          offsetof(fwd_entry_t, load_gen) < offsetof(fwd_entry_t, restored) &&
+          offsetof(fwd_entry_t, restored) < offsetof(fwd_entry_t, resp), "field order");
     CHECK(offsetof(fwd_entry_t, valid) == 12 || sizeof(void *) == 8, "ILP32: valid right after the u64 at 4");
-    /* The firmware log line says 544 B per entry (2048 x 544 B); that is the
+    /* The firmware log line says 548 B per entry (2048 x 548 B); that is the
      * ILP32 layout (u64 aligned to 4). 64-bit hosts pad to 552. */
     if (sizeof(void *) == 4)
-        CHECK(sizeof(fwd_entry_t) == 544, "ILP32 sizeof(fwd_entry_t)=%zu", sizeof(fwd_entry_t));
+        CHECK(sizeof(fwd_entry_t) == 548, "ILP32 sizeof(fwd_entry_t)=%zu", sizeof(fwd_entry_t));
     else
         CHECK(sizeof(fwd_entry_t) == 552, "LP64 sizeof(fwd_entry_t)=%zu", sizeof(fwd_entry_t));
 }

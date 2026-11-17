@@ -97,6 +97,7 @@ void fwd_cache_store_blocked(fwd_cache_t *c, uint32_t h, uint16_t qtype,
     e->qn_len = (uint16_t)qn_len;
     e->ttl_deadline_ms = now_ms + (uint64_t)ttl_s * 1000u;
     e->load_gen = load_gen;  /* (#85) */
+    e->restored = false;
     fwd_cache_write_end(c);
 }
 
@@ -117,6 +118,7 @@ void fwd_cache_store_resp(fwd_cache_t *c, uint32_t h, uint16_t qtype,
     e->ttl_deadline_ms   = now_ms + (uint64_t)ttl_s * 1000u;
     e->refresh_after_ms  = 0;
     e->load_gen          = load_gen;  /* (#85) */
+    e->restored          = false;
     fwd_cache_write_end(c);
 }
 
@@ -237,7 +239,8 @@ bool fwd_cache_snap_read(fwd_cache_t *c, uint32_t idx, uint64_t now_ms, uint8_t 
 }
 
 bool fwd_cache_load_insert(fwd_cache_t *c, uint32_t h, uint16_t qtype,
-                           const uint8_t *resp, uint16_t resp_len, uint64_t now_ms)
+                           const uint8_t *resp, uint16_t resp_len, uint64_t now_ms,
+                           uint32_t gen_now)
 {
     int qn_len = dns_qname_wire_len(resp, resp_len, FWD_DNS_HDR_LEN);
     if (qn_len < 0) return false;
@@ -251,7 +254,40 @@ bool fwd_cache_load_insert(fwd_cache_t *c, uint32_t h, uint16_t qtype,
     e->valid            = true;
     e->ttl_deadline_ms  = 1;   /* expired, but inside the stale window */
     e->refresh_after_ms = 0;   /* first touch is free to refresh at once */
+    e->load_gen         = gen_now - 1u;   /* never the current generation: unverified */
+    e->restored         = true;
     return true;
+}
+
+fwd_entry_t *fwd_cache_restored_pending(fwd_cache_t *c, uint32_t h, uint16_t qtype,
+                                        const uint8_t *qn, int qn_len, uint64_t now_ms,
+                                        uint32_t gen)
+{
+    fwd_entry_t *set = fwd_set(c, h, qtype);
+    for (int w = 0; w < FWD_CACHE_WAYS; w++) {
+        fwd_entry_t *e = &set[w];
+        if (e->valid && e->restored && !e->blocked && e->resp_len > 0 &&
+            e->load_gen != gen &&
+            fwd_key_eq(e, h, qtype, qn, qn_len) &&
+            e->ttl_deadline_ms + (uint64_t)FWD_STALE_MAX_S * 1000u > now_ms)
+            return e;
+    }
+    return NULL;
+}
+
+void fwd_cache_restored_adopt(fwd_cache_t *c, fwd_entry_t *e, uint32_t gen)
+{
+    fwd_cache_write_begin(c);
+    e->load_gen = gen;
+    fwd_cache_write_end(c);
+}
+
+void fwd_cache_restored_drop(fwd_cache_t *c, fwd_entry_t *e)
+{
+    fwd_cache_write_begin(c);
+    e->valid    = false;
+    e->restored = false;
+    fwd_cache_write_end(c);
 }
 
 void fwd_cache_hdr_encode(uint8_t hdr[FWD_SNAP_HDR_SZ], uint32_t count)

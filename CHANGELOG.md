@@ -7,6 +7,16 @@ firmware's `esp_app_desc` version string comes from `version.txt`.
 
 ### Fixed
 
+ - **The warm-boot cache survives the blocklist load (#79).** Responses
+   restored from the SD snapshot were stamped with blocklist generation 0, so
+   the boot-time blocklist load, which bumps the generation, made every one of
+   them a miss within seconds of boot. A restored response is now held
+   unverified and given a normal verdict (the name, then the stored answer's
+   CNAME chain) the first time it is asked for, and again after any generation
+   change; a name the current list blocks is dropped instead of served. Nothing
+   restored is served without that verdict. `fwd_entry_t` grows 4 bytes (8 KB
+   of PSRAM across the cache).
+
 - **`dns_task` no longer exits on a `select()` error (#152).** Any failure
   other than `EINTR` used to `break` out of the serve loop into the shutdown
   path — sockets closed, task deleted, nothing restarting it — so the board

@@ -61,6 +61,9 @@ typedef struct fwd_entry {
                                          authorised this entry (#85); a lookup under a newer
                                          generation is a miss. Passed in by the store's
                                          caller, never re-read at store time. */
+    bool       restored;              /* came from the SD snapshot and no live store has
+                                         replaced it since. Its load_gen is only as good as
+                                         the last fwd_cache_restored_adopt(); see there. */
     uint8_t    resp[FWD_RESP_MAX];    /* allowed: raw upstream response */
 } fwd_entry_t;
 
@@ -122,10 +125,30 @@ void fwd_cache_refresh_disarm(fwd_entry_t *e);
 bool fwd_cache_snap_read(fwd_cache_t *c, uint32_t idx, uint64_t now_ms, uint8_t *snap,
                          uint32_t *h, uint16_t *qtype, uint16_t *resp_len);
 /* Warm-boot insert of one restored response: stored expired-but-inside-the-
- * stale-window (deadline 1), gate open. False when the question name does not
+ * stale-window (deadline 1), gate open, marked restored and stamped with a
+ * generation that is NOT gen_now, so no lookup serves it until the caller has
+ * taken a verdict for it (below). False when the question name does not
  * parse (caller skips it). Caller holds the write bracket. */
 bool fwd_cache_load_insert(fwd_cache_t *c, uint32_t h, uint16_t qtype,
-                           const uint8_t *resp, uint16_t resp_len, uint64_t now_ms);
+                           const uint8_t *resp, uint16_t resp_len, uint64_t now_ms,
+                           uint32_t gen_now);
+
+/* Restored entries carry no verdict: the snapshot was taken under another
+ * boot's blocklist. Serve-stale trusts load_gen instead of asking the
+ * blocklist, so the caller must ask on the entry's behalf before the lookup:
+ *   e = fwd_cache_restored_pending(..., gen)   - restored, inside the stale
+ *       window, and not yet adopted under gen (NULL otherwise);
+ *   take the verdict for the name (and the stored answer's CNAME chain);
+ *   allowed -> fwd_cache_restored_adopt(c, e, gen)  (gen read BEFORE the verdict)
+ *   blocked -> fwd_cache_restored_drop(c, e).
+ * A generation bump makes the entry pending again, so it is re-checked, not
+ * lost: that is what keeps the warm set alive across the boot-time blocklist
+ * load. Any live store to the way clears `restored`. dns_task only. */
+fwd_entry_t *fwd_cache_restored_pending(fwd_cache_t *c, uint32_t h, uint16_t qtype,
+                                        const uint8_t *qn, int qn_len, uint64_t now_ms,
+                                        uint32_t gen);
+void fwd_cache_restored_adopt(fwd_cache_t *c, fwd_entry_t *e, uint32_t gen);
+void fwd_cache_restored_drop(fwd_cache_t *c, fwd_entry_t *e);
 
 void fwd_cache_hdr_encode(uint8_t hdr[FWD_SNAP_HDR_SZ], uint32_t count);
 void fwd_cache_count_encode(uint8_t out[4], uint32_t count);
