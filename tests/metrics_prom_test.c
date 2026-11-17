@@ -180,6 +180,7 @@ static const char *REAL =
     "\"cache_probes\":500,\"cache_hits\":250,\"cache_hit_rate\":50.0,"
     "\"cache_evictions\":1,\"cache_too_big\":0,\"stale_served\":0,\"coalesced\":3,"
     "\"hedges_sent\":4,\"hedged_completions\":2,"
+    "\"up_rotations\":3,\"up_rotate_failures\":1,"
     "\"dropped\":{\"table_full\":0,\"mbox_pressure\":0},"
     "\"upstream_timeouts\":1,\"upstream_inflight\":2,\"upstream_max\":64,"
     "\"blocklist_count\":150000,\"blocklist_loading\":false,\"blocklist_paused\":false,"
@@ -226,9 +227,162 @@ static void test_real(void)
         lines++;
         p = e + 1;
     }
-    /* 82 numeric/bool leaves counted by hand from REAL (pause_list excluded) + the info line */
-    CHECK(lines == 83, "line count %d", lines);
+    /* 84 numeric/bool leaves counted by hand from REAL (pause_list excluded) + the info line */
+    CHECK(lines == 85, "line count %d", lines);
     CHECK(n == strlen(got), "out_len %zu vs strlen %zu", n, strlen(got));
+}
+
+static void test_edges(void)
+{
+    printf("edge cases\n");
+    /* number grammar: JSON only */
+    expect_err("{\"a\":+1}", METRICS_PROM_ERR_PARSE);
+    expect_err("{\"a\":.5}", METRICS_PROM_ERR_PARSE);
+    expect_err("{\"a\":NaN}", METRICS_PROM_ERR_PARSE);
+    expect_err("{\"a\":Infinity}", METRICS_PROM_ERR_PARSE);
+    expect_err("{\"a\":-Infinity}", METRICS_PROM_ERR_PARSE);
+    expect_err("{\"a\":1e+}", METRICS_PROM_ERR_PARSE);
+    expect_err("{\"a\":-01}", METRICS_PROM_ERR_PARSE);
+    /* longest accepted number is 40 chars; 41 is refused */
+    {
+        char j[160];
+        char want[160];
+        memset(j, 0, sizeof j);
+        strcpy(j, "{\"a\":");
+        memset(j + 5, '7', 40);
+        strcpy(j + 45, "}");
+        snprintf(want, sizeof want, "adblock_a %.40s\n", j + 5);
+        expect_ok(j, want);
+        memset(j, 0, sizeof j);
+        strcpy(j, "{\"a\":");
+        memset(j + 5, '7', 41);
+        strcpy(j + 46, "}");
+        expect_err(j, METRICS_PROM_ERR_PARSE);
+        memset(j, 0, sizeof j);
+        strcpy(j, "{\"a\":");
+        memset(j + 5, '7', 100);   /* no closing brace: ends mid-number */
+        expect_err(j, METRICS_PROM_ERR_PARSE);
+    }
+    /* number running to the very end of the buffer */
+    expect_err("{\"a\":12", METRICS_PROM_ERR_PARSE);
+    expect_err("{\"a\":1.5e", METRICS_PROM_ERR_PARSE);
+    /* strings and escapes */
+    expect_ok("{\"a\\\"b\":1}", "adblock_a_b 1\n");
+    expect_ok("{\"a\\u0041\":1}", "adblock_aA 1\n");
+    expect_ok("{\"a\\u00e9b\":1}", "adblock_a_b 1\n");   /* \u above 0x7F becomes '?', then '_' */
+    expect_ok("{\"board\":\"x\\u0000y\"}", "adblock_info{board=\"x?y\"} 1\n");
+    expect_ok("{\"board\":\"\\\\\\\"\"}", "adblock_info{board=\"\\\\\\\"\"} 1\n");
+    expect_err("{\"a\":\"\\", METRICS_PROM_ERR_PARSE);
+    expect_err("{\"a\":\"\\u", METRICS_PROM_ERR_PARSE);
+    expect_err("{\"a\":\"\\u00", METRICS_PROM_ERR_PARSE);
+    expect_err("{\"a\":\"\\uZZZZ\"}", METRICS_PROM_ERR_PARSE);
+    /* an identity string longer than the label buffer is truncated, not refused */
+    {
+        char j[200];
+        char got[512]; size_t n;
+        strcpy(j, "{\"board\":\"");
+        memset(j + 10, 'b', 120);
+        strcpy(j + 130, "\"}");
+        int rc = run(j, sizeof got, got, sizeof got, &n);
+        CHECK(rc == METRICS_PROM_OK, "long label rc=%d", rc);
+        CHECK(n == strlen("adblock_info{board=\"") + 63 + strlen("\"} 1\n"), "long label len %zu", n);
+    }
+    /* embedded NUL honours json_len: NUL is neither whitespace nor an end marker */
+    {
+        static const char nul1[] = "{\"a\":1}\0{\"b\":2}";
+        char got[128]; size_t n = 7;
+        char *j = (char *)malloc(sizeof nul1 - 1);
+        memcpy(j, nul1, sizeof nul1 - 1);
+        int rc = metrics_json_to_prom(j, sizeof nul1 - 1, got, sizeof got, &n);
+        CHECK(rc == METRICS_PROM_ERR_PARSE && n == 0, "NUL then more JSON rc=%d n=%zu", rc, n);
+        rc = metrics_json_to_prom(j, 7, got, sizeof got, &n);   /* json_len cut at the NUL */
+        CHECK(rc == METRICS_PROM_OK && !strcmp(got, "adblock_a 1\n"), "prefix rc=%d", rc);
+        free(j);
+        static const char nul2[] = "{\"a\":\"x\0y\"}";
+        j = (char *)malloc(sizeof nul2 - 1);
+        memcpy(j, nul2, sizeof nul2 - 1);
+        rc = metrics_json_to_prom(j, sizeof nul2 - 1, got, sizeof got, &n);
+        CHECK(rc == METRICS_PROM_ERR_PARSE && n == 0, "NUL inside string rc=%d", rc);
+        free(j);
+    }
+    /* json_len = 0 with a non-NULL pointer */
+    {
+        char got[16]; size_t n = 3;
+        int rc = metrics_json_to_prom("{}", 0, got, sizeof got, &n);
+        CHECK(rc == METRICS_PROM_ERR_PARSE && n == 0, "json_len 0 rc=%d", rc);
+    }
+    /* duplicate keys and keys that sanitise alike: both emitted, no crash */
+    expect_ok("{\"a\":1,\"a\":2}", "adblock_a 1\nadblock_a 2\n");
+    expect_ok("{\"a-b\":1,\"a.b\":2}", "adblock_a_b 1\nadblock_a_b 2\n");
+    expect_ok("{\"\":1}", "adblock_ 1\n");
+    /* whitespace everywhere, nested arrays, empty containers */
+    expect_ok(" {\r\n\t\"a\" \t: [ 1 , 2 ] , \"o\" : { } , \"e\" : [ ] } ",
+              "adblock_a{idx=\"0\"} 1\nadblock_a{idx=\"1\"} 2\n");
+    expect_ok("{\"a\":[[1,2],[3]],\"k\":5}", "adblock_k 5\n");
+    expect_ok("{\"a\":[{\"x\":1},{\"x\":2}],\"k\":5}", "adblock_k 5\n");
+    /* depth exactly at the limit is fine, one past is refused */
+    expect_ok("{\"a\":{\"b\":{\"c\":[1]}}}", "adblock_a_b_c{idx=\"0\"} 1\n");
+    expect_err("{\"a\":{\"b\":{\"c\":[[1]]}}}", METRICS_PROM_ERR_DEPTH);
+    expect_ok("{\"a\":{\"b\":{\"c\":{}}}}", "");
+    expect_err("{\"a\":{\"b\":{\"c\":{}}}}x", METRICS_PROM_ERR_PARSE);
+    expect_err("{\"a\":{\"b\":{\"c\":{\"d\":{}}}}}", METRICS_PROM_ERR_DEPTH);
+    /* a long array: the index renders in full */
+    {
+        char j[1600]; size_t p = 0;
+        static char got[8192]; size_t n;
+        p += (size_t)snprintf(j + p, sizeof j - p, "{\"h\":[");
+        for (int i = 0; i < 300; i++) p += (size_t)snprintf(j + p, sizeof j - p, "%s0", i ? "," : "");
+        snprintf(j + p, sizeof j - p, "]}");
+        int rc = run(j, sizeof got, got, sizeof got, &n);
+        CHECK(rc == METRICS_PROM_OK && strstr(got, "adblock_h{idx=\"299\"} 0\n"), "idx 299 rc=%d", rc);
+    }
+}
+
+/* The worst /metrics document the firmware can produce: every integer at its
+ * widest, a full 8-entry pause_list, plus the up_rotations and dns_health keys.
+ * web_ui.cpp sizes: JSON buffer 3072 B, text buffer 6144 B. */
+static void test_worst_case_size(void)
+{
+    printf("worst-case size\n");
+    char j[3072];
+    const char *W = "4294967295";             /* widest uint32 */
+    const char *L = "9223372036854775807";    /* widest int64 (clock_epoch, uptime_s) */
+    size_t p = 0;
+#define A(...) p += (size_t)snprintf(j + p, sizeof j - p, __VA_ARGS__)
+    A("{\"upstream\":\"255.255.255.255\",\"upstream2\":\"255.255.255.255\","
+      "\"clock\":\"synced\",\"clock_src\":\"floor-no-rtc\",\"clock_epoch\":%s,\"uptime_s\":%s,", L, L);
+    const char *u32[] = { "queries_total","blocked","forwarded","tcp_queries","l2_blocked","l2_cached","l2_tx_fail",
+        "l2_fallthrough","l2_dns_fallthrough","wd_restarts","select_errors","l2_defer_lock_busy","l2_defer_snapshot",
+        "l2_log_dropped","census_dropped","case_mismatch","cache_probes","cache_hits","cache_evictions",
+        "cache_too_big","stale_served","coalesced","hedges_sent","hedged_completions","up_rotations",
+        "up_rotate_failures","upstream_timeouts","blocklist_count","pause_active","bypass_count","blocklist_dropped",
+        "blocklist_feed_failures","exceptions_loaded","exceptions_dropped","sd_bytes","heap_free","heap_largest",
+        "psram_free","dns_task_stack_hwm" };
+    for (size_t i = 0; i < sizeof u32 / sizeof u32[0]; i++) A("\"%s\":%s,", u32[i], W);
+    A("\"dns_task_alive\":false,\"cache_hit_rate\":100.0,\"upstream_inflight\":64,\"upstream_max\":64,"
+      "\"blocklist_loading\":false,\"blocklist_paused\":false,");
+    A("\"dropped\":{\"table_full\":%s,\"mbox_pressure\":%s},", W, W);
+    A("\"rejected\":{\"regex\":%s,\"wildcard\":%s,\"modifier\":%s,\"cosmetic\":%s,\"cidr\":%s,\"too_wide\":%s,"
+      "\"important_block\":%s},", W, W, W, W, W, W, W);
+    A("\"dns_health\":{\"probe_ok\":%s,\"probe_fail\":%s,\"probe_skipped\":%s,\"last_action\":2},", W, W, W);
+    A("\"sd_status\":\"open-failed\",\"flash_status\":\"loaded\",\"latency_us\":{");
+    const char *cats[] = { "blocked","cached","forwarded_total","forwarded_ourovh","forwarded_rtt","lookup","sendto" };
+    for (size_t i = 0; i < 7; i++)
+        A("%s\"%s\":{\"p50\":%s,\"p99\":%s,\"max\":%s,\"count\":%s}", i ? "," : "", cats[i], W, W, W, W);
+    A("},\"pause_list\":[");
+    for (int i = 0; i < 8; i++) A("%s{\"ip\":\"255.255.255.255\",\"remaining_s\":%s}", i ? "," : "", W);
+    A("]}");
+#undef A
+    CHECK(p < sizeof j, "worst-case JSON %zu overflowed the test buffer", p);
+    static char got[16384]; size_t n = 0;
+    int rc = run(j, sizeof got, got, sizeof got, &n);
+    printf("  worst-case JSON %zu B -> prom text %zu B (rc=%d)\n", p, n, rc);
+    CHECK(rc == METRICS_PROM_OK, "worst-case rc=%d", rc);
+    /* web_ui.cpp text buffer is 6144 B: require at least 1.5x margin. */
+    CHECK(n * 3 <= 6144 * 2, "worst-case text %zu B is too close to the 6144 B buffer", n);
+    size_t need = n + 1;
+    rc = run(j, need, got, sizeof got, &n);
+    CHECK(rc == METRICS_PROM_OK, "exact cap rc=%d", rc);
 }
 
 int main(void)
@@ -239,6 +393,8 @@ int main(void)
     test_errors();
     test_capacity();
     test_real();
+    test_edges();
+    test_worst_case_size();
     if (g_fail) { printf("%d FAILED\n", g_fail); return 1; }
     printf("all passed\n");
     return 0;

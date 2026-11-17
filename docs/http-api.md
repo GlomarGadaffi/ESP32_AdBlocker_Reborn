@@ -117,6 +117,10 @@ A single JSON object. Field names are exactly as emitted.
 | `l2_defer_snapshot` | int | L2-hook queries that deferred because a blocklist reload published underneath the verdict walk (#117). Flat outside a reload window. |
 | `wd_restarts` | int | Times the socket-path watchdog (#77) recreated `csock`/`usock` because wire traffic was arriving with no query progress for ~2s. Not reset by `/metrics/reset` (same convention as the `l2_*` counters). |
 | `select_errors` | int | `select()` failures `dns_task` has survived (#152). Before this the first one ended the task for good — DNS dead, web UI up, no reboot. Not reset by `/metrics/reset`. |
+| `dns_health.probe_ok` | int | DNS self-check probes (the board resolving a name through its own DNS port) that were answered, since boot. |
+| `dns_health.probe_fail` | int | Self-check probes that got no valid answer, since boot. |
+| `dns_health.probe_skipped` | int | Probe cycles that stood down (blocklist reloading, OTA upload in progress, no address yet, or the client ACL excludes the board's own address). |
+| `dns_health.last_action` | int | The latest self-check decision: `0` none, `1` warn, `2` reboot. |
 | `dns_task_alive` | bool | `false` means `dns_task` has exited (#153); `dns_task_stack_hwm` reads 0 in that state and means nothing. |
 | `case_mismatch` | int | DNS 0x20 (#72): replies whose question section didn't echo the exact case we sent. Observability only — never rejected; see `process_reply()`'s H2 check for why a hard reject isn't safe without first proving this stays ~0 against the real configured upstream. |
 | `l2_log_dropped` | int | L2 query-log staging ring (#124) overflows: entries the L2 hook couldn't hand to `dns_task` before the next tick because the 32-slot ring was still full. Dropped, not blocked — the L2 hook never waits on the log. A nonzero count means a burst outran the drain rate for that window, not a bug; which specific queries were lost isn't recorded, only the count. |
@@ -130,6 +134,8 @@ A single JSON object. Field names are exactly as emitted.
 | `coalesced` | int | Duplicate in-flight queries folded into one upstream request. |
 | `hedges_sent` | int | Hedged retransmits issued. |
 | `hedged_completions` | int | Answers that came back from a hedge rather than the original. |
+| `up_rotations` | int | Upstream source-port rotations completed: a fresh UDP socket swapped in for the upstream queries while the old one drains. |
+| `up_rotate_failures` | int | Rotations abandoned because no socket or no free port could be had. Non-zero means the upstream source port is not rotating. |
 | `dropped.table_full` | int | Queries dropped because the upstream table had no free slot. |
 | `dropped.mbox_pressure` | int | Queries dropped at the UDP receive mailbox drain cap. |
 | `upstream_timeouts` | int | Upstream requests that never got an answer. |
@@ -160,15 +166,18 @@ A single JSON object. Field names are exactly as emitted.
 | `dns_task_stack_hwm` | int | `dns_task` stack headroom, **bytes** — ESP-IDF's `uxTaskGetStackHighWaterMark()` returns bytes, not the words stock FreeRTOS documents (`freertos/task.h`). It is a minimum-ever, so a freshly booted board reads high until the task has been exercised. |
 | `latency_us` | object | See below. |
 
+`dns_health` is a nested object: `"dns_health":{"probe_ok":N,"probe_fail":N,"probe_skipped":N,"last_action":N}`.
+
 `dropped` is a nested object: `"dropped":{"table_full":N,"mbox_pressure":N}`.
 
 `latency_us` is an object of seven categories — `blocked`, `cached`,
 `forwarded_total`, `forwarded_ourovh`, `forwarded_rtt`, `lookup`, `sendto` —
 each `{"p50":N,"p99":N,"max":N,"count":N}` in microseconds.
 
-The whole response is built into a fixed 2048 B buffer and clamped to it;
-worst case today is roughly 1,750 B (`pause_list` can add up to `PAUSE_MAX`
-(8) entries at ~50 B each — see the `F15` comment in `dns_server.cpp`).
+The whole response is built into a fixed 3072 B buffer and clamped to it;
+the strict worst case is roughly 2,860 B (`pause_list` can add up to
+`PAUSE_MAX` (8) entries at ~50 B each — see the `F15` comment in
+`dns_server.cpp`), and real values are far smaller.
 
 ## `GET /metrics/prom`
 
@@ -192,7 +201,7 @@ separate list to maintain:
   handles that.
 
 If the metrics JSON was clamped to its buffer, or the text does not fit its
-6 KB buffer, the route answers `500 metrics unavailable` rather than send a
+6 KB buffer (a saturated worst-case document renders to about 3.4 KB), the route answers `500 metrics unavailable` rather than send a
 partial page.
 
 **What a scraper must send.** The route is behind the same `auth_wrap`
@@ -215,23 +224,13 @@ curl -sk -c jar -X POST -d 'user=U&pass=P' https://HOST/login -o /dev/null
 curl -sk -b jar https://HOST/metrics/prom
 ```
 
-A Prometheus version whose scrape config supports `http_headers` can send the
-cookie itself, with `sid` copied from the jar and replaced when it expires:
-
-```yaml
-scrape_configs:
-  - job_name: adblock
-    scheme: https
-    metrics_path: /metrics/prom
-    scrape_interval: 15s
-    tls_config:
-      insecure_skip_verify: true     # self-signed; pin the cert instead if you can
-    http_headers:
-      Cookie:
-        values: ["sid=PASTE_SID_FROM_THE_COOKIE_JAR"]
-    static_configs:
-      - targets: ["192.168.1.2:443"]
-```
+If your Prometheus supports sending a static `Cookie` header on scrapes, it
+could carry the session cookie itself. Check your version's documentation
+for the exact option name and syntax before relying on it: this has not been
+verified against a Prometheus release. The cookie value must be copied from
+the login by hand and replaced whenever it expires (30 min idle, 12 h
+absolute), so a sidecar or the textfile arrangement above is the more
+robust choice.
 
 ## `GET /lastwords`
 

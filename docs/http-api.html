@@ -77,6 +77,9 @@ curl -k -b cookies.txt -H "X-CSRF: $TOKEN" -X POST https://esp32adblock.local/re
 <tr><td><code>queries_total</code></td><td>int</td><td>Total DNS queries received on standard socket paths.</td></tr>
 <tr><td><code>blocked</code></td><td>int</td><td>Total queries sinkholed on socket path.</td></tr>
 <tr><td><code>forwarded</code></td><td>int</td><td>Total queries forwarded to upstream resolver.</td></tr>
+<tr><td><code>up_rotations</code></td><td>int</td><td>Upstream source-port rotations completed.</td></tr>
+<tr><td><code>up_rotate_failures</code></td><td>int</td><td>Rotations abandoned (no socket or no free port).</td></tr>
+<tr><td><code>dns_health</code></td><td>object</td><td>DNS self-check: <code>probe_ok</code>, <code>probe_fail</code>, <code>probe_skipped</code> counters since boot and <code>last_action</code> (0 none, 1 warn, 2 reboot).</td></tr>
 <tr><td><code>l2_blocked</code></td><td>int</td><td>Queries blocked directly in L2 Ethernet frame hook (~1.8ms path).</td></tr>
 <tr><td><code>l2_cached</code></td><td>int</td><td>Forward-cache hits served directly in L2 Ethernet frame hook.</td></tr>
 <tr><td><code>cache_hit_rate</code></td><td>float</td><td>Cache hit percentage (<code>cache_hits / cache_probes * 100</code>).</td></tr>
@@ -90,7 +93,7 @@ curl -k -b cookies.txt -H "X-CSRF: $TOKEN" -X POST https://esp32adblock.local/re
 
 <h2>Prometheus Metrics (<code>GET /metrics/prom</code>)</h2>
 <p>The <code>/metrics</code> document as Prometheus text exposition 0.0.4, converted from the same JSON. Numbers become <code>adblock_&lt;name&gt;</code> with nested keys joined by <code>_</code> (<code>latency_us.blocked.p99</code> becomes <code>adblock_latency_us_blocked_p99</code>), bools become <code>1</code>/<code>0</code>, and <code>upstream</code> and <code>clock_src</code> become labels on one <code>adblock_info</code> line. Other strings and <code>pause_list</code> are dropped.</p>
-<p><b>Auth:</b> the route is behind the same session gate as every other route. A scraper must <code>POST /login</code> once, keep the <code>sid</code> cookie (30 min idle, 12 h absolute, 4 sessions device-wide), and log in again when it receives a <code>303</code> to <code>/login</code>. The certificate is self-signed. See <code>docs/http-api.md</code> for a curl example and a <code>scrape_config</code>.</p>
+<p><b>Auth:</b> the route is behind the same session gate as every other route. A scraper must <code>POST /login</code> once, keep the <code>sid</code> cookie (30 min idle, 12 h absolute, 4 sessions device-wide), and log in again when it receives a <code>303</code> to <code>/login</code>. The certificate is self-signed. Stock Prometheus has no login step, so the usual arrangement is a sidecar or a cron job that holds the session; see <code>docs/http-api.md</code> for a curl example.</p>
 
 <h2>Crash Flight Recorder (<code>GET /lastwords</code>)</h2>
 <p>Retrieves the RTC-persisted telemetry buffer recorded immediately before the previous system restart or crash:</p>

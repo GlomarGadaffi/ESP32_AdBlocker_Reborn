@@ -72,6 +72,7 @@ extern "C" void dns_sink_reboot(void);
 extern "C" bool dns_sink_setup_ap_active(void);
 extern "C" const char *dns_sink_hostname(void);
 extern "C" const char *dns_sink_lan_ip(void);
+extern "C" void dns_sink_health_ota_busy(bool busy);   /* DNS self-check stands down during an upload */
 
 /* ── helpers ─────────────────────────────────────────────────────── */
 
@@ -1865,8 +1866,10 @@ static esp_err_t handle_alarms(httpd_req_t *r)
  * for the same reason every other static page buffer here is: the single
  * httpd task runs one handler at a time (CONTRIBUTING.md, "Single-task
  * httpd"), and both handlers finish with the buffer before they return. */
-static EXT_RAM_BSS_ATTR char s_metrics_json[2048];
-/* Prometheus text for the same document: about 3 KB today, so 6 KB leaves
+static EXT_RAM_BSS_ATTR char s_metrics_json[3072];
+/* Prometheus text for the same document. The JSON is under 2 KB at worst
+ * today; tests/metrics_prom_test.c test_worst_case_size renders a saturated
+ * 2.8 KB document to ~3.4 KB of text, so 3 KB of JSON and 6 KB of text leave
  * room for new fields. PSRAM, like the other page buffers. */
 static EXT_RAM_BSS_ATTR char s_metrics_prom[6144];
 
@@ -1970,7 +1973,9 @@ static esp_err_t handle_metrics_view(httpd_req_t *r)
     " ['census_dropped','Census sightings dropped','n:drops',1],\n"
     " ['wd_restarts','Watchdog restarts','n:restarts',1],\n"
     " ['select_errors','select() errors survived','n:errors',1],\n"
-    " ['dns_task_alive','DNS task alive','B',0]]],\n"
+    " ['dns_task_alive','DNS task alive','B',0],\n"
+    " ['dns_health.probe_ok','DNS self-checks passed','n:checks',0],\n"
+    " ['dns_health.probe_fail','DNS self-check failures','n:checks',1]]],\n"
     "['Forward cache',[\n"
     " ['cache_probes','Probes','n:probes',0],\n"
     " ['cache_hits','Hits','n:hits',0],\n"
@@ -1984,6 +1989,8 @@ static esp_err_t handle_metrics_view(httpd_req_t *r)
     " ['upstream_timeouts','Timeouts','n:timeouts',1],\n"
     " ['hedges_sent','Hedged retransmits sent','n:sends',0],\n"
     " ['hedged_completions','Answered by the hedge','n:answers',0],\n"
+    " ['up_rotations','Upstream port rotations','n:rotations',0],\n"
+    " ['up_rotate_failures','Port rotation failures','n:fails',1],\n"
     " ['dropped.table_full','Dropped: table full','n:drops',1],\n"
     " ['dropped.mbox_pressure','Dropped: mailbox pressure','n:drops',1]]],\n"
     "['Blocklist',[\n"
@@ -2538,8 +2545,12 @@ static esp_err_t handle_ota_update(httpd_req_t *r)
     }
     ESP_LOGI(TAG, "OTA: writing %d bytes to %s", (int)r->content_len, update_part->label);
 
+    /* The DNS self-check stands down for the upload so a flash-write stall is
+     * not read as a dead resolver. Cleared on every exit below. */
+    dns_sink_health_ota_busy(true);
     esp_ota_handle_t ota;
     if (esp_ota_begin(update_part, (size_t)r->content_len, &ota) != ESP_OK) {
+        dns_sink_health_ota_busy(false);
         httpd_resp_send_err(r, HTTPD_500_INTERNAL_SERVER_ERROR, "esp_ota_begin failed");
         return ESP_FAIL;
     }
@@ -2556,12 +2567,14 @@ static esp_err_t handle_ota_update(httpd_req_t *r)
     }
     if (!ok) {
         esp_ota_abort(ota);
+        dns_sink_health_ota_busy(false);
         httpd_resp_send_err(r, HTTPD_500_INTERNAL_SERVER_ERROR, "upload interrupted — old firmware still running");
         return ESP_FAIL;
     }
 
     esp_err_t end_err = esp_ota_end(ota);
     if (end_err != ESP_OK) {
+        dns_sink_health_ota_busy(false);
         httpd_resp_send_err(r, HTTPD_500_INTERNAL_SERVER_ERROR,
             end_err == ESP_ERR_OTA_VALIDATE_FAILED
                 ? "image validation failed (not a firmware image, or not signed with this project's key) — old firmware still running"
@@ -2569,6 +2582,7 @@ static esp_err_t handle_ota_update(httpd_req_t *r)
         return ESP_FAIL;
     }
     if (esp_ota_set_boot_partition(update_part) != ESP_OK) {
+        dns_sink_health_ota_busy(false);
         httpd_resp_send_err(r, HTTPD_500_INTERNAL_SERVER_ERROR,
             "esp_ota_set_boot_partition failed — old firmware still running");
         return ESP_FAIL;
@@ -2586,6 +2600,7 @@ static esp_err_t handle_ota_update(httpd_req_t *r)
                  "</body></html>", HTTPD_RESP_USE_STRLEN);
     httpd_resp_send_chunk(r, nullptr, 0);
     vTaskDelay(pdMS_TO_TICKS(300));
+    dns_sink_health_ota_busy(false);   /* if the reboot is ignored, the self-check resumes */
     dns_sink_reboot();
     return ESP_OK;
 }
@@ -3191,7 +3206,7 @@ bool web_ui_start(DnsSinkServer *dns)
     cfg.prvtkey_pem      = (const uint8_t *)key;
     cfg.prvtkey_len      = key_len;
     cfg.port_secure      = 443;
-    cfg.httpd.max_uri_handlers = 50;   /* 48 registered with /metrics/prom (47 with /alarms, 44 as of #73) — keep headroom */
+    cfg.httpd.max_uri_handlers = 54;   /* 48 registered with /metrics/prom (47 with /alarms, 44 as of #73) — headroom for the pause-schedule routes */
     cfg.httpd.max_resp_headers = 16;   /* 5 hardening headers + cookie + Location + type */
     cfg.httpd.stack_size       = 16384;
     /* Recycle the least-recently-used connection instead of refusing new ones
