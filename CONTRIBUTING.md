@@ -155,6 +155,18 @@ retry-spin in the RX hook.
 The RX hook takes the whitelist mutex non-blocking; the socket path uses a
 bounded 2 ms take (#37). NVS commits always happen outside the lock.
 
+## Running the host tests
+
+```sh
+sh tests/run_host_tests.sh              # all tests in tests/host_tests.txt
+sh tests/run_host_tests.sh rule_parse_test   # one test
+```
+
+Each test builds with ASan + UBSan and prints `PASS`/`FAIL name`; add a new
+test by adding a line to `tests/host_tests.txt`. After a firmware build,
+`python3 tools/check_build.py --build-dir <dir> --board <board>` checks app
+size headroom and required/forbidden sdkconfig symbols (CI runs it).
+
 ## Docs
 
 Every claim in `README.md`, `CHANGELOG.md`, and `docs/` should be checkable
