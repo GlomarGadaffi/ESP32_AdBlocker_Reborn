@@ -1987,8 +1987,8 @@ static void halt_or_rollback(const char *reason)
  * (logged once) rather than failed: with an allow-list that omits loopback
  * the self-check is off, which is safer than a reboot loop. Pause and bypass
  * are per client IP and never match 127.0.0.1. Every probe is one more count
- * in queries_total and one query-log line from 127.0.0.1 (query_log.c would
- * have to drop that source to hide it; it is outside this file).
+ * in queries_total; query_log_record() drops source 127.0.0.1 (host byte
+ * order), so the probe leaves no query-log line, history or top-list entry.
  *
  * Reboot gating beyond dns_health.c's streak: never before one OK this boot,
  * and at most DNS_HEALTH_MAX_CONSEC_REBOOTS in a row (RTC counter in
@@ -2373,7 +2373,9 @@ extern "C" void app_main(void)
     dot_init_nvs();
     acl_init();
     bypass_init();
-    pause_init();
+    if (!pause_init()) {
+        ESP_LOGE(TAG, "pause_init failed - pause/schedule unavailable, blocking stays on");
+    }
     query_log_init();
     census_init();
 

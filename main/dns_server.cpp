@@ -1318,11 +1318,14 @@ void DnsSinkServer::upstream_ip(char *out, size_t cap) const {
 }
 
 void DnsSinkServer::stop() {
+    /* dns_task owns every socket it opened and closes them all in its done:
+     * path; the loop re-checks _running at least every 100 ms (select
+     * timeout). This used to close _client_fd/_upstream_fd from here as well,
+     * which could race a source-port rotation or reopen_sockets(): the task
+     * would then close an fd stop() had already closed (now held as s_drain_fd,
+     * or re-published into _upstream_fd), and by then the number may belong to
+     * another socket. Only the flag is set here. */
     _running.exchange(false, std::memory_order_acq_rel);
-    int fd = _client_fd.exchange(-1, std::memory_order_acq_rel);
-    if (fd != -1) { shutdown(fd, SHUT_RDWR); close(fd); }
-    fd = _upstream_fd.exchange(-1, std::memory_order_acq_rel);
-    if (fd != -1) { shutdown(fd, SHUT_RDWR); close(fd); }
     if (_taskStarted && _exitSem) {
         xSemaphoreTake(_exitSem, pdMS_TO_TICKS(1500));
         _taskStarted = false;
@@ -1785,7 +1788,7 @@ void DnsSinkServer::run_loop()
                 if (sel_err_run == 1 || (sel_err_run % 10) == 0)
                     ESP_LOGE(TAG, "select: %d (%" PRIu32 " in a row) — recovering, not exiting",
                              e, sel_err_run);
-                if (!_running.load(std::memory_order_acquire)) break;   /* stop() closed our fds */
+                if (!_running.load(std::memory_order_acquire)) break;   /* stop() asked us to exit */
                 if (sel_err_run >= 50) {
                     ESP_LOGE(TAG, "select: still failing after %" PRIu32 " tries — restarting",
                              sel_err_run);
@@ -2070,6 +2073,8 @@ void DnsSinkServer::run_loop()
                 if ((ntohs(hdr->flags) & 0x8000) || ntohs(hdr->qdcount) == 0) continue;
 
                 int64_t t_recv = esp_timer_get_time();
+                /* Includes the DNS self-check's one query from 127.0.0.1 every
+                 * 10 s (dns_sink.cpp); query_log_record() drops that source. */
                 s_cnt_total++;
 
                 /* parse QNAME */
@@ -2659,6 +2664,10 @@ extern "C" uint32_t dns_sink_l2_cached(void);
 extern "C" uint32_t dns_sink_l2_tx_fail(void);
 extern "C" uint32_t dns_sink_l2_defer_lock_busy(void);   /* (#117) */
 extern "C" uint32_t dns_sink_l2_defer_snapshot(void);    /* (#117) */
+extern "C" uint32_t dns_sink_health_probe_ok(void);      /* dns_sink.cpp self-check */
+extern "C" uint32_t dns_sink_health_probe_fail(void);
+extern "C" uint32_t dns_sink_health_probe_skipped(void);
+extern "C" uint32_t dns_sink_health_last_action(void);
 
 static void do_metrics_reset(void)
 {
@@ -2743,6 +2752,10 @@ int dns_server_metrics_json(char *out, size_t cap)
         "\"l2_blocked\":%" PRIu32 ",\"l2_cached\":%" PRIu32 ",\"l2_tx_fail\":%" PRIu32 ","
         "\"l2_fallthrough\":%" PRIu32 ",\"l2_dns_fallthrough\":%" PRIu32 ",\"wd_restarts\":%" PRIu32 ","
         "\"select_errors\":%" PRIu32 ",\"dns_task_alive\":%s,"
+        /* DNS self-check (dns_sink.cpp): probe outcomes since boot and the
+         * latest decision, 0 none / 1 warn / 2 reboot. */
+        "\"dns_health\":{\"probe_ok\":%" PRIu32 ",\"probe_fail\":%" PRIu32
+        ",\"probe_skipped\":%" PRIu32 ",\"last_action\":%" PRIu32 "},"
         "\"l2_defer_lock_busy\":%" PRIu32 ",\"l2_defer_snapshot\":%" PRIu32 ","
         "\"l2_log_dropped\":%" PRIu32 ","
         "\"census_dropped\":%" PRIu32 ","
@@ -2780,6 +2793,8 @@ int dns_server_metrics_json(char *out, size_t cap)
         dns_sink_l2_blocked(), dns_sink_l2_cached(), dns_sink_l2_tx_fail(),
         dns_sink_l2_fallthrough(), dns_sink_l2_dns_fallthrough(), s_cnt_wd_restarts,
         s_cnt_select_err, s_dns_task_handle ? "true" : "false",   /* (#152, #153) */
+        dns_sink_health_probe_ok(), dns_sink_health_probe_fail(),
+        dns_sink_health_probe_skipped(), dns_sink_health_last_action(),
         dns_sink_l2_defer_lock_busy(), dns_sink_l2_defer_snapshot(),
         dns_sink_l2log_dropped(),
         dns_sink_census_dropped(),
@@ -2857,12 +2872,18 @@ int dns_server_metrics_json(char *out, size_t cap)
      * it there (or past it, from the very first unguarded snprintf() above).
      * handle_metrics() then does httpd_resp_send(r, json, n) against a fixed
      * 2048 B buffer, so an unclamped n ships whatever .bss sits after json[]
-     * to an unauthenticated client as unterminated JSON. Unreachable today —
-     * worst case is now ~1,810 B (incl. up_rotations/up_rotate_failures) (was ~1,323 B before #105/#108's
-     * pause_list/clock_epoch additions: PAUSE_MAX=8 entries at ~50 B each is
-     * the largest single addition) — against a 2048 B cap, less headroom
-     * than the old estimate implied. Re-check this number the next time
-     * something is added here rather than trusting it stays stale-safe. */
+     * to an unauthenticated client as unterminated JSON. Re-derived from the
+     * format strings (every uint32 counter at 10 digits, clock/uptime at 20,
+     * longest sd/flash status strings, 7 latency categories x 4 fields at
+     * 10 digits, PAUSE_MAX=8 pause_list entries at 15-char IPs): the strict
+     * worst case is ~2,860 B (fixed main part 1,838 + latency 608 + pause
+     * list 416, incl. the dns_health object), NOT the ~1,810 B once written
+     * here. Real values are far smaller (counters of 5-7 digits, a pause
+     * list of 0-2 entries), so this is a truncation risk only on a long-lived
+     * busy box, and the clamp below turns it into a cut-off document rather
+     * than an overread. The buffer in web_ui.cpp (s_metrics_json[3072]) is
+     * below that worst case; 3072 B covers it with margin. Re-derive this
+     * number the next time something is added here. */
     if (n > (int)cap - 1) n = (int)cap - 1;
     return n;
 }

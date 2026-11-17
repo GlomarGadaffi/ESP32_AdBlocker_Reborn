@@ -9,6 +9,8 @@
 
 static const char *TAG = "qlog";
 
+#define QLOG_LOOPBACK_HBO 0x7F000001u   /* 127.0.0.1, host byte order */
+
 /* ── ring buffer ──────────────────────────────────────────────────── */
 static QLogEntry *s_ring = NULL;
 static _Atomic uint32_t s_head = 0;   /* next write slot (mod QLOG_SIZE) */
@@ -58,6 +60,12 @@ bool query_log_init(void)
 void query_log_record(const char *domain, uint16_t qtype, uint32_t client_ip_hbo,
                       bool blocked, bool rewritten)
 {
+    /* The DNS self-check (dns_sink.cpp) sends one query from 127.0.0.1 every
+     * 10 s. It is not a client: keep it out of the log, the history graph, the
+     * top lists and the crash breadcrumb ring. Every caller passes host byte
+     * order (ntohl(sin_addr.s_addr), tc.peer_ip, src_hbo). */
+    if (client_ip_hbo == QLOG_LOOPBACK_HBO) return;
+
     /* (#71) Cheap RTC-memory breadcrumb, independent of the PSRAM ring below:
      * survives a panic/watchdog reset the ring's own PSRAM contents can't be
      * trusted through. Recorded even if the PSRAM ring failed to allocate. */
