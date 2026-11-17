@@ -25,6 +25,7 @@
 #include "web_tls.h"
 #include "web_auth.h"
 #include "web_parse.h"   /* host-fuzzed request parsers (tests/fuzz/fuzz_web_parse.c) */
+#include "metrics_prom.h" /* /metrics JSON to Prometheus text (tests/fuzz/fuzz_metrics_prom.c) */
 #include <cstring>
 #include <strings.h>
 #include <cstdio>
@@ -1860,14 +1861,44 @@ static esp_err_t handle_alarms(httpd_req_t *r)
     return httpd_resp_send(r, body, n > 0 ? n : 0);
 }
 
+/* One metrics JSON buffer for /metrics and /metrics/prom. Sharing it is safe
+ * for the same reason every other static page buffer here is: the single
+ * httpd task runs one handler at a time (CONTRIBUTING.md, "Single-task
+ * httpd"), and both handlers finish with the buffer before they return. */
+static EXT_RAM_BSS_ATTR char s_metrics_json[2048];
+/* Prometheus text for the same document: about 3 KB today, so 6 KB leaves
+ * room for new fields. PSRAM, like the other page buffers. */
+static EXT_RAM_BSS_ATTR char s_metrics_prom[6144];
+
 static esp_err_t handle_metrics(httpd_req_t *r)
 {
-    static EXT_RAM_BSS_ATTR char json[2048];
-    int n = dns_server_metrics_json(json, sizeof(json));
+    int n = dns_server_metrics_json(s_metrics_json, sizeof(s_metrics_json));
     httpd_resp_set_type(r, "application/json");
     httpd_resp_set_hdr(r, "Cache-Control", "no-store");
-    httpd_resp_send(r, json, n > 0 ? n : 0);
+    httpd_resp_send(r, s_metrics_json, n > 0 ? n : 0);
     return ESP_OK;
+}
+
+/* ── GET /metrics/prom — the same metrics as Prometheus text ──────────
+ * Registered through auth_wrap like /metrics, so it has exactly the same
+ * session requirement. The text is converted from the JSON dns_server_metrics_json()
+ * builds (metrics_prom.c), so there is no second list of metrics to keep in
+ * step. If the JSON was clamped to its buffer or the text does not fit, the
+ * converter reports an error and the scraper gets a 500 instead of a
+ * half-rendered page. */
+static esp_err_t handle_metrics_prom(httpd_req_t *r)
+{
+    int n = dns_server_metrics_json(s_metrics_json, sizeof(s_metrics_json));
+    size_t plen = 0;
+    if (n <= 0 ||
+        metrics_json_to_prom(s_metrics_json, (size_t)n, s_metrics_prom,
+                             sizeof(s_metrics_prom), &plen) != METRICS_PROM_OK) {
+        httpd_resp_send_err(r, HTTPD_500_INTERNAL_SERVER_ERROR, "metrics unavailable");
+        return ESP_FAIL;
+    }
+    httpd_resp_set_type(r, "text/plain; version=0.0.4");
+    httpd_resp_set_hdr(r, "Cache-Control", "no-store");
+    return httpd_resp_send(r, s_metrics_prom, (ssize_t)plen);
 }
 
 /* ── GET /metrics/view ─ rendered dashboard over /metrics (#126) ──── */
@@ -3160,7 +3191,7 @@ bool web_ui_start(DnsSinkServer *dns)
     cfg.prvtkey_pem      = (const uint8_t *)key;
     cfg.prvtkey_len      = key_len;
     cfg.port_secure      = 443;
-    cfg.httpd.max_uri_handlers = 50;   /* 47 registered with /alarms (44 as of #73) — keep headroom */
+    cfg.httpd.max_uri_handlers = 50;   /* 48 registered with /metrics/prom (47 with /alarms, 44 as of #73) — keep headroom */
     cfg.httpd.max_resp_headers = 16;   /* 5 hardening headers + cookie + Location + type */
     cfg.httpd.stack_size       = 16384;
     /* Recycle the least-recently-used connection instead of refusing new ones
@@ -3198,6 +3229,7 @@ bool web_ui_start(DnsSinkServer *dns)
         { "/logout",              HTTP_POST, H(handle_logout)        },
         { "/",                    HTTP_GET,  H(handle_status)        },
         { "/metrics",             HTTP_GET,  H(handle_metrics)       },
+        { "/metrics/prom",        HTTP_GET,  H(handle_metrics_prom)  },
         { "/alarms",              HTTP_GET,  H(handle_alarms)        },
         { "/metrics/view",        HTTP_GET,  H(handle_metrics_view)  },
         { "/lastwords",           HTTP_GET,  H(handle_lastwords)     },

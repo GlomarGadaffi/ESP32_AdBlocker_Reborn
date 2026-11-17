@@ -8,3 +8,5 @@ rule_parse_test: tests/rule_parse_test.c main/domain.c
 web_parse_test: tests/web_parse_test.c main/web_parse.c
 verdict_test: tests/verdict_test.c main/bl_verdict.c main/bl_rank.c main/bl_table.c main/domain.c
 upstream_port_test: tests/upstream_port_test.c main/upstream_port.c
+metrics_prom_test: tests/metrics_prom_test.c main/metrics_prom.c
+dns_health_test: tests/dns_health_test.c main/dns_health.c

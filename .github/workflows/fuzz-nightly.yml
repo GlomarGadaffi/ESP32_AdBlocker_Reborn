@@ -22,6 +22,8 @@ jobs:
             max_len: 512
           - target: web_parse
             max_len: 512
+          - target: metrics_prom
+            max_len: 4096
     steps:
       - name: Check out repository
         uses: actions/checkout@v4

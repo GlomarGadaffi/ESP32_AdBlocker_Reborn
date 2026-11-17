@@ -41,6 +41,7 @@ curl -k -b cookies.txt -H "X-CSRF: $TOKEN" -X POST https://esp32adblock.local/re
 <tr><td><code>POST</code></td><td><code>/logout</code></td><td>Destroy active session and invalidate cookie.</td></tr>
 <tr><td><code>GET</code></td><td><code>/</code></td><td>Main switchboard status dashboard. Polls <code>/metrics</code> every 10s without full page reload.</td></tr>
 <tr><td><code>GET</code></td><td><code>/metrics</code></td><td>Raw JSON telemetry, counter states, and latency histograms.</td></tr>
+<tr><td><code>GET</code></td><td><code>/metrics/prom</code></td><td>The same metrics as Prometheus text exposition (<code>text/plain; version=0.0.4</code>). Same session requirement as <code>/metrics</code>.</td></tr>
 <tr><td><code>GET</code></td><td><code>/metrics/view</code></td><td>Rendered HTML dashboard covering all metrics with auto-refresh.</td></tr>
 <tr><td><code>POST</code></td><td><code>/metrics/reset</code></td><td>Reset volatile counters and histograms to zero.</td></tr>
 <tr><td><code>POST</code></td><td><code>/reload</code></td><td>Trigger immediate asynchronous blocklist re-download and index rebuild.</td></tr>
@@ -86,6 +87,10 @@ curl -k -b cookies.txt -H "X-CSRF: $TOKEN" -X POST https://esp32adblock.local/re
 <tr><td><code>latency_us</code></td><td>object</td><td>Microsecond percentiles (p50, p99, max) for <code>blocked</code>, <code>cached</code>, and <code>forwarded</code>.</td></tr>
 </tbody>
 </table>
+
+<h2>Prometheus Metrics (<code>GET /metrics/prom</code>)</h2>
+<p>The <code>/metrics</code> document as Prometheus text exposition 0.0.4, converted from the same JSON. Numbers become <code>adblock_&lt;name&gt;</code> with nested keys joined by <code>_</code> (<code>latency_us.blocked.p99</code> becomes <code>adblock_latency_us_blocked_p99</code>), bools become <code>1</code>/<code>0</code>, and <code>upstream</code> and <code>clock_src</code> become labels on one <code>adblock_info</code> line. Other strings and <code>pause_list</code> are dropped.</p>
+<p><b>Auth:</b> the route is behind the same session gate as every other route. A scraper must <code>POST /login</code> once, keep the <code>sid</code> cookie (30 min idle, 12 h absolute, 4 sessions device-wide), and log in again when it receives a <code>303</code> to <code>/login</code>. The certificate is self-signed. See <code>docs/http-api.md</code> for a curl example and a <code>scrape_config</code>.</p>
 
 <h2>Crash Flight Recorder (<code>GET /lastwords</code>)</h2>
 <p>Retrieves the RTC-persisted telemetry buffer recorded immediately before the previous system restart or crash:</p>

@@ -49,6 +49,7 @@ metrics fields from `dns_server_metrics_json()` in `dns_server.cpp`.
 | POST | `/logout` | Destroy the current session and clear the cookie. |
 | GET | `/` | Status page (Dashboard + tabs). Polls `GET /metrics` every 10 s and patches the stat chips, the pause-countdown table, and the clock line in place — no full-page reload, so in-progress typing in the Check-domain / Whitelist boxes survives a tick (#105, #108, PR #134). |
 | GET | `/metrics` | JSON counters and latency histograms — see below. |
+| GET | `/metrics/prom` | The same metrics as Prometheus text exposition, for a scraper — see below. Same session requirement as `/metrics`. |
 | GET | `/metrics/view` | Rendered dashboard over `/metrics` (#126). Static page; the grouping lives in its JS and it polls `/metrics` every 10 s, pausing while the tab is hidden. Fields the grouping does not claim are still shown, under "Other (ungrouped)". |
 | GET | `/lastwords` | JSON crash flight recorder (#71) — see below. |
 | POST | `/metrics/reset` | Zero the counters and histograms. |
@@ -168,6 +169,69 @@ each `{"p50":N,"p99":N,"max":N,"count":N}` in microseconds.
 The whole response is built into a fixed 2048 B buffer and clamped to it;
 worst case today is roughly 1,750 B (`pause_list` can add up to `PAUSE_MAX`
 (8) entries at ~50 B each — see the `F15` comment in `dns_server.cpp`).
+
+## `GET /metrics/prom`
+
+The `/metrics` document rendered as Prometheus text exposition format 0.0.4
+(`Content-Type: text/plain; version=0.0.4`). It is converted from the same
+JSON by `main/metrics_prom.c`, so every numeric field above is here with no
+separate list to maintain:
+
+- A number becomes `adblock_<name>`, with nested keys joined by `_`:
+  `queries_total` → `adblock_queries_total`, `dropped.table_full` →
+  `adblock_dropped_table_full`, `latency_us.blocked.p99` →
+  `adblock_latency_us_blocked_p99`. The number text is passed through as is.
+- A bool becomes `1` or `0` (`adblock_dns_task_alive`).
+- An array of numbers becomes `adblock_<name>{idx="N"}`. None exists today.
+- Strings are not metrics and are dropped, except four identity strings that
+  become labels on one line, `adblock_info{version="…",board="…",upstream="…",clock_src="…"} 1`.
+  Only the ones present in `/metrics` appear; today that is `upstream` and
+  `clock_src`. `pause_list` (an array of objects) is dropped.
+- No `# HELP` or `# TYPE` lines: every series is untyped. Counters that
+  `/metrics/reset` zeroes will look like a counter reset to `rate()`, which
+  handles that.
+
+If the metrics JSON was clamped to its buffer, or the text does not fit its
+6 KB buffer, the route answers `500 metrics unavailable` rather than send a
+partial page.
+
+**What a scraper must send.** The route is behind the same `auth_wrap`
+session gate as every other route, and there is no token or basic-auth
+alternative: without a valid `sid` cookie it answers `303` to `/login`, which
+a scraper sees as a failed scrape. The session is a login cookie that expires
+after 30 minutes idle or 12 hours absolute, and the device keeps at most 4
+sessions at once, so the scraper must (1) `POST /login` with `user` and `pass`
+once, keep the `sid` cookie, (2) scrape at least every 30 minutes so it never
+idles out, and (3) log in again when it gets the `303`, no more often than
+that (every login takes a session slot a browser may need, and 5 failed logins
+lock out for 60 s). The certificate is self-signed, so the scraper must
+either trust it or skip verification. Stock Prometheus has no login step, so
+the usual arrangement is a small sidecar that holds the session and serves
+the text, or a cron job that fetches it with curl into a file for
+`node_exporter`'s textfile collector:
+
+```sh
+curl -sk -c jar -X POST -d 'user=U&pass=P' https://HOST/login -o /dev/null
+curl -sk -b jar https://HOST/metrics/prom
+```
+
+A Prometheus version whose scrape config supports `http_headers` can send the
+cookie itself, with `sid` copied from the jar and replaced when it expires:
+
+```yaml
+scrape_configs:
+  - job_name: adblock
+    scheme: https
+    metrics_path: /metrics/prom
+    scrape_interval: 15s
+    tls_config:
+      insecure_skip_verify: true     # self-signed; pin the cert instead if you can
+    http_headers:
+      Cookie:
+        values: ["sid=PASTE_SID_FROM_THE_COOKIE_JAR"]
+    static_configs:
+      - targets: ["192.168.1.2:443"]
+```
 
 ## `GET /lastwords`
 
