@@ -107,8 +107,31 @@ static void test_oversize(void)
     CHECK(!web_sched_form_parse("slot=0&spec=", NULL), "NULL out rejected");
 }
 
+static void test_nul_and_duplicates(void)
+{
+    web_sched_form_t f;
+    /* %00 would cut the decoded spec short and hide the trailing junk */
+    CHECK(!web_sched_form_parse("slot=0&spec=daily+09:00-17:00%00junk", &f), "%%00 in spec rejected");
+    CHECK(!web_sched_form_parse("slot=0%00&spec=daily+09:00-17:00", &f), "%%00 in slot rejected");
+    CHECK(!web_sched_form_parse("utc_offset_min=60%00&x=1", &f), "%%00 in offset rejected");
+    /* repeated fields are ambiguous */
+    CHECK(!web_sched_form_parse("slot=1&slot=2&spec=daily+09:00-17:00", &f), "duplicate slot rejected");
+    CHECK(!web_sched_form_parse("slot=1&spec=daily+09:00-17:00&spec=", &f), "duplicate spec rejected");
+    CHECK(!web_sched_form_parse("utc_offset_min=60&utc_offset_min=120", &f), "duplicate offset rejected");
+    /* a key that is only a suffix of another is not a duplicate */
+    CHECK(web_sched_form_parse("xslot=9&slot=1&spec=daily+09:00-17:00", &f) && f.slot == 1,
+          "xslot is not slot");
+    /* sign and whitespace forms of the offset */
+    CHECK(!web_sched_form_parse("utc_offset_min=%2B60", &f), "+60 rejected");
+    CHECK(!web_sched_form_parse("utc_offset_min=+60", &f), "plus-as-space rejected");
+    CHECK(!web_sched_form_parse("utc_offset_min=60+", &f), "trailing space rejected");
+    CHECK(!web_sched_form_parse("slot=%200&spec=", &f), "space-prefixed slot rejected");
+    CHECK(!web_sched_form_parse("slot=0&spec=+daily+09:00-17:00", &f), "leading-space spec rejected");
+}
+
 int main(void)
 {
+    test_nul_and_duplicates();
     test_set_window();
     test_reject_slot();
     test_clear();

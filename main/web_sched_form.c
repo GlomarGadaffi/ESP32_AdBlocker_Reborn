@@ -35,6 +35,31 @@ static bool parse_small_int(const char *s, int *v)
     return true;
 }
 
+/* True when the body carries an encoded NUL ("%00"): web_url_decode would
+ * store it and cut the value short, so "daily 09:00-17:00%00junk" would read
+ * as a clean spec. */
+static bool has_encoded_nul(const char *body)
+{
+    for (const char *p = body; *p; p++)
+        if (p[0] == '%' && p[1] == '0' && p[2] == '0') return true;
+    return false;
+}
+
+/* Occurrences of `key=` at the start of a field. A repeated field is
+ * ambiguous (web_form_field would silently take the first), so it is
+ * rejected rather than guessed at. */
+static int field_count(const char *body, const char *key)
+{
+    size_t kl = strlen(key);
+    int n = 0;
+    const char *p = body;
+    while ((p = strstr(p, key)) != NULL) {
+        if ((p == body || p[-1] == '&') && p[kl] == '=') n++;
+        p += kl;
+    }
+    return n;
+}
+
 bool web_sched_form_parse(const char *body, web_sched_form_t *out)
 {
     if (!out) return false;
@@ -42,6 +67,10 @@ bool web_sched_form_parse(const char *body, web_sched_form_t *out)
     out->kind = WSF_REJECT;
     out->err  = "Bad request";
     if (!body) return false;
+    if (has_encoded_nul(body)) return reject(out, "Bad request");
+    if (field_count(body, "slot") > 1 || field_count(body, "spec") > 1 ||
+        field_count(body, "utc_offset_min") > 1)
+        return reject(out, "Repeated field");
 
     char slot_s[8], spec[SPEC_BUF], off_s[12];
     bool has_slot = web_form_field(body, "slot", slot_s, sizeof(slot_s));
