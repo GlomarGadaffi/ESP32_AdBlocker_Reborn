@@ -1,6 +1,7 @@
 idf_component_register(
     SRCS
         "dns_sink.cpp"
+        "net_bringup.cpp"
         "dns_server.cpp"
         "blocklist.c"
         "bl_table.c"
