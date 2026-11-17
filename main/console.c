@@ -2,6 +2,7 @@
 #include "web_auth.h"
 #include "web_tls.h"
 #include "pause.h"
+#include "timesync.h"
 #include "acl.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -52,6 +53,14 @@ const char *dns_sink_hostname(void);
  *                              one client IP or, with "all", every client;
  *                              no scope argument lists what is active
  *   resume [ip|all]            end a pause early; no argument clears them all
+ *   sched                      list the recurring "don't block" windows
+ *   sched-set <0-3> <spec>     e.g. sched-set 0 weekdays 09:00-17:00 or
+ *                              sched-set 1 fri,sat 22:00-02:00 (the window
+ *                              belongs to the day it starts on)
+ *   sched-clear <0-3>          empty one window
+ *   sched-tz <minutes>         UTC offset the windows are read in (-300 =
+ *                              UTC-5); no DST, so change it with the clocks.
+ *                              Inactive until the clock is NTP-synced.
  *
  * Replies go out as normal log lines (visible on both consoles). Physical
  * USB access already implies full control (reflash), so no auth here — which
@@ -73,6 +82,25 @@ static void console_pause_list(void)
                      (unsigned)((pv[i].ip >> 8) & 0xFF), (unsigned)(pv[i].ip & 0xFF),
                      (unsigned)(pv[i].remaining_s / 60), (unsigned)(pv[i].remaining_s % 60));
     }
+}
+
+static void console_sched_list(void)
+{
+    pause_sched_t s;
+    if (!pause_schedule_get(&s)) { ESP_LOGW(TAG, "sched: pause module not ready"); return; }
+    static const char *const REASON[] = { "none", "manual", "schedule" };
+    int n = 0;
+    for (int i = 0; i < PAUSE_SCHED_MAX_WINDOWS; i++) {
+        char spec[PAUSE_SCHED_SPEC_MAX];
+        if (s.win[i].enabled && pause_sched_format(&s.win[i], spec, sizeof(spec)) == 0) {
+            ESP_LOGI(TAG, "sched %d: %s", i, spec);
+            n++;
+        } else {
+            ESP_LOGI(TAG, "sched %d: (empty)", i);
+        }
+    }
+    ESP_LOGI(TAG, "sched: %d window(s), UTC%+d min, clock %s, paused by: %s", n,
+             (int)s.utc_offset_min, timesync_state(), REASON[(int)pause_effective()]);
 }
 
 static void handle_line(char *line)
@@ -178,9 +206,52 @@ static void handle_line(char *line)
             else     ESP_LOGI(TAG, "resume %s: %s", p, pause_clear(ip) ? "cleared" : "none active");
         }
         console_pause_list();
+    } else if (strcmp(line, "sched") == 0) {
+        console_sched_list();
+    } else if (strncmp(line, "sched-set ", 10) == 0) {
+        char *p = line + 10;
+        while (*p == ' ') p++;
+        if (*p < '0' || *p >= '0' + PAUSE_SCHED_MAX_WINDOWS || (p[1] != ' ' && p[1] != '\0')) {
+            ESP_LOGW(TAG, "sched-set: slot must be 0-%d", PAUSE_SCHED_MAX_WINDOWS - 1);
+            return;
+        }
+        int slot = *p - '0';
+        p++;
+        while (*p == ' ') p++;
+        pause_sched_window_t w;
+        if (pause_sched_parse(p, &w) != 0)
+            ESP_LOGW(TAG, "sched-set: expected <days> HH:MM-HH:MM, days = daily | weekdays | "
+                          "weekends | mon,tue,... (e.g. weekdays 09:00-17:00)");
+        else if (!pause_schedule_set_window(slot, &w))
+            ESP_LOGW(TAG, "sched-set: could not save slot %d", slot);
+        else
+            console_sched_list();
+    } else if (strncmp(line, "sched-clear ", 12) == 0) {
+        char *p = line + 12;
+        while (*p == ' ') p++;
+        if (*p < '0' || *p >= '0' + PAUSE_SCHED_MAX_WINDOWS || p[1] != '\0') {
+            ESP_LOGW(TAG, "sched-clear: slot must be 0-%d", PAUSE_SCHED_MAX_WINDOWS - 1);
+            return;
+        }
+        if (!pause_schedule_clear_window(*p - '0'))
+            ESP_LOGW(TAG, "sched-clear: could not save slot %c", *p);
+        else
+            console_sched_list();
+    } else if (strncmp(line, "sched-tz ", 9) == 0) {
+        /* The firmware has no timezone setting (TZ is fixed at UTC), so the
+         * schedule keeps its own UTC offset, in minutes (e.g. -300 for UTC-5). */
+        char *end = NULL;
+        long off = strtol(line + 9, &end, 10);
+        if (end == line + 9 || *end != '\0' ||
+            !pause_schedule_set_utc_offset((int)off))
+            ESP_LOGW(TAG, "sched-tz: expected minutes from UTC, %d to %d",
+                     PAUSE_SCHED_UTC_MIN_MIN, PAUSE_SCHED_UTC_MAX_MIN);
+        else
+            console_sched_list();
     } else {
         ESP_LOGW(TAG, "unknown command (have: wifi, wifi-on, wifi-off, status, heap, "
-                      "admin-reset, cert-reset, cert, setup-psk, pause, resume)");
+                      "admin-reset, cert-reset, cert, setup-psk, pause, resume, "
+                      "sched, sched-set, sched-clear, sched-tz)");
     }
 }
 
@@ -197,7 +268,7 @@ static void console_task(void *arg)
         return;
     }
     ESP_LOGI(TAG, "USB recovery console ready "
-                  "(wifi/wifi-on/wifi-off/status/heap/admin-reset/cert-reset/cert/setup-psk/pause/resume)");
+                  "(wifi/wifi-on/wifi-off/status/heap/admin-reset/cert-reset/cert/setup-psk/pause/resume/sched/sched-set/sched-clear/sched-tz)");
     static char line[160];
     size_t have = 0;
     for (;;) {

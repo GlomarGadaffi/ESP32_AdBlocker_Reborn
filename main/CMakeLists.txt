@@ -12,6 +12,7 @@ idf_component_register(
         "acl.c"
         "bypass.c"
         "pause.c"
+        "pause_sched.c"
         "query_log.c"
         "census.c"
         "crashlog.c"

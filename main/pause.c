@@ -4,6 +4,10 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "nvs.h"
+#include "nvs_keys.h"
+#include "timesync.h"
+#include "blocklist.h"
 #include <stdatomic.h>
 #include <string.h>
 #include <inttypes.h>
@@ -20,7 +24,13 @@ typedef struct {
 } pause_slot_t;
 
 static pause_slot_t      s_slots[PAUSE_MAX];
-static _Atomic uint32_t  s_armed = 0;      /* slots with a non-zero expiry: hot-path gate */
+/* Hot-path gate: live slots, plus one while a schedule window is active. Zero
+ * means "nothing can possibly be paused" and the reader stops after one load. */
+static _Atomic uint32_t  s_armed = 0;
+static uint32_t          s_slot_count = 0;       /* live slots only; mutex held */
+static _Atomic uint32_t  s_sched_on = 0;         /* a schedule window is active now */
+static pause_sched_t     s_sched;                /* mutex held */
+static esp_timer_handle_t s_sched_timer = NULL;
 static SemaphoreHandle_t s_mutex = NULL;   /* writers only */
 
 static inline uint32_t now_s(void)
@@ -51,7 +61,65 @@ static void sweep_locked(void)
         if (e <= now) { atomic_store_explicit(&s_slots[i].expires_s, 0, memory_order_release); continue; }
         armed++;
     }
+    s_slot_count = armed;
+    armed += atomic_load_explicit(&s_sched_on, memory_order_relaxed) ? 1u : 0u;
     atomic_store_explicit(&s_armed, armed, memory_order_release);
+}
+
+/* Recompute whether a schedule window is active and publish it. Mutex held.
+ * An unsynced clock reads as "no window active": keep filtering. */
+static void sched_eval_locked(void)
+{
+    uint32_t on = 0;
+    uint32_t epoch = timesync_is_synced() ? timesync_epoch() : 0;
+    int wd = 0, mn = 0;
+    if (epoch != 0 && pause_sched_localtime(epoch, s_sched.utc_offset_min, &wd, &mn) == 0)
+        on = pause_sched_active(&s_sched, wd, mn) ? 1u : 0u;
+    uint32_t was = atomic_load_explicit(&s_sched_on, memory_order_relaxed);
+    atomic_store_explicit(&s_sched_on, on, memory_order_release);
+    sweep_locked();                              /* refolds s_sched_on into s_armed */
+    if (on != was) ESP_LOGW(TAG, "scheduled pause %s", on ? "STARTED: blocking off" : "ended: blocking on");
+}
+
+static void sched_timer_cb(void *arg)
+{
+    (void)arg;
+    if (!s_mutex) return;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    sched_eval_locked();
+    xSemaphoreGive(s_mutex);
+}
+
+/* Write the schedule blob. Mutex held. */
+static bool sched_save_locked(const pause_sched_t *s)
+{
+    uint8_t blob[PAUSE_SCHED_BLOB_LEN];
+    if (pause_sched_serialise(s, blob, sizeof(blob)) != 0) return false;
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS_MAIN, NVS_READWRITE, &h) != ESP_OK) return false;
+    esp_err_t e = nvs_set_blob(h, NVSK_PAUSE_SCHED, blob, sizeof(blob));
+    if (e == ESP_OK) e = nvs_commit(h);
+    nvs_close(h);
+    if (e != ESP_OK) ESP_LOGW(TAG, "schedule NVS write failed: %s", esp_err_to_name(e));
+    return e == ESP_OK;
+}
+
+static void sched_load(void)
+{
+    memset(&s_sched, 0, sizeof(s_sched));
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS_MAIN, NVS_READONLY, &h) != ESP_OK) return;
+    uint8_t blob[PAUSE_SCHED_BLOB_LEN];
+    size_t len = sizeof(blob);
+    esp_err_t e = nvs_get_blob(h, NVSK_PAUSE_SCHED, blob, &len);
+    nvs_close(h);
+    if (e == ESP_ERR_NVS_NOT_FOUND) return;
+    pause_sched_t t;
+    if (e != ESP_OK || pause_sched_deserialise(blob, len, &t) != 0) {
+        ESP_LOGW(TAG, "stored pause schedule unreadable — ignored (blocking stays on)");
+        return;
+    }
+    s_sched = t;
 }
 
 bool pause_init(void)
@@ -59,8 +127,66 @@ bool pause_init(void)
     if (!s_mutex) s_mutex = xSemaphoreCreateMutex();
     if (!s_mutex) return false;
     for (int i = 0; i < PAUSE_MAX; i++) slot_write(&s_slots[i], 0, 0);
+    atomic_store(&s_sched_on, 0);
     atomic_store(&s_armed, 0);
+    s_slot_count = 0;
+    sched_load();
+    if (!s_sched_timer) {
+        const esp_timer_create_args_t args = { .callback = sched_timer_cb, .name = "pause_sched" };
+        if (esp_timer_create(&args, &s_sched_timer) != ESP_OK) { s_sched_timer = NULL; return false; }
+        if (esp_timer_start_periodic(s_sched_timer, 1000000) != ESP_OK) return false;
+    }
     return true;
+}
+
+pause_reason_t pause_effective(void)
+{
+    if (!s_mutex) return PAUSE_REASON_NONE;
+    if (blocklist_is_paused() || pause_count() > 0) return PAUSE_REASON_MANUAL;
+    return atomic_load_explicit(&s_sched_on, memory_order_acquire) ? PAUSE_REASON_SCHEDULE : PAUSE_REASON_NONE;
+}
+
+bool pause_schedule_get(pause_sched_t *out)
+{
+    if (!s_mutex || !out) return false;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    *out = s_sched;
+    xSemaphoreGive(s_mutex);
+    return true;
+}
+
+/* Apply a modified copy: persist first, publish only if the write held. */
+static bool sched_commit(const pause_sched_t *next)
+{
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    bool ok = sched_save_locked(next);
+    if (ok) { s_sched = *next; sched_eval_locked(); }
+    xSemaphoreGive(s_mutex);
+    return ok;
+}
+
+bool pause_schedule_set_window(int slot, const pause_sched_window_t *w)
+{
+    if (!s_mutex || !w || slot < 0 || slot >= PAUSE_SCHED_MAX_WINDOWS) return false;
+    pause_sched_t next;
+    if (!pause_schedule_get(&next)) return false;
+    next.win[slot] = *w;
+    return sched_commit(&next);
+}
+
+bool pause_schedule_clear_window(int slot)
+{
+    pause_sched_window_t empty = { false, 0, 0, 0 };
+    return pause_schedule_set_window(slot, &empty);
+}
+
+bool pause_schedule_set_utc_offset(int minutes)
+{
+    if (!s_mutex || minutes < PAUSE_SCHED_UTC_MIN_MIN || minutes > PAUSE_SCHED_UTC_MAX_MIN) return false;
+    pause_sched_t next;
+    if (!pause_schedule_get(&next)) return false;
+    next.utc_offset_min = (int16_t)minutes;
+    return sched_commit(&next);
 }
 
 bool pause_set(uint32_t ip_hbo, uint32_t minutes)
@@ -115,10 +241,10 @@ uint32_t pause_clear_all(void)
     if (!s_mutex) return 0;
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     sweep_locked();
-    uint32_t n = atomic_load(&s_armed);
+    uint32_t n = s_slot_count;
     for (int i = 0; i < PAUSE_MAX; i++)
         atomic_store_explicit(&s_slots[i].expires_s, 0, memory_order_release);
-    atomic_store_explicit(&s_armed, 0, memory_order_release);
+    sweep_locked();                              /* leaves the schedule's share of s_armed */
     xSemaphoreGive(s_mutex);
     if (n) ESP_LOGW(TAG, "blocking resumed: %" PRIu32 " pause(s) cleared", n);
     return n;
@@ -147,7 +273,7 @@ uint32_t pause_count(void)
     if (!s_mutex) return 0;
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     sweep_locked();
-    uint32_t n = atomic_load(&s_armed);
+    uint32_t n = s_slot_count;
     xSemaphoreGive(s_mutex);
     return n;
 }
@@ -166,5 +292,7 @@ bool IRAM_ATTR pause_active_for(uint32_t client_ip_hbo)
         if (e2 != e1) continue;                    /* torn update: fail closed for this query */
         if (ip == PAUSE_IP_ALL || ip == client_ip_hbo) return true;
     }
-    return false;
+    /* No slot matched. A schedule window pauses everyone; this load is only
+     * reached when s_armed was non-zero, so the idle path stays one load. */
+    return atomic_load_explicit(&s_sched_on, memory_order_acquire) != 0;
 }

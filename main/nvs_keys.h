@@ -63,6 +63,11 @@
 #define NVSK_WHITELIST_FMT  "wl%" PRIu32    /* str: wl0 … wl63 (WHITELIST_MAX 64) */
 #define NVSK_PAUSED         "paused"        /* u8:  filtering paused */
 
+/* ── pause.c — recurring pause schedule ────────────────────────────── */
+#define NVSK_PAUSE_SCHED    "pause_sched"   /* blob: 27 B, versioned; 4 windows
+                                             * plus the UTC offset they use
+                                             * (see pause_sched.h) */
+
 /* ── dot.c — DNS-over-TLS upstream (#5) ────────────────────────────── */
 #define NVSK_DOT_EN         "dot_en"        /* u8  */
 #define NVSK_DOT_SERVER     "dot_srv"       /* str: upstream IP */
@@ -125,6 +130,7 @@ NVSK_ASSERT_FITS("bl_en_3");                /* same bound — 9 digits */
 NVSK_ASSERT_FITS("wl63");                   /* WHITELIST_MAX 64 — 13 digits */
 NVSK_ASSERT_FITS(NVSK_CUSTOM_BLOCK);
 NVSK_ASSERT_FITS(NVSK_PAUSED);
+NVSK_ASSERT_FITS(NVSK_PAUSE_SCHED);
 NVSK_ASSERT_FITS(NVSK_DOT_EN);
 NVSK_ASSERT_FITS(NVSK_DOT_SERVER);
 NVSK_ASSERT_FITS(NVSK_DOT_SNI);
