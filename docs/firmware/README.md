@@ -36,3 +36,11 @@ docs/firmware/
 `index.json` carries an explicit `files` array because GitHub Pages serves no
 directory listing — it is what lets the page rebuild the asset map it used to
 get from the API without a second round trip.
+
+## Retention
+
+Each release adds roughly 4 MB of binaries to git history (about 3.9 MB for
+1.5.0, from the sizes in `index.json`), and history never shrinks. The flasher
+only needs the versions listed in `index.json`. Older version directories can
+be dropped from the tree once they are removed from `index.json`; the GitHub
+Release keeps every asset regardless.
