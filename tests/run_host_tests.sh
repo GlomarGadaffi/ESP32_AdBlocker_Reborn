@@ -7,12 +7,16 @@ root=$(cd "$here/.." && pwd)
 manifest="$here/host_tests.txt"
 only=${1:-}
 tmp=$(mktemp -d) || exit 1
-trap 'rm -rf "$tmp"' EXIT INT TERM
+trap 'rm -rf "$tmp"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+cr=$(printf '')
 cd "$root" || exit 1
 
 pass=0
 fail=0
 while IFS= read -r line || [ -n "$line" ]; do
+    line=${line%"$cr"}
     case "$line" in ''|'#'*) continue ;; esac
     name=${line%%:*}
     srcs=${line#*:}
@@ -39,4 +43,5 @@ while IFS= read -r line || [ -n "$line" ]; do
 done < "$manifest"
 
 echo "$pass passed, $fail failed"
+[ -n "$only" ] && [ "$pass" -eq 0 ] && [ "$fail" -eq 0 ] && echo "no test named $only in manifest" >&2
 [ "$fail" -eq 0 ] && [ "$pass" -gt 0 ]

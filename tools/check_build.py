@@ -95,6 +95,9 @@ def main():
 
     for sym in COMMON_REQUIRED + [b["select"], b["flash"]]:
         check(sym in cfg, "%s present" % sym)
+    for other, ob in BOARDS.items():
+        if ob["select"] != b["select"]:
+            check(ob["select"] not in cfg, "%s absent" % ob["select"])
     for sym in SEEDS:
         v = cfg.get(sym, "").strip('"')
         check(v == "", "%s is empty" % sym)
