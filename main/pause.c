@@ -31,7 +31,11 @@ static uint32_t          s_slot_count = 0;       /* live slots only; mutex held 
 static _Atomic uint32_t  s_sched_on = 0;         /* a schedule window is active now */
 static pause_sched_t     s_sched;                /* mutex held */
 static esp_timer_handle_t s_sched_timer = NULL;
-static SemaphoreHandle_t s_mutex = NULL;   /* writers only */
+static SemaphoreHandle_t s_mutex = NULL;   /* writers only; held briefly, never across NVS I/O */
+/* Serialises schedule setters (read-modify-write + NVS commit). The 1 Hz timer
+ * and the pause table never take it, so a slow flash commit cannot stall the
+ * esp_timer task. Lock order: s_cfg_mutex then s_mutex. */
+static SemaphoreHandle_t s_cfg_mutex = NULL;
 
 static inline uint32_t now_s(void)
 {
@@ -90,8 +94,8 @@ static void sched_timer_cb(void *arg)
     xSemaphoreGive(s_mutex);
 }
 
-/* Write the schedule blob. Mutex held. */
-static bool sched_save_locked(const pause_sched_t *s)
+/* Write the schedule blob. s_cfg_mutex held, s_mutex NOT held. */
+static bool sched_save(const pause_sched_t *s)
 {
     uint8_t blob[PAUSE_SCHED_BLOB_LEN];
     if (pause_sched_serialise(s, blob, sizeof(blob)) != 0) return false;
@@ -104,9 +108,11 @@ static bool sched_save_locked(const pause_sched_t *s)
     return e == ESP_OK;
 }
 
-static void sched_load(void)
+/* Read the stored schedule into *out; empty on absent/corrupt. No lock needed
+ * (touches no shared state); the caller publishes it. */
+static void sched_load(pause_sched_t *out)
 {
-    memset(&s_sched, 0, sizeof(s_sched));
+    memset(out, 0, sizeof(*out));
     nvs_handle_t h;
     if (nvs_open(NVS_NS_MAIN, NVS_READONLY, &h) != ESP_OK) return;
     uint8_t blob[PAUSE_SCHED_BLOB_LEN];
@@ -119,22 +125,40 @@ static void sched_load(void)
         ESP_LOGW(TAG, "stored pause schedule unreadable — ignored (blocking stays on)");
         return;
     }
-    s_sched = t;
+    *out = t;
 }
 
 bool pause_init(void)
 {
-    if (!s_mutex) s_mutex = xSemaphoreCreateMutex();
-    if (!s_mutex) return false;
+    if (!s_cfg_mutex) s_cfg_mutex = xSemaphoreCreateMutex();
+    if (!s_mutex) {
+        SemaphoreHandle_t m = xSemaphoreCreateMutex();
+        if (!m) return false;
+        s_mutex = m;
+    }
+    if (!s_cfg_mutex) return false;
+    pause_sched_t loaded;
+    sched_load(&loaded);
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
     for (int i = 0; i < PAUSE_MAX; i++) slot_write(&s_slots[i], 0, 0);
     atomic_store(&s_sched_on, 0);
     atomic_store(&s_armed, 0);
     s_slot_count = 0;
-    sched_load();
+    s_sched = loaded;
+    xSemaphoreGive(s_mutex);
     if (!s_sched_timer) {
+        esp_timer_handle_t t = NULL;
         const esp_timer_create_args_t args = { .callback = sched_timer_cb, .name = "pause_sched" };
-        if (esp_timer_create(&args, &s_sched_timer) != ESP_OK) { s_sched_timer = NULL; return false; }
-        if (esp_timer_start_periodic(s_sched_timer, 1000000) != ESP_OK) return false;
+        if (esp_timer_create(&args, &t) != ESP_OK) {
+            ESP_LOGE(TAG, "schedule timer create failed — schedule stays inactive (blocking stays on)");
+            return false;
+        }
+        if (esp_timer_start_periodic(t, 1000000) != ESP_OK) {
+            ESP_LOGE(TAG, "schedule timer start failed — schedule stays inactive (blocking stays on)");
+            (void)esp_timer_delete(t);
+            return false;
+        }
+        s_sched_timer = t;
     }
     return true;
 }
@@ -155,23 +179,43 @@ bool pause_schedule_get(pause_sched_t *out)
     return true;
 }
 
-/* Apply a modified copy: persist first, publish only if the write held. */
-static bool sched_commit(const pause_sched_t *next)
+/* Read-modify-write one field under s_cfg_mutex: persist first (outside
+ * s_mutex, so the 1 Hz timer never waits on flash), publish only if the write
+ * held, and skip the flash write entirely when nothing changed.
+ * slot >= 0 replaces that window with *w; slot < 0 sets the UTC offset. */
+static bool sched_commit(int slot, const pause_sched_window_t *w, int offset_min)
 {
+    if (!s_mutex || !s_cfg_mutex) return false;
+    xSemaphoreTake(s_cfg_mutex, portMAX_DELAY);
+    pause_sched_t cur, next;
     xSemaphoreTake(s_mutex, portMAX_DELAY);
-    bool ok = sched_save_locked(next);
-    if (ok) { s_sched = *next; sched_eval_locked(); }
+    cur = s_sched;
     xSemaphoreGive(s_mutex);
+    next = cur;
+    if (slot >= 0) next.win[slot] = *w;
+    else           next.utc_offset_min = (int16_t)offset_min;
+
+    uint8_t a[PAUSE_SCHED_BLOB_LEN], b[PAUSE_SCHED_BLOB_LEN];
+    bool ok = pause_sched_serialise(&next, b, sizeof(b)) == 0;   /* rejects a bad window */
+    if (ok && pause_sched_serialise(&cur, a, sizeof(a)) == 0 && memcmp(a, b, sizeof(a)) == 0) {
+        xSemaphoreGive(s_cfg_mutex);
+        return true;                                             /* unchanged: no flash write */
+    }
+    if (ok) ok = sched_save(&next);
+    if (ok) {
+        xSemaphoreTake(s_mutex, portMAX_DELAY);
+        s_sched = next;
+        sched_eval_locked();
+        xSemaphoreGive(s_mutex);
+    }
+    xSemaphoreGive(s_cfg_mutex);
     return ok;
 }
 
 bool pause_schedule_set_window(int slot, const pause_sched_window_t *w)
 {
-    if (!s_mutex || !w || slot < 0 || slot >= PAUSE_SCHED_MAX_WINDOWS) return false;
-    pause_sched_t next;
-    if (!pause_schedule_get(&next)) return false;
-    next.win[slot] = *w;
-    return sched_commit(&next);
+    if (!w || slot < 0 || slot >= PAUSE_SCHED_MAX_WINDOWS) return false;
+    return sched_commit(slot, w, 0);
 }
 
 bool pause_schedule_clear_window(int slot)
@@ -182,11 +226,8 @@ bool pause_schedule_clear_window(int slot)
 
 bool pause_schedule_set_utc_offset(int minutes)
 {
-    if (!s_mutex || minutes < PAUSE_SCHED_UTC_MIN_MIN || minutes > PAUSE_SCHED_UTC_MAX_MIN) return false;
-    pause_sched_t next;
-    if (!pause_schedule_get(&next)) return false;
-    next.utc_offset_min = (int16_t)minutes;
-    return sched_commit(&next);
+    if (minutes < PAUSE_SCHED_UTC_MIN_MIN || minutes > PAUSE_SCHED_UTC_MAX_MIN) return false;
+    return sched_commit(-1, NULL, minutes);
 }
 
 bool pause_set(uint32_t ip_hbo, uint32_t minutes)

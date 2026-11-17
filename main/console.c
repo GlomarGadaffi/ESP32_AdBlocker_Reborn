@@ -206,6 +206,11 @@ static void handle_line(char *line)
             else     ESP_LOGI(TAG, "resume %s: %s", p, pause_clear(ip) ? "cleared" : "none active");
         }
         console_pause_list();
+        /* resume ends manual pauses only; a schedule window is a separate,
+         * independent source and is edited with sched-clear / sched-set. */
+        if (pause_effective() == PAUSE_REASON_SCHEDULE)
+            ESP_LOGW(TAG, "resume: blocking is still off — a schedule window is active "
+                          "(sched-clear <0-3> to remove it)");
     } else if (strcmp(line, "sched") == 0) {
         console_sched_list();
     } else if (strncmp(line, "sched-set ", 10) == 0) {

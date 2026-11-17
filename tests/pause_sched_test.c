@@ -181,6 +181,29 @@ static void test_localtime(void)
           "pre-epoch local: %d %d", wd, mn);
 }
 
+static void test_review_regressions(void)
+{
+    pause_sched_window_t w = { true, 0x55, 111, 222 };
+    /* long digit runs / 24:00 never overflow or wrap into range */
+    CHECK(pause_sched_parse("mon 99999999999999999999-10:00", &w) != 0, "digit run rejected");
+    CHECK(pause_sched_parse("mon 24:00-10:00", &w) != 0, "24:00 rejected");
+    CHECK(w.days == 0x55, "rejects left *out untouched");
+    /* exact second of a window edge: 12:00:00 is in [12:00,13:00), 13:00:00 is not */
+    pause_sched_t s;
+    memset(&s, 0, sizeof(s));
+    CHECK(pause_sched_parse("mon 12:00-13:00", &s.win[0]) == 0, "parse");
+    int wd, mn;
+    uint32_t mon_noon = 1794832496u - HM(12, 34) * 60 + HM(12, 0) * 60;   /* Mon 12:00:02 UTC */
+    mon_noon -= mon_noon % 60;
+    CHECK(pause_sched_localtime(mon_noon - 1, 0, &wd, &mn) == 0 && !pause_sched_active(&s, wd, mn), "11:59:59 off");
+    CHECK(pause_sched_localtime(mon_noon, 0, &wd, &mn) == 0 && pause_sched_active(&s, wd, mn), "12:00:00 on");
+    CHECK(pause_sched_localtime(mon_noon + 3599, 0, &wd, &mn) == 0 && pause_sched_active(&s, wd, mn), "12:59:59 on");
+    CHECK(pause_sched_localtime(mon_noon + 3600, 0, &wd, &mn) == 0 && !pause_sched_active(&s, wd, mn), "13:00:00 off");
+    /* negative offset crossing midnight into the previous weekday */
+    CHECK(pause_sched_localtime(mon_noon - HM(12, 0) * 60 + 2 * 3600, -300, &wd, &mn) == 0 &&
+          wd == SUN && mn == HM(21, 0), "Mon 02:00 UTC at -300 is Sun 21:00 (%d %d)", wd, mn);
+}
+
 int main(void)
 {
     test_active();
@@ -188,6 +211,7 @@ int main(void)
     test_roundtrip();
     test_blob();
     test_localtime();
+    test_review_regressions();
     if (g_fail) { printf("pause_sched_test: %d FAILED\n", g_fail); return 1; }
     printf("pause_sched_test: all passed\n");
     return 0;
